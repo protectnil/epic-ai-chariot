@@ -1,0 +1,70 @@
+name: Leak Pattern Check
+on:
+  push:
+    branches: [main, master]
+  pull_request_target:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout base (no PR code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+      - name: Fetch PR head ref (text-only, no checkout)
+        if: github.event_name == 'pull_request_target'
+        run: git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-head
+      - name: Compute diff text
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            git diff origin/${{ github.event.pull_request.base.ref }}...pr-head > diff.txt
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null || ! git merge-base "${{ github.event.before }}" "${{ github.event.after }}" >/dev/null 2>&1; then
+            # New branch, unreachable before-SHA, or force-push onto an unrelated
+            # history (orphan root => no merge base). Scan the ENTIRE pushed tree
+            # against the empty tree so no file is skipped.
+            EMPTY_TREE=$(git hash-object -t tree /dev/null)
+            git diff "$EMPTY_TREE" "${{ github.event.after }}" > diff.txt
+          else
+            git diff ${{ github.event.before }}...${{ github.event.after }} > diff.txt
+          fi
+      - name: Scan diff for leak patterns (file-aware allowlist)
+        env:
+          LEAK_DENYLIST_REGEX: ${{ secrets.LEAK_DENYLIST_REGEX }}
+          LEAK_DENYLIST_REGEX_RESTRICTED: ${{ secrets.LEAK_DENYLIST_REGEX_RESTRICTED }}
+        run: |
+          if [ -z "$LEAK_DENYLIST_REGEX" ] || [ -z "$LEAK_DENYLIST_REGEX_RESTRICTED" ]; then
+            echo "::error::LEAK_DENYLIST_REGEX and/or LEAK_DENYLIST_REGEX_RESTRICTED secret not set"
+            exit 1
+          fi
+          python3 - <<'PYEOF'
+          import os, re, sys
+          ALLOWED = re.compile(r'^(LICENSE|LICENSE-APACHE|LICENSE-ELASTIC|LICENSE-ADAPTERS|NOTICE|TRADEMARK\.md)$')
+          FULL = re.compile(os.environ['LEAK_DENYLIST_REGEX'])
+          RESTRICTED = re.compile(os.environ['LEAK_DENYLIST_REGEX_RESTRICTED'])
+          current_file = None
+          fail = False
+          with open('diff.txt') as f:
+              for line in f:
+                  if line.startswith('diff --git'):
+                      m = re.search(r' b/(\S+)', line)
+                      current_file = m.group(1) if m else None
+                      continue
+                  if not line.startswith('+') or line.startswith('+++'):
+                      continue
+                  if current_file is None:
+                      continue
+                  basename = os.path.basename(current_file)
+                  rx = RESTRICTED if ALLOWED.match(basename) else FULL
+                  m = rx.search(line)
+                  if m:
+                      print(f'::error file={current_file}::Leak pattern matched: {line.rstrip()}')
+                      fail = True
+          sys.exit(1 if fail else 0)
+          PYEOF
+          echo "Leak pattern check passed."

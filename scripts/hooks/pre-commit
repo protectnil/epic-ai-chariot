@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+#
+# Epic AI® Chariot pre-commit leak scanner
+#
+# Always scans staged content (git show ":$FILE") — never falls back to the
+# working tree, which could scan unstaged changes.
+#
+# The denylist files are resolved from $LEAK_DENYLIST_DIR (or its default
+# fallback chain). They contain regex patterns, one per line, that must
+# never appear in committed content.
+#
+# Install: bash scripts/hooks/install.sh
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+DENYLIST_DIR=""
+for candidate in \
+    "${REPO_ROOT}/.leak-denylist" \
+    "${PWD}/.leak-denylist" \
+    "${LEAK_DENYLIST_DIR:-}" \
+    "${HOME}/.config/epicai-leak-denylist"; do
+  if [ -n "${candidate}" ] && [ -d "${candidate}" ]; then
+    DENYLIST_DIR="${candidate}"
+    break
+  fi
+done
+DENYLIST_FILE="${DENYLIST_DIR}/patterns.txt"
+RESTRICTED_FILE="${DENYLIST_DIR}/patterns-restricted.txt"
+ALLOWED_FILES_REGEX='^(LICENSE|LICENSE-APACHE|LICENSE-ELASTIC|LICENSE-ADAPTERS|NOTICE|TRADEMARK\.md|scripts/hooks/pre-commit)$'
+
+if [ ! -f "$DENYLIST_FILE" ]; then
+  echo "[ERROR] Canonical denylist not found: $DENYLIST_FILE"
+  exit 1
+fi
+
+# Load patterns — skip comment/blank lines
+mapfile -t PATTERNS       < <(grep -v '^\s*#' "$DENYLIST_FILE"  | grep -v '^\s*$')
+mapfile -t RESTRICTED_PAT < <(grep -v '^\s*#' "$RESTRICTED_FILE" | grep -v '^\s*$')
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+# ── Staged-path guardrail ──────────────────────────────────────────────
+#
+# Reject any commit that stages files under test/ or .leak-denylist/.
+# test/ paths must enter via the eval workflow (eval runner stages
+# baselines atomically). .leak-denylist/ must never be re-committed
+# once removed from VCS tracking — patterns live in out-of-repo storage.
+while IFS= read -r _SP_FILE; do
+  case "$_SP_FILE" in
+    test/*)
+      echo ""
+      echo "Staged-path rejected: $_SP_FILE"
+      echo "  Paths under test/ must not be staged directly."
+      echo "  Use the eval workflow to update test baselines."
+      exit 1
+      ;;
+    .leak-denylist/*)
+      echo ""
+      echo "Staged-path rejected: $_SP_FILE"
+      echo "  .leak-denylist/ is untracked by design — patterns live in"
+      echo "  out-of-repo storage. Do not re-add these files to VCS."
+      exit 1
+      ;;
+  esac
+done <<< "$STAGED"
+
+# Materialize staged content to a temp tree, then delegate the leak scan to
+# scripts/leak-scan.mjs (single Node process; compiled regex objects; one
+# pass per file). Replaces the previous nested bash loop, which forked
+# `git show` + `grep -nE` per (file × pattern) and ran ~O(N×P) subprocesses
+# — fine for normal commits, ~30+ minutes for orphan-root scale (1,378
+# staged files × ~30 patterns ≈ 82,000 forks).
+#
+# Skips applied here in the wrapper rather than in the Node scanner:
+#   - .leak-denylist/* — patterns are literally inside these files
+#   - scripts/hooks/pre-commit — the hook source intentionally references
+#     denylist context; would false-positive against the broad patterns
+#   - common binary extensions — strict UTF-8 decode in the Node scanner
+#     can choke on/false-positive across binary blobs
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+SKIP_EXT_RE='\.(node|png|jpg|jpeg|gif|ico|woff|woff2|ttf|otf|zip|tgz|tar|gz|pdf|wasm|so|dylib|dll|exe)$'
+
+while IFS= read -r FILE; do
+  [ -z "$FILE" ] && continue
+  case "$FILE" in
+    .leak-denylist/*) continue ;;
+    scripts/hooks/pre-commit) continue ;;
+  esac
+  if [[ "$FILE" =~ $SKIP_EXT_RE ]]; then
+    continue
+  fi
+  mkdir -p "$TMPDIR/$(dirname "$FILE")"
+  git show ":$FILE" > "$TMPDIR/$FILE" 2>/dev/null || true
+done <<< "$STAGED"
+
+if [ -n "$(find "$TMPDIR" -type f -print -quit 2>/dev/null)" ]; then
+  if ! LEAK_DENYLIST_DIR="$DENYLIST_DIR" node "$REPO_ROOT/scripts/leak-scan.mjs" "$TMPDIR"; then
+    echo ""
+    echo "Commit rejected. Remove leak content or update canonical denylist with an allowlist exemption."
+    exit 1
+  fi
+fi
+
+# ──  — Eval gate manifest staleness check ──────────────────────────
+#
+# Refuse commits that touch src/ or test/ai-evals/ if the eval-gate
+# manifest's commit SHA does not match HEAD. The manifest is written
+# by every eval's reporter.finish(); a mismatch means the staged
+# changes have not been re-evaluated.
+#
+# Bypass: CHARIOT_SKIP_EVAL_GATE=1 in the environment for the commit.
+# Use ONLY when the change is provably not in eval scope (typo fixes,
+# doc-only edits) and explain the bypass in the commit body.
+GATE_MANIFEST="$(git rev-parse --show-toplevel 2>/dev/null)/test/ai-evals/_baselines/eval-gate.manifest.json"
+if [ "${CHARIOT_SKIP_EVAL_GATE:-0}" != "1" ] && [ -f "$GATE_MANIFEST" ]; then
+  TOUCHES_GATE=0
+  for FILE in $STAGED; do
+    case "$FILE" in
+      src/*|test/ai-evals/*)
+        TOUCHES_GATE=1
+        ;;
+    esac
+  done
+  if [ $TOUCHES_GATE -eq 1 ]; then
+    MANIFEST_COMMIT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('commit','none'))" "$GATE_MANIFEST" 2>/dev/null || echo "unknown")
+    HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    if [ "$MANIFEST_COMMIT" != "$HEAD_COMMIT" ]; then
+      echo ""
+      echo "Eval gate manifest is stale."
+      echo "  manifest commit: $MANIFEST_COMMIT"
+      echo "  HEAD commit:     $HEAD_COMMIT"
+      echo "  staged changes touch src/ or test/ai-evals/."
+      echo ""
+      echo "Refresh path:"
+      echo "  1. Run 'npm run eval:ai' (suite must pass — runner rewrites the"
+      echo "     manifest commit field only on a fully-green run)."
+      echo "  2. 'git add test/ai-evals/_baselines/eval-gate.manifest.json'"
+      echo "  3. Re-commit."
+      echo ""
+      echo "Bypass with CHARIOT_SKIP_EVAL_GATE=1 for proven non-eval changes"
+      echo "(typo fixes, doc-only edits) with an explanation in the commit body."
+      exit 1
+    fi
+  fi
+fi
+
+# ── Catalog signature pair invariant ──────────────────────────────────
+#
+# Every signed catalog artifact (bundle / catalog / mcp-registry) ships
+# with an Ed25519 .sig file alongside it. Editing the .json without
+# updating the .sig produces a signed-but-tampered artifact that fails
+# src/engine/keys/verifyCatalogSignature.ts on the customer's machine —
+# every adapter query then reports "No adapters matched" because the
+# catalog is rejected at load.
+#
+# This hook cannot re-sign (the signing key is held by the materializer
+# service, not the developer). Instead it refuses any commit that
+# stages a signed JSON without ALSO staging the matching .sig in the
+# same commit. The intended write path is the catalog materializer in
+# the sibling publisher repo, which produces the .json and .sig
+# together. See BUNDLE_AUTHORITY.md.
+#
+# Incident: 3.0.6 publish, 2026-05-22. Bundle edit for the wayback
+# packageName fix landed without a corresponding .sig refresh; CI
+# shipped the broken pair to npm and every customer install broke.
+SIGNED_ARTIFACTS=(
+  chariot-adapter-bundle.json
+  chariot-adapter-catalog.json
+)
+# chariot-mcp-registry.json is a publisher-side derivative of the bundle
+# with no companion .sig (BUNDLE_AUTHORITY.md). It is intentionally not
+# listed here — pairing it with a non-existent .sig would always fail.
+for ARTIFACT in "${SIGNED_ARTIFACTS[@]}"; do
+  if echo "$STAGED" | grep -qx "$ARTIFACT"; then
+    if ! echo "$STAGED" | grep -qx "${ARTIFACT}.sig"; then
+      echo ""
+      echo "Catalog signature pair invariant violated."
+      echo "  staged:     $ARTIFACT"
+      echo "  not staged: ${ARTIFACT}.sig"
+      echo ""
+      echo "  Signed catalog artifacts must be edited via the materializer."
+      echo "  See: BUNDLE_AUTHORITY.md"
+      echo ""
+      echo "  Direct edits without re-signing ship a tampered artifact"
+      echo "  that fails the runtime signature gate on every customer"
+      echo "  machine. Refusing commit."
+      exit 1
+    fi
+  fi
+done
+
+exit 0

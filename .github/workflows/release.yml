@@ -1,0 +1,1258 @@
+name: Release
+
+# Triggered by pushing a tag of the form vX.Y.Z, or manually via
+# workflow_dispatch for re-runs after partial failures.
+#
+# The full pipeline is idempotent at the per-package level: every publish
+# step checks the npm registry first and skips if the target version is
+# already published. A second run after a partial failure will only do
+# the work that did not complete the first time. Because each sibling
+# package ships its own copy of the signed integrity manifest, cross-run
+# inconsistency of rebuilt binaries cannot produce a manifest mismatch
+# at the consumer's install time.
+#
+# Leak gate: both publish jobs run the mirrored denylist scan from
+# `.leak-denylist/` before publishing. `prepublishOnly` does the same
+# for local `npm publish`. This is a fail-closed gate for source and
+# dist content; it is intentionally independent of the post-push
+# `leak-pattern-check.yml` workflow.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 1.0.6). Must match package.json.'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # GitHub release creation
+  id-token: write   # reserved for OIDC-backed workflows; npm provenance is disabled below
+
+concurrency:
+  # One release per ref. Never cancel a release in progress — a canceled
+  # publish leaves the registry in a partial state that is harder to
+  # recover from than letting the run finish.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Floor where node:sqlite leaves --experimental-sqlite; must track engines.node.
+  NODE_VERSION: '22.13.0'
+  # Run v4 JS actions on the runner's Node 24 instead of the deprecated Node 20.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Harden against npm 11+ trusted-publishing auto-opt-in: this release
+  # workflow uses plain token-based publish and must never emit provenance.
+  NPM_CONFIG_PROVENANCE: 'false'
+  # Must be >= 1.85.0 (edition2024 feature, required by transitively-
+  # resolved base64ct >= 1.8.3). Pinned to 1.94.1 to match the version
+  # that generated Cargo.lock so CI and local builds stay in sync.
+  RUST_VERSION: '1.94.1'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. VALIDATE — fail-fast preflight
+  # ─────────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify required secrets are present
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          SIGNING_KEY: ${{ secrets.CHARIOT_SIGNING_KEY }}
+          LICENSE_SIGNING_KEY: ${{ secrets.CHARIOT_LICENSE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::error::NPM_TOKEN repository secret is not set"
+            missing=1
+          fi
+          if [ -z "${SIGNING_KEY}" ]; then
+            echo "::error::CHARIOT_SIGNING_KEY repository secret is not set (used to sign integrity manifest)"
+            missing=1
+          fi
+          if [ -z "${LICENSE_SIGNING_KEY}" ]; then
+            echo "::error::CHARIOT_LICENSE_SIGNING_KEY repository secret is not set (used to sign test licenses)"
+            missing=1
+          fi
+          [ "${missing}" -eq 0 ]
+
+      - name: Resolve target version and commit
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${INPUT_VERSION}"
+          fi
+          # : validate the resolved version against strict SemVer
+          # 2.0.0 BEFORE it can flow into any subsequent shell expansion.
+          # Without this, a workflow_dispatch input of "; rm -rf /" or
+          # a smuggled workflow command (newline + ::set-output::) would
+          # be interpolated directly into downstream `run: |` blocks or
+          # into GitHub-Actions log-command parsing.
+          #
+          # The regex below is the OFFICIAL SemVer 2.0.0 grammar from
+          # semver.org §9: pre-release identifiers cannot have a leading
+          # zero in numeric-only form and cannot be empty (the "1.2.3-01"
+          # and "1.2.3-foo..bar" cases the previous looser regex let
+          # through).
+          # Reject any control character (including CR/LF) BEFORE the
+          # SemVer check. `grep -Eq` matches per-line, so a multi-line
+          # input where line 1 is valid SemVer would otherwise smuggle
+          # downstream lines into `VERSION` for later interpolation.
+          # Using POSIX `case` against a glob avoids that boundary
+          # ambiguity — any character outside the SemVer-legal set
+          # exits the gate before regex match.
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*)
+              echo "::error::Release version input rejected; contains characters outside the SemVer charset. See workflow inputs for the supplied value."
+              exit 1
+              ;;
+          esac
+          # Strict SemVer 2.0.0 grammar from semver.org §9. Bash
+          # `[[ =~ ]]` matches the WHOLE string (no per-line ambiguity).
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if ! [[ "${VERSION}" =~ ${SEMVER_RE} ]]; then
+            # Echo a constant-shape error WITHOUT re-emitting the raw
+            # untrusted input — embedded newlines / workflow-command
+            # smuggling cannot ride this log line. The operator can
+            # find the rejected value in the input-events tab.
+            echo "::error::Release version input rejected; not valid SemVer 2.0.0. See workflow inputs for the supplied value."
+            exit 1
+          fi
+          COMMIT="$(git rev-parse HEAD)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"  >> "$GITHUB_OUTPUT"
+          echo "Target version: ${VERSION}"
+          echo "Target commit:  ${COMMIT}"
+
+      - name: Verify package.json version matches target
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "${PKG_VERSION}" != "${{ steps.resolve.outputs.version }}" ]; then
+            echo "::error::package.json version (${PKG_VERSION}) does not match target (${{ steps.resolve.outputs.version }})"
+            exit 1
+          fi
+          echo "package.json version matches: ${PKG_VERSION}"
+
+      - name: Verify optionalDependencies pins match main version
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const target = pkg.version;
+            const deps = pkg.optionalDependencies || {};
+            const siblings = [
+              "@epicai/chariot-bin-linux-x64-gnu",
+              "@epicai/chariot-bin-darwin-arm64",
+              "@epicai/chariot-bin-darwin-x64",
+              "@epicai/chariot-bin-win32-x64-msvc",
+            ];
+            let bad = 0;
+            for (const name of siblings) {
+              const ver = deps[name];
+              if (!ver) {
+                console.error("::error::" + name + " is not listed in optionalDependencies");
+                bad = 1;
+              } else if (ver !== target) {
+                console.error("::error::" + name + " pinned to " + ver + ", must match main version " + target);
+                bad = 1;
+              }
+            }
+            process.exit(bad);
+          '
+
+      - name: Verify package-lock is in sync with package.json
+        run: |
+          set -euo pipefail
+          LOCK_VERSION="$(node -p "require('./package-lock.json').version")"
+          if [ "${LOCK_VERSION}" != "${{ steps.resolve.outputs.version }}" ]; then
+            echo "::error::package-lock.json version (${LOCK_VERSION}) does not match package.json (${{ steps.resolve.outputs.version }})"
+            exit 1
+          fi
+
+      - name: Verify working tree is clean
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree not clean at tagged commit"
+            git status --short
+            exit 1
+          fi
+
+      # Internal-path exposure guard: the test/ directory and .leak-denylist/
+      # must never be tracked in this public repository. If either is present
+      # in the git index, fail immediately before any build or publish step.
+      - name: Guard against internal-path exposure (test/ and .leak-denylist/)
+        run: |
+          set -euo pipefail
+          TRACKED="$(git ls-files test/ .leak-denylist/)"
+          if [ -n "${TRACKED}" ]; then
+            echo "::error::Internal paths are tracked in the public repository index:"
+            echo "${TRACKED}"
+            echo "::error::Remove these paths from git tracking before releasing."
+            exit 1
+          fi
+          echo "OK: no tracked paths under test/ or .leak-denylist/"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve sibling versions into lock
+        # npm/cli#8320 + napi-rs/napi-rs#3174: platform-specific
+        # optionalDependencies are written to package-lock.json without
+        # version strings when the lock is generated on a platform that
+        # doesn't match the sibling. `npm ci` then fails strict-check
+        # BEFORE the install phase decides what to skip — so
+        # `--omit=optional` alone cannot bypass it. Running
+        # `npm install --package-lock-only --include=optional` against
+        # the live registry resolves all four sibling versions into the
+        # lock without touching node_modules; the subsequent `npm ci`
+        # then satisfies strict-check and `--omit=optional` skips the
+        # actual binary downloads we don't need on the publisher runner.
+        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          # --omit=optional: the four platform-sibling optionalDependencies
+          # are end-user-only. The preceding lock-resolution step ensures
+          # this passes strict-check; --omit=optional then skips the
+          # downloads themselves.
+          command: npm ci --omit=optional
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build TypeScript
+        run: npm run build
+
+      # Catalog signature pre-publish gate.
+      # Verifies every committed catalog artifact (bundle, catalog,
+      # mcp-registry) against its .sig file before any build/publish
+      # step runs. A signed-but-tampered artifact reaches the runtime
+      # gate in src/engine/keys/verifyCatalogSignature.ts and fails
+      # every customer install with
+      # "catalog signature gate failed reason=signature-verification-failed"
+      # followed by "No adapters matched" on every query.
+      # Incident: 3.0.6 publish, 2026-05-22. Bundle edit landed without
+      # a corresponding .sig refresh; CI shipped the broken pair to
+      # npm and every customer install broke. This gate is fail-closed.
+      - name: Verify catalog signatures (bundle, catalog, mcp-registry)
+        run: node scripts/verify-catalog-signature-prepublish.mjs
+
+      # Catalog bundle/sig lineage check — defense in depth.
+      # The pre-commit hook refuses bundle edits without a paired .sig
+      # update, but history can be rewritten with `git rebase` or
+      # `git commit --amend` after the hook has run. This step inspects
+      # the most-recent commit that touched each signed .json and
+      # confirms the same commit ALSO touched the matching .sig. Catches
+      # any path where the artifacts were ever desynchronized.
+      - name: Verify catalog bundle/sig commit-lineage parity
+        run: |
+          set -euo pipefail
+          bad=0
+          for ARTIFACT in chariot-adapter-bundle.json chariot-adapter-catalog.json; do
+            JSON_COMMIT=$(git log -1 --format='%H' -- "${ARTIFACT}")
+            SIG_COMMIT=$(git log -1 --format='%H' -- "${ARTIFACT}.sig")
+            if [ "${JSON_COMMIT}" != "${SIG_COMMIT}" ]; then
+              echo "::error::${ARTIFACT} last modified in ${JSON_COMMIT:0:12} but ${ARTIFACT}.sig last modified in ${SIG_COMMIT:0:12} — bundle/sig desync. Run the materializer to re-sign."
+              bad=1
+            else
+              echo "OK: ${ARTIFACT} and ${ARTIFACT}.sig last touched together (${JSON_COMMIT:0:12})"
+            fi
+          done
+          exit $bad
+
+      # `npm whoami` step removed: in 2026 the npm registry rejects this
+      # endpoint for any token type that lacks user-identity scope, including
+      # Granular Access Tokens scoped only to packages. The publish steps
+      # below run their own auth via NODE_AUTH_TOKEN; if the token works for
+      # publish, this sanity-check was redundant; if it doesn't, the publish
+      # steps emit clearer errors than a generic `whoami` 401. Per
+      # docs.npmjs.com/trusted-publishers the long-term migration is OIDC
+      # trusted publishing — tracked separately.
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. BUILD — one native binary per platform on its own runner
+  # ─────────────────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary_name: chariot-native.linux-x64-gnu.node
+          - platform: darwin-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary_name: chariot-native.darwin-x64.node
+          - platform: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            binary_name: chariot-native.darwin-arm64.node
+          - platform: win32-x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary_name: chariot-native.win32-x64-msvc.node
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          target: ${{ matrix.target }}
+          cache: false   # handled by Swatinem/rust-cache below
+
+      - name: Prepend toolchain cargo to PATH
+        # actions/runner-images#14099: on macos-14 / macos-15-arm64 images,
+        # `cargo` on PATH resolves to the rustup-init shim instead of the
+        # toolchain cargo. Symptom: `error: error: unexpected argument
+        # 'metadata' found / Usage: rustup-init[EXE]`. Prepending
+        # $HOME/.cargo/bin ensures the real cargo is found first. Applies
+        # to all runners (no-op on Linux/Windows where PATH is already
+        # correct, fixes darwin-arm64 where it isn't).
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+          key: ${{ matrix.target }}-rust-${{ env.RUST_VERSION }}
+          shared-key: native-${{ matrix.target }}
+
+      - name: Resolve sibling versions into lock
+        # See validate job for full rationale (npm/cli#8320 +
+        # napi-rs/napi-rs#3174). The build runner only needs THIS
+        # platform's native toolchain; --omit=optional skips the sibling
+        # downloads after strict-check passes.
+        shell: bash
+        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          # --omit=optional: same rationale as validate / publish-main.
+          # Each per-platform build runner does not need the OTHER platforms'
+          # native binaries; the build process for THIS platform's binary
+          # uses cargo + napi, not the published sibling binaries.
+          command: npm ci --omit=optional
+
+      - name: Build native binary
+        shell: bash
+        working-directory: native
+        run: |
+          set -euo pipefail
+          # Use `npx napi` for portability — git-bash on Windows runners
+          # does not reliably execute ../node_modules/.bin/napi directly.
+          npx --no-install napi build --platform --release --target ${{ matrix.target }}
+          ls -la
+
+      - name: Locate and normalize binary path
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # napi emits either `chariot-native.node` (when building for the
+          # host target) or `chariot-native.<triple>.node` (when targeting
+          # a non-host triple). Normalize both to a single well-known name.
+          cd native
+          if [ -f "${{ matrix.binary_name }}" ]; then
+            cp "${{ matrix.binary_name }}" chariot-native.node
+          elif [ -f chariot-native.node ]; then
+            :  # already in place
+          else
+            echo "::error::Expected binary not found for ${{ matrix.platform }}"
+            ls -la
+            exit 1
+          fi
+          test -s chariot-native.node
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: native/chariot-native.node
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. SIGN MANIFEST — single source of truth for all downstream packages
+  # ─────────────────────────────────────────────────────────────────────
+  # Builds the signed integrity.json once, from all four platform
+  # binaries. For any sibling already published at this version (partial-
+  # failure retry case), fetches its canonical binary from npm — with a
+  # retry loop to tolerate registry propagation lag — so the manifest
+  # always describes the bytes consumers will actually receive. Uploads
+  # the signed manifest as an artifact that publish-sibling, publish-main,
+  # and release all consume.
+  sign-manifest:
+    name: Sign integrity manifest
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: build-binaries
+
+      - name: Stage canonical binaries for signing
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          mkdir -p platform-binaries
+
+          for plat in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
+            case "${plat}" in
+              linux-x64)    PKG="@epicai/chariot-bin-linux-x64-gnu"   ;;
+              darwin-x64)   PKG="@epicai/chariot-bin-darwin-x64"      ;;
+              darwin-arm64) PKG="@epicai/chariot-bin-darwin-arm64"    ;;
+              win32-x64)    PKG="@epicai/chariot-bin-win32-x64-msvc"  ;;
+            esac
+
+            # Propagation-tolerant published check: retry npm view up to
+            # 5 times at 15s intervals before concluding the sibling is
+            # not on the registry. This prevents a race where sibling-N
+            # was just published by a prior workflow run and CDN cache
+            # hasn't caught up yet, which would otherwise cause us to
+            # sign against the fresh build bytes instead of the canonical
+            # bytes, producing a manifest that doesn't match what npm
+            # actually serves.
+            found=0
+            for attempt in 1 2 3 4 5; do
+              if npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
+                found=1
+                break
+              fi
+              if [ "${attempt}" -lt 5 ]; then
+                echo "  ${PKG}@${VERSION} not yet visible (attempt ${attempt}/5) — waiting..."
+                sleep 15
+              fi
+            done
+
+            if [ "${found}" -eq 1 ]; then
+              echo "Fetching canonical binary for ${PKG}@${VERSION} from registry"
+              tmp="$(mktemp -d)"
+              ( cd "${tmp}" && npm pack "${PKG}@${VERSION}" --silent >/dev/null )
+              tar -xzf "${tmp}"/*.tgz -C "${tmp}"
+              cp "${tmp}/package/chariot-native.node" "platform-binaries/${plat}.node"
+              rm -rf "${tmp}"
+              HASH="$(sha256sum "platform-binaries/${plat}.node" | awk '{print $1}')"
+              echo "${plat}: ${HASH} (fetched from npm)"
+            else
+              src="build-binaries/binary-${plat}/chariot-native.node"
+              if [ ! -f "${src}" ]; then
+                echo "::error::Missing binary artifact for ${plat}"
+                exit 1
+              fi
+              cp "${src}" "platform-binaries/${plat}.node"
+              HASH="$(sha256sum "platform-binaries/${plat}.node" | awk '{print $1}')"
+              echo "${plat}: ${HASH} (fresh build)"
+            fi
+          done
+
+      - name: Stage signing key
+        env:
+          SIGNING_KEY: ${{ secrets.CHARIOT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "${SIGNING_KEY}" > "${RUNNER_TEMP}/chariot-sign.pem"
+          chmod 600 "${RUNNER_TEMP}/chariot-sign.pem"
+          head -1 "${RUNNER_TEMP}/chariot-sign.pem" | grep -q 'BEGIN.*PRIVATE KEY' || {
+            echo "::error::CHARIOT_SIGNING_KEY is not a PEM private key"
+            exit 1
+          }
+
+      - name: Sign integrity manifest
+        run: |
+          set -euo pipefail
+          node scripts/sign-integrity.mjs \
+            --key "${RUNNER_TEMP}/chariot-sign.pem" \
+            --platform linux-x64=platform-binaries/linux-x64.node \
+            --platform darwin-x64=platform-binaries/darwin-x64.node \
+            --platform darwin-arm64=platform-binaries/darwin-arm64.node \
+            --platform win32-x64=platform-binaries/win32-x64.node
+
+      - name: Shred signing key
+        if: always()
+        run: |
+          if [ -f "${RUNNER_TEMP}/chariot-sign.pem" ]; then
+            shred -u "${RUNNER_TEMP}/chariot-sign.pem" 2>/dev/null || rm -f "${RUNNER_TEMP}/chariot-sign.pem"
+          fi
+
+      - name: Verify manifest coverage
+        run: node scripts/verify-manifest-coverage.mjs
+
+      - name: Upload signed manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: integrity-manifest
+          path: native/integrity.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload canonical platform binaries
+        # These are the bytes the signed manifest actually describes —
+        # fetched from npm for already-published siblings, or taken from
+        # the fresh build for siblings not yet on the registry. Downstream
+        # jobs (publish-main, release) must consume THESE, not the raw
+        # build artifacts, or they will ship a native/chariot-native.node
+        # whose hash does not match native/integrity.json.
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-binaries
+          path: platform-binaries
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 4. PUBLISH SIBLING PACKAGES — one per platform, includes manifest
+  # ─────────────────────────────────────────────────────────────────────
+  # Each sibling ships its own copy of the signed integrity.json alongside
+  # its binary. This makes every sibling self-verifiable: the loader finds
+  # the manifest via `binaryDir/integrity.json` and checks the binary
+  # against its own platform's entry. No cross-package manifest lookup.
+  publish-sibling:
+    name: Publish @epicai/${{ matrix.package }}
+    needs: [validate, build, sign-manifest]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            package: chariot-bin-linux-x64-gnu
+            os_json: '["linux"]'
+            cpu_json: '["x64"]'
+            libc_json: '["glibc"]'
+          - platform: darwin-x64
+            package: chariot-bin-darwin-x64
+            os_json: '["darwin"]'
+            cpu_json: '["x64"]'
+            libc_json: ''
+          - platform: darwin-arm64
+            package: chariot-bin-darwin-arm64
+            os_json: '["darwin"]'
+            cpu_json: '["arm64"]'
+            libc_json: ''
+          - platform: win32-x64
+            package: chariot-bin-win32-x64-msvc
+            os_json: '["win32"]'
+            cpu_json: '["x64"]'
+            libc_json: ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Upgrade npm for OIDC trusted publishing
+        # Trusted publishing requires npm >= 11.5.1; runner-bundled npm is older.
+        # Pinned to match local box's verified-working npm version. `npm@latest`
+        # let actions/setup-node@v4's generated `.npmrc` (with `always-auth=true`)
+        # produce 404s on first-publish of new scoped sibling packages — see
+        # commit body / handover doc.
+        run: npm install -g npm@11.12.1
+
+      - name: Check if sibling already published (idempotency)
+        id: check
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          PKG="@epicai/${{ matrix.package }}"
+          if npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${PKG}@${VERSION} is already on the registry — skipping publish"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download binary artifact
+        if: steps.check.outputs.already == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: sibling-pkg
+
+      - name: Download integrity manifest
+        if: steps.check.outputs.already == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: integrity-manifest
+          path: sibling-pkg
+
+      - name: Assemble sibling package
+        if: steps.check.outputs.already == 'false'
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          PKG_NAME: '@epicai/${{ matrix.package }}'
+          PLATFORM: ${{ matrix.platform }}
+          OS_JSON: ${{ matrix.os_json }}
+          CPU_JSON: ${{ matrix.cpu_json }}
+          LIBC_JSON: ${{ matrix.libc_json }}
+        run: |
+          set -euo pipefail
+
+          # Generate package.json via Node so we can conditionally include
+          # `libc` only for linux-x64 (where it constrains install to glibc
+          # and prevents npm from trying to install on musl/Alpine, which
+          # would defer the failure to runtime load).
+          node -e '
+            const fs = require("fs");
+            const pkg = {
+              name: process.env.PKG_NAME,
+              version: process.env.VERSION,
+              description: "Epic AI® Chariot — compiled native binary for " + process.env.PLATFORM,
+              main: "chariot-native.node",
+              files: [
+                "chariot-native.node",
+                "integrity.json",
+                "LICENSE-ELASTIC",
+                "README.md"
+              ],
+              os: JSON.parse(process.env.OS_JSON),
+              cpu: JSON.parse(process.env.CPU_JSON),
+              license: "SEE LICENSE IN LICENSE-ELASTIC",
+              repository: {
+                type: "git",
+                url: "https://github.com/protectnil/epic-ai-chariot.git"
+              },
+              homepage: "https://epic-ai.io",
+              publishConfig: {
+                access: "public"
+              }
+            };
+            if (process.env.LIBC_JSON) {
+              pkg.libc = JSON.parse(process.env.LIBC_JSON);
+            }
+            fs.writeFileSync("sibling-pkg/package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+
+          cp LICENSE-ELASTIC sibling-pkg/
+
+          cat > sibling-pkg/README.md <<EOF
+          # ${PKG_NAME}
+
+          This is the **${PLATFORM}** native binary for \`@epicai/chariot\`.
+
+          You almost certainly want to install the main package, not this one:
+
+          \`\`\`
+          npx @epicai/chariot
+          \`\`\`
+
+          npm will resolve the correct platform binary automatically via
+          \`optionalDependencies\`.
+
+          License: Elastic License 2.0 (see \`LICENSE-ELASTIC\`).
+          EOF
+
+          echo "--- package.json ---"
+          cat sibling-pkg/package.json
+          echo "--- files ---"
+          ls -la sibling-pkg/
+
+      - name: Materialize leak denylist from secrets
+        if: steps.check.outputs.already == 'false'
+        env:
+          LEAK_DENYLIST_REGEX: ${{ secrets.LEAK_DENYLIST_REGEX }}
+          LEAK_DENYLIST_REGEX_RESTRICTED: ${{ secrets.LEAK_DENYLIST_REGEX_RESTRICTED }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LEAK_DENYLIST_REGEX}" ] || [ -z "${LEAK_DENYLIST_REGEX_RESTRICTED}" ]; then
+            echo "::error::LEAK_DENYLIST_REGEX / LEAK_DENYLIST_REGEX_RESTRICTED secret(s) not set"; exit 1
+          fi
+          DL_DIR="${RUNNER_TEMP}/leak-denylist"
+          mkdir -p "${DL_DIR}"
+          printf '%s\n' "${LEAK_DENYLIST_REGEX}" > "${DL_DIR}/patterns.txt"
+          printf '%s\n' "${LEAK_DENYLIST_REGEX_RESTRICTED}" > "${DL_DIR}/patterns-restricted.txt"
+          echo "LEAK_DENYLIST_DIR=${DL_DIR}" >> "$GITHUB_ENV"
+          echo "Denylist materialized from secrets."
+
+      - name: Leak scan sibling package
+        if: steps.check.outputs.already == 'false'
+        run: npm run leak:scan -- sibling-pkg
+
+      - name: Write npm auth file for sibling publish
+        # Matches the local box's verified-working .npmrc shape exactly:
+        # a single _authToken line scoped to registry.npmjs.org, with NO
+        # `always-auth=true` (the legacy key that npm 11+ warns on and that
+        # actions/setup-node@v4's generated .npmrc emits when registry-url is
+        # set). Removing the generated .npmrc was the structural fix.
+        if: steps.check.outputs.already == 'false'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > sibling-pkg/.npmrc
+
+      - name: Publish sibling package
+        if: steps.check.outputs.already == 'false'
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            cd sibling-pkg && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify sibling is visible on registry
+        if: steps.check.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          # Post-publish propagation probe. npm CDN propagation on brand-
+          # new scoped packages regularly takes 60–120s, so the retry
+          # budget needs real headroom. 12 × 15s = 3 minutes tolerates the
+          # slow tail without being generous enough to mask a real failure.
+          VERSION="${{ needs.validate.outputs.version }}"
+          PKG="@epicai/${{ matrix.package }}"
+          for i in $(seq 1 12); do
+            if npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
+              echo "::notice::${PKG}@${VERSION} visible on registry (attempt ${i}/12)"
+              exit 0
+            fi
+            echo "Waiting for registry propagation (attempt ${i}/12)..."
+            sleep 15
+          done
+          echo "::error::${PKG}@${VERSION} not visible after 3 minutes of polling"
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 5. PUBLISH MAIN — run tests, ship main tarball with manifest
+  # ─────────────────────────────────────────────────────────────────────
+  publish-main:
+    name: Publish @epicai/chariot
+    needs: [validate, build, sign-manifest, publish-sibling]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    services:
+      # secrets-flow-eval-may-2026, customer-ux-eval-may-2026, and other
+      # tests under npm test connect to MongoDB on localhost:27017. GitHub
+      # ubuntu-22.04 images do not include a running Mongo, so we spin one
+      # up as a service container. Mongo 7 matches the local-box version.
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install uv (provides uvx)
+        # supply-chain-eval-may-2026 G5/G6/G7 gates exercise uvx-mediated
+        # package installs; the eval reports SKIP_NO_UVX_TOOL when uvx is
+        # missing and the validator treats SKIP as FAIL. Use Astral's
+        # official installer to put `uvx` on PATH for this job.
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Upgrade npm for OIDC trusted publishing
+        # See publish-sibling job — same rationale. Pin matches local box.
+        run: npm install -g npm@11.12.1
+
+      - name: Check if main already published (idempotency)
+        id: check
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          if npm view "@epicai/chariot@${VERSION}" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@epicai/chariot@${VERSION} is already on the registry — skipping publish"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve sibling versions into lock
+        if: steps.check.outputs.already == 'false'
+        # See validate job for full rationale (npm/cli#8320 +
+        # napi-rs/napi-rs#3174). Runs against the live registry so the
+        # four sibling-package versions are populated into the lock
+        # without touching node_modules — strict-check then passes and
+        # --omit=optional skips the actual sibling binary downloads.
+        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+
+      - name: Install dependencies
+        if: steps.check.outputs.already == 'false'
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          # --omit=optional: skip the 4 platform-sibling optionalDependencies.
+          # This publisher runner does not consume any platform native binary
+          # — those are for end users. The preceding lock-resolution step
+          # populates the sibling versions so strict-check passes; this
+          # flag then skips the actual ~4×1.6MB downloads.
+          command: npm ci --omit=optional
+
+      - name: Build TypeScript
+        if: steps.check.outputs.already == 'false'
+        run: npm run build
+
+      - name: Materialize leak denylist from secrets
+        if: steps.check.outputs.already == 'false'
+        env:
+          LEAK_DENYLIST_REGEX: ${{ secrets.LEAK_DENYLIST_REGEX }}
+          LEAK_DENYLIST_REGEX_RESTRICTED: ${{ secrets.LEAK_DENYLIST_REGEX_RESTRICTED }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LEAK_DENYLIST_REGEX}" ] || [ -z "${LEAK_DENYLIST_REGEX_RESTRICTED}" ]; then
+            echo "::error::LEAK_DENYLIST_REGEX / LEAK_DENYLIST_REGEX_RESTRICTED secret(s) not set"; exit 1
+          fi
+          DL_DIR="${RUNNER_TEMP}/leak-denylist"
+          mkdir -p "${DL_DIR}"
+          printf '%s\n' "${LEAK_DENYLIST_REGEX}" > "${DL_DIR}/patterns.txt"
+          printf '%s\n' "${LEAK_DENYLIST_REGEX_RESTRICTED}" > "${DL_DIR}/patterns-restricted.txt"
+          echo "LEAK_DENYLIST_DIR=${DL_DIR}" >> "$GITHUB_ENV"
+          echo "Denylist materialized from secrets."
+
+      - name: Leak scan release source and dist
+        if: steps.check.outputs.already == 'false'
+        run: npm run leak:scan -- src dist
+
+      - name: Download canonical platform binaries
+        if: steps.check.outputs.already == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: canonical-binaries
+          path: download-canonical
+
+      - name: Download signed manifest
+        if: steps.check.outputs.already == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: integrity-manifest
+          path: download-manifest
+
+      - name: Stage main tarball contents
+        if: steps.check.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          # Main tarball ships the canonical linux-x64 binary (from the
+          # sign-manifest job — either fetched from npm for an already-
+          # published sibling, or taken from the fresh build) and the
+          # matching signed manifest. Mac/Windows consumers resolve via
+          # optionalDependencies and load from a sibling package, which
+          # ships its own copy of the same manifest.
+          cp download-canonical/linux-x64.node native/chariot-native.node
+          cp download-manifest/integrity.json native/integrity.json
+          MAIN_BIN_HASH="$(sha256sum native/chariot-native.node | awk '{print $1}')"
+          MANIFEST_LINUX_HASH="$(node -p "require('./native/integrity.json').hashes['linux-x64']")"
+          echo "main native/chariot-native.node: ${MAIN_BIN_HASH}"
+          echo "manifest linux-x64 hash         : ${MANIFEST_LINUX_HASH}"
+          if [ "${MAIN_BIN_HASH}" != "${MANIFEST_LINUX_HASH}" ]; then
+            echo "::error::main binary hash does not match manifest linux-x64 entry"
+            exit 1
+          fi
+
+      - name: Stage signing key and CI test fixtures
+        # Stage the LICENSE-signing key in $RUNNER_TEMP for the
+        # native-integration license tests. This is a DIFFERENT keypair
+        # from CHARIOT_SIGNING_KEY (which is the integrity-manifest
+        # signing key, used by sign-manifest job):
+        #   - native/src/license.rs ACCEPTED_PUBLIC_KEYS_PEM expects the
+        #     post-rotation key (kid f8b8f6f6...) — paired with
+        #     secrets.CHARIOT_LICENSE_SIGNING_KEY.
+        #   - scripts/verify-manifest-coverage.mjs PUBLIC_KEY_PEM expects
+        #     the pre-rotation key — paired with secrets.CHARIOT_SIGNING_KEY.
+        # Conflating the two would either break license tests
+        # (post-rotation binary rejects pre-rotation signature) or break
+        # integrity verification (verifier rejects post-rotation signature).
+        # Discovery test fixture is staged ephemerally for the test run.
+        if: steps.check.outputs.already == 'false'
+        env:
+          SIGNING_KEY: ${{ secrets.CHARIOT_LICENSE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+
+          umask 077
+          printf '%s\n' "${SIGNING_KEY}" > "${RUNNER_TEMP}/chariot-license.private.pem"
+          chmod 600 "${RUNNER_TEMP}/chariot-license.private.pem"
+          head -1 "${RUNNER_TEMP}/chariot-license.private.pem" | grep -q 'BEGIN.*PRIVATE KEY' || {
+            echo "::error::CHARIOT_LICENSE_SIGNING_KEY is not a PEM private key"
+            exit 1
+          }
+
+          mkdir -p "${RUNNER_TEMP}/test-fixture"
+          cat > "${RUNNER_TEMP}/test-fixture/payments.ts" <<'FIXTURE'
+          import { Router } from 'express';
+          const router = Router();
+          router.get('/pay', (req, res) => res.json({}));
+          router.post('/refund', (req, res) => res.json({}));
+          router.get('/status', (req, res) => res.json({}));
+          export default router;
+          FIXTURE
+
+      - name: Restore committed package-lock.json before prepublish gate
+        # The Resolve-sibling-versions step earlier in this job mutated
+        # package-lock.json in place to satisfy `npm ci`'s strict-check
+        # (npm/cli#8320 + napi-rs/napi-rs#3174). Once `npm ci` has run,
+        # those mutations have no downstream consumer — `npm publish`
+        # does not read the lock — and they trip the prepublishOnly
+        # dirty-tree refusal. Restore the committed lock so the gate
+        # sees a clean tree. The committed lock was already verified
+        # at the target version by the validate job.
+        if: steps.check.outputs.already == 'false'
+        run: git checkout -- package-lock.json
+
+      # Clone the private eval suite (sparse: evals/chariot only) so the
+      # prepublish gate can run the full eval battery against the built dist.
+      # The test/ directory is intentionally absent from this public repo;
+      # evals live in the private companion repo and are fetched here at
+      # gate time using a deploy token scoped to that repo.
+      - name: Ensure leak denylist materialized from secrets
+        if: steps.check.outputs.already == 'false'
+        env:
+          LEAK_DENYLIST_REGEX: ${{ secrets.LEAK_DENYLIST_REGEX }}
+          LEAK_DENYLIST_REGEX_RESTRICTED: ${{ secrets.LEAK_DENYLIST_REGEX_RESTRICTED }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LEAK_DENYLIST_REGEX}" ] || [ -z "${LEAK_DENYLIST_REGEX_RESTRICTED}" ]; then
+            echo "::error::LEAK_DENYLIST_REGEX / LEAK_DENYLIST_REGEX_RESTRICTED secret(s) not set"; exit 1
+          fi
+          DL_DIR="${RUNNER_TEMP}/leak-denylist"
+          mkdir -p "${DL_DIR}"
+          printf '%s\n' "${LEAK_DENYLIST_REGEX}" > "${DL_DIR}/patterns.txt"
+          printf '%s\n' "${LEAK_DENYLIST_REGEX_RESTRICTED}" > "${DL_DIR}/patterns-restricted.txt"
+          echo "LEAK_DENYLIST_DIR=${DL_DIR}" >> "$GITHUB_ENV"
+          echo "Denylist materialized from secrets (prepublish gate)."
+
+      - name: Run deterministic eval gate (fail-closed)
+        id: eval_gate
+        # The publish path previously ran only `prepublishOnly`, whose
+        # `[ -d test ]` guard SKIPS the eval battery because test/ is absent
+        # from this public repo — so nothing was actually evaluated before
+        # publish (3.1.0 shipped broken for exactly this reason). Clone the
+        # private eval suite and run the DETERMINISTIC subset (no model
+        # endpoint exists in CI) against the freshly built dist. Any non-zero
+        # fails the job, so the later Publish step never runs (fail-closed).
+        if: steps.check.outputs.already == 'false'
+        env:
+          EVAL_REPO_TOKEN: ${{ secrets.EVAL_REPO_TOKEN }}
+          CHARIOT_SIGNING_KEY: ${{ secrets.CHARIOT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EVAL_REPO_TOKEN}" ]; then
+            echo "::error::EVAL_REPO_TOKEN not set — eval gate cannot run; refusing to publish"; exit 1
+          fi
+          EVAL_ROOT="${RUNNER_TEMP}/eval-suite"
+          rm -rf "${EVAL_ROOT}"
+          # Sparse, blobless clone of the private eval suite (evals/chariot only).
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://x-access-token:${EVAL_REPO_TOKEN}@github.com/protectnil/protectnil-agents.git" \
+            "${EVAL_ROOT}"
+          git -C "${EVAL_ROOT}" sparse-checkout set evals/chariot
+          EVAL_DIR="${EVAL_ROOT}/evals/chariot/test/ai-evals"
+          if [ ! -f "${EVAL_DIR}/run-all.mjs" ]; then
+            echo "::error::eval runner not found at ${EVAL_DIR}/run-all.mjs — refusing to publish"; exit 1
+          fi
+          # Point the suite at the chariot built in this checkout; run the
+          # deterministic subset only. Mongo service is up on :27017.
+          CHARIOT_ROOT="${GITHUB_WORKSPACE}" \
+          CHARIOT_EVAL_DETERMINISTIC=1 \
+          node "${EVAL_DIR}/run-all.mjs"
+
+          ATTESTATION_PATH="${RUNNER_TEMP}/chariot-eval-gate.attestation.json"
+          VERSION="${{ needs.validate.outputs.version }}"
+          printf '%s' "{\"gate\":\"deterministic-ai-evals\",\"status\":\"passed\",\"commit\":\"${GITHUB_SHA}\",\"run_id\":\"${GITHUB_RUN_ID}\",\"run_attempt\":\"${GITHUB_RUN_ATTEMPT}\",\"version\":\"${VERSION}\"}" > "${ATTESTATION_PATH}"
+          ATTESTATION_SHA256="$(sha256sum "${ATTESTATION_PATH}" | awk '{print $1}')"
+          ATTESTATION_SIG="$(node -e "const {createPrivateKey,sign}=require('node:crypto');const {readFileSync}=require('node:fs');const key=createPrivateKey(process.env.CHARIOT_SIGNING_KEY);const payload=readFileSync(process.argv[1]);process.stdout.write(sign(null,payload,key).toString('base64'))" "${ATTESTATION_PATH}")"
+          printf 'attestation_path=%s\n' "${ATTESTATION_PATH}" >> "${GITHUB_OUTPUT}"
+          printf 'attestation_sha256=%s\n' "${ATTESTATION_SHA256}" >> "${GITHUB_OUTPUT}"
+          printf 'attestation_sig=%s\n' "${ATTESTATION_SIG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run prepublish gate
+        if: steps.check.outputs.already == 'false'
+        env:
+          CHARIOT_LICENSE_SIGNING_KEY_PATH: ${{ runner.temp }}/chariot-license.private.pem
+          CHARIOT_LICENSE_SIGNING_KID: ${{ secrets.CHARIOT_SIGNING_KID }}
+          CHARIOT_DISCOVERY_FIXTURE_DIR: ${{ runner.temp }}/test-fixture
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/.npmrc
+          # Tamper-evident proof the deterministic eval gate ran and passed,
+          # bound to HEAD + version and hash-verified inside prepublishOnly.
+          CHARIOT_EVAL_GATE_ATTESTATION: ${{ steps.eval_gate.outputs.attestation_path }}
+          CHARIOT_EVAL_GATE_ATTESTATION_SHA256: ${{ steps.eval_gate.outputs.attestation_sha256 }}
+          CHARIOT_EVAL_GATE_ATTESTATION_SIG: ${{ steps.eval_gate.outputs.attestation_sig }}
+        run: npm run prepublishOnly
+
+      - name: Write npm auth file for main publish
+        # See publish-sibling job — same .npmrc-shape rationale.
+        if: steps.check.outputs.already == 'false'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > "${RUNNER_TEMP}/.npmrc"
+
+      - name: Publish main package
+        if: steps.check.outputs.already == 'false'
+        # Prepublish checks already ran once in the dedicated gate step.
+        # `--ignore-scripts` prevents npm from invoking prepublishOnly a
+        # second time, which would otherwise re-run the stateful test suite.
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: npm publish --access public --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/.npmrc
+
+      - name: Verify main is visible on registry
+        if: steps.check.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          # Post-publish propagation probe. Same 12 × 15s = 3 minute
+          # budget as publish-sibling for consistency. npm CDN on new
+          # scoped packages often needs more than 50s to propagate.
+          VERSION="${{ needs.validate.outputs.version }}"
+          for i in $(seq 1 12); do
+            if npm view "@epicai/chariot@${VERSION}" version >/dev/null 2>&1; then
+              echo "::notice::@epicai/chariot@${VERSION} visible on registry (attempt ${i}/12)"
+              exit 0
+            fi
+            echo "Waiting for registry propagation (attempt ${i}/12)..."
+            sleep 15
+          done
+          echo "::error::@epicai/chariot@${VERSION} not visible after 3 minutes of polling"
+          exit 1
+
+      - name: Shred signing key and remove CI fixtures
+        # Runs on every exit path so the PEM never outlives the job.
+        if: always()
+        run: |
+          set +e
+          if [ -f "${RUNNER_TEMP}/chariot-license.private.pem" ]; then
+            shred -u "${RUNNER_TEMP}/chariot-license.private.pem" 2>/dev/null \
+              || rm -f "${RUNNER_TEMP}/chariot-license.private.pem"
+          fi
+          rm -rf "${RUNNER_TEMP}/test-fixture"
+          exit 0
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 6. GITHUB RELEASE — attach binaries, auto-generate notes
+  # ─────────────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub release
+    needs: [validate, publish-main]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download canonical platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: canonical-binaries
+          path: canonical-binaries
+
+      - name: Download signed manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: integrity-manifest
+          path: manifest-stage
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          VERSION="${{ needs.validate.outputs.version }}"
+          # Release assets are the same canonical bytes the signed manifest
+          # describes — not the raw build artifacts. This matters when a
+          # sibling was already on npm and sign-manifest pulled its bytes
+          # back to keep the manifest consistent with the registry.
+          for plat in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
+            src="canonical-binaries/${plat}.node"
+            dst="release-assets/chariot-native-${plat}-v${VERSION}.node"
+            cp "${src}" "${dst}"
+            sha256sum "${dst}" > "${dst}.sha256"
+          done
+          cp manifest-stage/integrity.json "release-assets/integrity-v${VERSION}.json"
+          ls -la release-assets/
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.validate.outputs.version }}
+          name: v${{ needs.validate.outputs.version }}
+          # Pin tag/release to the exact commit the workflow validated.
+          # Without this, action-gh-release creates the tag at the default
+          # branch HEAD, which can drift from the commit that was actually
+          # built and published.
+          target_commitish: ${{ needs.validate.outputs.commit }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.node
+            release-assets/*.sha256
+            release-assets/integrity-*.json
+          fail_on_unmatched_files: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 7. POST-PUBLISH PROBE — install from npm, exercise customer flow
+  #
+  # Runs the external adversarial probe (test/external-adversarial-probe.sh)
+  # against the freshly-published tarball in a clean container. The
+  # probe does `npm install @epicai/chariot` and then exercises:
+  #   - chariot search slack            → top hit must be slack
+  #   - chariot search stripe           → top hit must be stripe
+  #   - chariot add slack (no creds)    → exit 4 STDIN_REQUIRED
+  #   - chariot query (NL → wikipedia)  → routes to wikipedia
+  #   - chariot list                    → no WARN about dropped entries
+  #   - wayback packageName             → resolves on npm
+  #
+  # The first three lines of the probe verify the catalog signature
+  # gate by side effect: a broken bundle returns "No adapters matched"
+  # and the probe fails. This is the gate that would have caught the
+  # 3.0.6 publish before it reached the npm registry's customer
+  # downloads.
+  #
+  # On failure: emit a loud error and fail the job for human triage. It
+  # does NOT auto-deprecate or reset dist-tags — a probe failure can be
+  # probe-infrastructure (missing script, runner/registry transient) rather
+  # than a package defect, and auto-mutating a published release on such a
+  # signal can take down a healthy version. Deprecate manually only after a
+  # human confirms the published package is actually broken.
+  # ─────────────────────────────────────────────────────────────────────
+  post-publish-verify:
+    name: Post-publish customer-flow probe
+    needs: [validate, publish-main, release]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Wait for npm registry CDN propagation
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          for i in $(seq 1 12); do
+            if npm view "@epicai/chariot@${VERSION}" version 2>/dev/null | grep -qx "${VERSION}"; then
+              echo "Version visible on npm registry."
+              exit 0
+            fi
+            echo "Waiting for npm propagation (attempt ${i}/12)..."
+            sleep 15
+          done
+          echo "::error::@epicai/chariot@${VERSION} not visible on npm after 3min"
+          exit 1
+
+      - name: Run external adversarial probe against published tarball
+        id: probe
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # Run the probe in a context that does NOT abort the shell on
+          # nonzero so we can record the exit code and then bubble it up
+          # as the step's exit code — which is what determines
+          # steps.probe.outcome. The earlier shape
+          #   bash test/external-adversarial-probe.sh
+          #   echo "rc=$?" >> "$GITHUB_OUTPUT"
+          # always exited 0 (the echo succeeded after a failing probe),
+          # so the outcome stayed 'success' and the auto-rollback step
+          # was never triggered. Fix: capture the probe rc, write it to
+          # $GITHUB_OUTPUT, then exit with the same rc so
+          # continue-on-error: true lets the workflow proceed to the
+          # rollback step while outcome == 'failure'.
+          bash scripts/external-adversarial-probe.sh
+          PROBE_RC=$?
+          echo "rc=$PROBE_RC" >> "$GITHUB_OUTPUT"
+          exit $PROBE_RC
+
+      - name: Alert on probe failure (auto-deprecate disabled)
+        if: steps.probe.outcome == 'failure'
+        run: |
+          set -uo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          # A probe failure is NOT a license to auto-mutate a published release.
+          # The probe can fail for reasons that have nothing to do with the
+          # package (missing probe script, runner/network/registry transient,
+          # propagation timing). Automatically running `npm deprecate` + a
+          # `latest` dist-tag reset on any such failure can take down a healthy
+          # release. This step therefore performs NO npm mutation: it fails the
+          # job (red signal) and requires a human to inspect the probe output
+          # and, only if the published package is genuinely broken, deprecate
+          # manually after confirmation.
+          echo "::error::Customer-flow probe FAILED for @epicai/chariot@${VERSION} (run ${{ github.run_id }})."
+          echo "::error::Automatic deprecate / dist-tag rollback is DISABLED by design. Investigate the probe output; deprecate manually only after confirming the published package is actually broken."
+          exit 1

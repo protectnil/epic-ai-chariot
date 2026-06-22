@@ -1,0 +1,109 @@
+/**
+ * @epicai/chariot — In-Memory Audit Store Adapter
+ * For development and testing. Not for production use.
+ * Built on the Epic AI® Intelligence Platform
+ * Copyright 2026 protectNIL Inc. Elastic-2.0
+ */
+
+import type { AuditStoreAdapter, ActionRecord, AuditFilter, FailureMode } from '../../types/index.js';
+import { HashChain } from '../HashChain.js';
+
+export class InMemoryAuditAdapter implements AuditStoreAdapter {
+  private readonly records: ActionRecord[] = [];
+
+  append(record: ActionRecord): Promise<void> {
+    this.records.push(record);
+    return Promise.resolve();
+  }
+
+  query(filter: AuditFilter): Promise<ActionRecord[]> {
+    let results = [...this.records];
+
+    if (filter.since) {
+      const since = filter.since instanceof Date ? filter.since : new Date(filter.since);
+      results = results.filter(r => r.timestamp >= since);
+    }
+    if (filter.until) {
+      const until = filter.until instanceof Date ? filter.until : new Date(filter.until);
+      results = results.filter(r => r.timestamp <= until);
+    }
+    if (filter.tier) {
+      results = results.filter(r => r.tier === filter.tier);
+    }
+    if (filter.server) {
+      results = results.filter(r => r.server === filter.server);
+    }
+    if (filter.tool) {
+      results = results.filter(r => r.tool === filter.tool);
+    }
+    if (filter.persona) {
+      results = results.filter(r => r.persona === filter.persona);
+    }
+    if (filter.approvedBy) {
+      results = results.filter(r => r.approvedBy === filter.approvedBy);
+    }
+    if (filter.offset) {
+      results = results.slice(filter.offset);
+    }
+    if (filter.limit) {
+      results = results.slice(0, filter.limit);
+    }
+
+    return Promise.resolve(results);
+  }
+
+  verify(): Promise<{ valid: boolean; chainLength: number; brokenAt?: number }> {
+    const { valid, chainLength, brokenAt } = HashChain.verifyChain(this.records);
+    return Promise.resolve({ valid, chainLength, brokenAt });
+  }
+
+  /**
+   * Update the status and output of a pending record by ID.
+   * Mutates in-place for in-memory store.
+   */
+  updateStatus(
+    id: string,
+    status: 'completed' | 'failed',
+    output: Record<string, unknown>,
+    durationMs: number,
+    opts?: { failureMode?: FailureMode; retryCount?: number; retryReasons?: string[]; outcome?: import('../../types/index.js').CallOutcome; errorClass?: import('../../types/index.js').ErrorClass },
+  ): Promise<void> {
+    const record = this.records.find(r => r.id === id);
+    if (record) {
+      record.status = status;
+      record.output = output;
+      record.durationMs = durationMs;
+      // Spec contract: only assign when supplied; never write null/undefined.
+      if (opts?.failureMode !== undefined) {
+        record.failureMode = opts.failureMode;
+      }
+      if (opts?.retryCount !== undefined) {
+        record.retryCount = opts.retryCount;
+      }
+      if (opts?.retryReasons !== undefined) {
+        record.retryReasons = opts.retryReasons;
+      }
+      if (opts?.outcome !== undefined) {
+        record.outcome = opts.outcome;
+      }
+      if (opts?.errorClass !== undefined) {
+        record.errorClass = opts.errorClass;
+      }
+    }
+    return Promise.resolve();
+  }
+
+  /**
+   * Get all records. For testing.
+   */
+  all(): ActionRecord[] {
+    return [...this.records];
+  }
+
+  /**
+   * Clear all records. For testing.
+   */
+  clear(): void {
+    this.records.length = 0;
+  }
+}

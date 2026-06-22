@@ -1,0 +1,62 @@
+#  — explicit npm package contents allowlist.
+#
+# package.json "files" already whitelists the shipped paths, but
+# .npmignore is the conventional belt-and-suspenders. Without an
+# explicit .npmignore, npm falls back to .gitignore precedence
+# rules — a future contributor adding an entry to .gitignore can
+# accidentally ship development-only files when "files" includes
+# a glob that matches them. .npmignore makes the exclusion list
+# precedent-stable and explicit.
+#
+# Anything not listed in package.json "files" is excluded by default
+# (npm pack restricts to the allowlist). This file lists categories
+# that MUST NEVER ship even if a future glob change tries to include
+# them.
+
+# Source — engine source is shipped via dist/, not raw .ts files
+src/
+test/
+native/src/
+native/target/
+native/Cargo.toml
+native/Cargo.lock
+native/build.rs
+native/rust-toolchain.toml
+native/index.d.ts
+native/index.js
+
+# Build infrastructure that should never ship
+.github/
+scripts/
+docs/
+codex-chariot-eval-may-2026/
+
+# Dev artifacts
+node_modules/
+*.log
+*.tsbuildinfo
+# Source maps — debug-only, zero runtime value (~2.6k files). Shipped .d.ts
+# (the package "types"/exports) are KEPT; only *.map (incl. *.js.map / *.d.ts.map)
+# are excluded to shrink the tarball.
+*.map
+.env*
+.eslintrc*
+.eslintcache
+tsconfig.json
+tsconfig.*.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets — should never be in repo either, but defense in depth
+*.private.pem
+*.key
+secrets/
+
+# Coverage / test outputs
+coverage/
+.nyc_output/
+test-results/

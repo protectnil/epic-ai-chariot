@@ -1,0 +1,15 @@
+{
+  "name": "chariot-native",
+  "version": "2.0.0",
+  "private": true,
+  "main": "chariot-native.node",
+  "napi": {
+    "binaryName": "chariot-native",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  }
+}

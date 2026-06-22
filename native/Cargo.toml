@@ -1,0 +1,36 @@
+[package]
+name = "chariot-native"
+version = "1.0.0"
+edition = "2021"
+license = "Elastic-2.0"
+description = "Epic AI® Chariot — compiled enterprise module (IAM enforcement, credential vault, license validation, internal API discovery)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", features = ["napi9", "serde-json"] }
+napi-derive = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = { version = "2", features = ["pem"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+rand = "0.9"
+
+# Internal API discovery
+syn = { version = "2", features = ["full", "parsing", "visit"] }
+regex = "1"
+walkdir = "2"
+glob = "0.3"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = "symbols"
+opt-level = "z"

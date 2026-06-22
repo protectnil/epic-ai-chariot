@@ -1,0 +1,199 @@
+{
+  "__comment": "Chariot Production Drift Detection. Import into Grafana via Dashboard > Import > JSON. Requires Loki datasource uid 'grafanacloud-logs' and pm2 log stream. NOT auto-deployed.",
+  "title": "Chariot Production Drift Detection",
+  "uid": "chariot-drift-detection",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-7d", "to": "now" },
+  "timepicker": {},
+  "tags": ["chariot", "drift", "monitoring"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Top-1 Selection Accuracy — 7-day rolling drift overlay",
+      "description": "Hourly top-1 accuracy from synthetic golden-query replay. Drift fires when z-score > 2 over the 7-day rolling window.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "uid": "grafanacloud-logs", "type": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "top1Accuracy",
+          "expr": "sum_over_time({service=\"pm2\"} | json | type=\"drift-detected\" | signal=\"top1Accuracy\" | unwrap currentValue [1h])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "auto"
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "rollingMean" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } },
+              { "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "upperBand" },
+            "properties": [
+              { "id": "custom.fillBelowTo", "value": "lowerBand" },
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "color", "value": { "fixedColor": "rgba(255,100,100,0.15)", "mode": "fixed" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Per-Adapter Error Rate — drift overlay",
+      "description": "Fraction of adapter calls ending isError=true per 1-hour window. Drift fires when z-score > 2.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "uid": "grafanacloud-logs", "type": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "errorRate ({{adapterId}})",
+          "expr": "sum by (adapterId) (count_over_time({service=\"pm2\"} | json | type=\"result\" | isError=\"true\" [1h])) / sum by (adapterId) (count_over_time({service=\"pm2\"} | json | type=\"result\" [1h]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "drift-alert errorRate",
+          "expr": "count_over_time({service=\"pm2\"} | json | type=\"drift-detected\" | signal=~\"errorRate:.+\" [1h])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Per-Adapter Mean Retry Count — drift overlay",
+      "description": "Mean retryCount per adapter as recorded by the DriftDetector's meanRetry:<adapterId> signal. The series reads currentValue from the drift-detected event payload, matching the data path Panels 1 and 4 use. Drift fires when the DriftDetector's z-score exceeds 2 over the 7-day rolling window; the alert is recorded in the drift event itself rather than overlaid as a static threshold here.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "uid": "grafanacloud-logs", "type": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "mean retryCount ({{adapterId}})",
+          "expr": "sum by (signal) (sum_over_time({service=\"pm2\"} | json | type=\"drift-detected\" | signal=~\"meanRetry:.+\" | unwrap currentValue [1h]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Ensemble-Judge Verdict Distribution — drift overlay",
+      "description": "Fraction PASS / (PASS+FAIL) from ensemble-judge scoring the synthetic replay. Only populated when CHARIOT_EVAL_RUN_LLM=1 and judge keys are present. Drift fires when z-score > 2.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "uid": "grafanacloud-logs", "type": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "verdictDist (PASS rate)",
+          "expr": "sum_over_time({service=\"pm2\"} | json | type=\"drift-detected\" | signal=\"verdictDist\" | unwrap currentValue [1h])"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Drift Alerts (last 24h)",
+      "description": "Count of drift-alert JSONL entries in the last 24 hours across all signals.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 24 },
+      "datasource": { "uid": "grafanacloud-logs", "type": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count_over_time({service=\"pm2\"} | json | type=\"drift-detected\" [24h])",
+          "legendFormat": "Drift alerts"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 1 },
+            { "color": "red", "value": 5 }
+          ]
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Recent Drift Events",
+      "description": "Latest drift entries from the JSONL file via Loki. Columns: signal, z-score, currentValue, rollingMean, timestamp.",
+      "gridPos": { "h": 4, "w": 18, "x": 6, "y": 24 },
+      "datasource": { "uid": "grafanacloud-logs", "type": "loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service=\"pm2\"} | json | type=\"drift-detected\"",
+          "legendFormat": ""
+        }
+      ],
+      "transformations": [
+        { "id": "extractFields", "options": { "source": "labels" } },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "signal": "Signal",
+              "zScore": "z-score",
+              "currentValue": "Current",
+              "rollingMean": "7-day Mean",
+              "timestamp": "Detected At"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

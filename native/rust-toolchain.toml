@@ -1,0 +1,7 @@
+#  — Pin the toolchain so every build site uses the same rustc.
+# release.yml's RUST_VERSION env var is the operational copy of this value;
+# any change here must be matched in .github/workflows/release.yml.
+[toolchain]
+channel = "1.94.1"
+components = ["rustc", "cargo", "rust-std"]
+profile = "minimal"
