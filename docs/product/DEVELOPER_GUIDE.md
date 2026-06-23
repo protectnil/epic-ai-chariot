@@ -51,7 +51,7 @@ chariot serve
 chariot discover ./src
 ```
 
-For the full engine documentation (federation, routing, orchestrator, adapters), see the [Chariot Developer Guide](https://github.com/protectnil/epic-ai-chariot/blob/master/DEVELOPER_GUIDE.md). The engine is bundled directly in this package.
+For the full engine documentation (federation, routing, orchestrator, adapters), see the [Chariot Developer Guide](https://github.com/protectnil/epic-ai-chariot/blob/master/docs/product/DEVELOPER_GUIDE.md). The engine is bundled directly in this package.
 
 ---
 

@@ -48,14 +48,12 @@ test/ai-evals/_artifacts/
 # Internal docs ignored, but public integrator-facing spec must ship.
 # Use `docs/*` (not `docs/`) so the negation below can re-include a file.
 docs/*
-!docs/CHARIOT-SPEC.md
-# Operator-facing public docs that integrators MUST read at install/runtime.
-# Every file added here ships publicly — verify no internal paths,
-# credentials, or unverified citations before committing.
-!docs/operator/
-!docs/operator/*
-!docs/grafana/
-!docs/grafana/*
+# docs/product/ is the dedicated PUBLIC "Product Documentation" space — it
+# ships in the @epicai/chariot npm package. Everything under it is tracked.
+# Internal/engineering docs placed elsewhere under docs/ stay ignored.
+# Every file added under docs/product/ ships publicly — verify no internal
+# paths, credentials, identities, or unverified citations before committing.
+!docs/product/
 **/last-run-report.json
 # verify-dependency-provenance.mjs writes a structured run summary on
 # every invocation. Without this ignore, the file's presence in the

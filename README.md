@@ -12,7 +12,7 @@ Epic AI® Chariot is an **Intelligent Virtual Assistant (IVA) MCP gateway** that
 npx @epicai/chariot
 ```
 
-**Epic AI® Chariot publishes a per-item OWASP Top 10 for LLM Applications (2025) evidence map.** For each of the ten items, the map enumerates: (1) the runtime defense in source, (2) the hard-gate eval that exercises it, (3) the property the eval proves, and (4) the property the eval explicitly does NOT prove. Limitations are stated up-front rather than left for audit to discover. Item LLM04 (Data and Model Poisoning) is out of scope — Chariot does not train, fine-tune, or host the model. Full per-item table with file:line citations in [SECURITY_ARCHITECTURE.md §OWASP Top 10 for LLM Applications (2025)](SECURITY_ARCHITECTURE.md#owasp-top-10-for-llm-applications-2025--per-item-evidence-map). Self-asserted by protectNIL Inc.; adversarial-review-pipeline approved.
+**Epic AI® Chariot publishes a per-item OWASP Top 10 for LLM Applications (2025) evidence map.** For each of the ten items, the map enumerates: (1) the runtime defense in source, (2) the hard-gate eval that exercises it, (3) the property the eval proves, and (4) the property the eval explicitly does NOT prove. Limitations are stated up-front rather than left for audit to discover. Item LLM04 (Data and Model Poisoning) is out of scope — Chariot does not train, fine-tune, or host the model. Full per-item table with file:line citations in [SECURITY_ARCHITECTURE.md §OWASP Top 10 for LLM Applications (2025)](docs/product/SECURITY_ARCHITECTURE.md#owasp-top-10-for-llm-applications-2025--per-item-evidence-map). Self-asserted by protectNIL Inc.; adversarial-review-pipeline approved.
 
 ---
 
@@ -198,9 +198,9 @@ npm detects your platform and pulls the right binary automatically.
 
 - **Website:** [epic-ai.io](https://epic-ai.io)
 - **Chariot:** [github.com/protectnil/epic-ai-chariot](https://github.com/protectnil/epic-ai-chariot)
-- **Security Architecture:** [SECURITY_ARCHITECTURE.md](SECURITY_ARCHITECTURE.md)
-- **Security Policy:** [SECURITY.md](SECURITY.md)
-- **Operator — Nondeterminism by design:** [docs/operator/nondeterminism.md](docs/operator/nondeterminism.md)
+- **Security Architecture:** [docs/product/SECURITY_ARCHITECTURE.md](docs/product/SECURITY_ARCHITECTURE.md)
+- **Security Policy:** [docs/product/SECURITY.md](docs/product/SECURITY.md)
+- **Operator — Nondeterminism by design:** [docs/product/operator/nondeterminism.md](docs/product/operator/nondeterminism.md)
 - **Security email:** security@epic-ai.io
 - **Support:** support@epic-ai.io
 
