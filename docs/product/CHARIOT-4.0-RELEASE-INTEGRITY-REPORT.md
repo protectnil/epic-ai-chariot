@@ -36,8 +36,8 @@ checks:
 - `npm run typecheck`: PASS
 - `cargo check --manifest-path native/Cargo.toml`: PASS
 - `git diff --check`: PASS
-- `npm run verify:splade-artifact`: NOT PASS; the required
-  `CHARIOT_SPLADE_ARTIFACT_DIR` environment variable was not set.
+- `npm run verify:splade-artifact`: PASS with the pinned snapshot at
+  `/opt/bien/artifacts/fe-cache/models--Qdrant--Splade_PP_en_v1/snapshots/efcd182bc7eb351e81a9445752d4388c2bab500b` and the governed ONNX Runtime library.
 
 ## 9d4ec33 review
 
