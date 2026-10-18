@@ -92,7 +92,7 @@ export class AcledMCPServer extends MCPAdapterBase {
       name: 'acled',
       displayName: 'ACLED — Armed Conflict Location & Event Data',
       version: '1.0.0',
-      category: 'geopolitical',
+      category: 'government',
       keywords: [
         'acled', 'conflict', 'political violence', 'protest', 'riot',
         'battle', 'fatalities', 'armed conflict', 'security', 'geopolitical',

@@ -17,6 +17,10 @@
  */
 
 import { z } from 'zod';
+import { createLogger } from '../logger.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('engine.validate-tool-schema');
 
 // recursive property shape. Arrays carry `items` (single JSON-Schema
 // node describing element type); nested objects carry their own `properties` +
@@ -66,7 +70,7 @@ function warnOnceMissingSchema(adapterId: string, toolName: string): void {
   // Plain console.warn — the federation layer doesn't carry a logger
   // reference at this code path; operators forward stderr to their log
   // aggregator. The warn-once Set prevents log spam under high call volume.
-  console.warn(
+  moduleLog.warn(
     `[chariot] adapter "${adapterId}" tool "${toolName}" has no usable inputSchema, skipping per-tool validation`,
   );
 }

@@ -101,6 +101,28 @@ export class ApprovalQueue {
   }
 
   /**
+   * CHARIOT::§7.6::4 — mark every pending approval pointing at `server` as
+   * cancelled. Called by FederationManager.unloadAdapter() when an adapter
+   * is revoked at runtime ("ApprovalQueue items pointing at the adapter are
+   * marked as cancelled"). Idempotent per item: only 'pending' items are
+   * transitioned — already-decided (approved/denied/expired/cancelled)
+   * items are left untouched, mirroring approve()/deny()'s idempotence.
+   * Returns the items that were cancelled by this call.
+   */
+  cancelByServer(server: string, reason: string): PendingApproval[] {
+    const cancelled: PendingApproval[] = [];
+    for (const approval of this.queue.values()) {
+      if (approval.state !== 'pending') continue;
+      if (approval.action.server !== server) continue;
+      approval.state = 'cancelled';
+      approval.decidedAt = new Date();
+      approval.denyReason = reason;
+      cancelled.push(approval);
+    }
+    return cancelled;
+  }
+
+  /**
    * Get all pending approvals.
    */
   pending(): PendingApproval[] {

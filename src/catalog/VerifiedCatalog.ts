@@ -7,6 +7,11 @@
  * - Metadata normalization (name, toolCount, keywords, capabilities)
  * - Deduplication of conflicting adapter entries
  * - Failure reason tracking
+ * - CATALOG-WIDE trust state machine (CHARIOT::§5.2, CH-02): `verified` /
+ *   `stale` / `invalid`, Ed25519-gated, with an empty EFFECTIVE catalog on
+ *   `invalid` — distinct from the per-adapter bookkeeping above, which
+ *   tracks individual adapter verification records, not whether the whole
+ *   signed catalog document itself is trustworthy.
  *
  * Reads Chariot engine catalog entries and overlays trust metadata for
  * downstream consumers (routing, UI, audit).
@@ -25,6 +30,7 @@ import type {
   VerificationStatus,
 } from './types.js';
 import { DEFAULT_CATALOG_TRUST_CONFIG } from './types.js';
+import { chariotEmitter } from '../observability/emitter.js';
 
 // =============================================================================
 // Normalization helpers
@@ -85,6 +91,13 @@ function inferCapabilities(keywords: string[], toolNames: string[]): string[] {
 }
 
 /**
+ * Tolerance for a `lastVerifiedAt` slightly in the future (distributed
+ * verifiers with mildly skewed clocks). Anything further in the future is
+ * treated as untrustworthy and therefore STALE (fail closed).
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
  * ASCII byte-order comparison. Deterministic across locales/machines.
  * Returns negative if a < b, positive if a > b, 0 if equal.
  */
@@ -110,6 +123,159 @@ function inferFramework(entry: AdapterCatalogEntry): 'mcp' | 'rest' | 'both' | '
   if (hasMcp) return 'mcp';
   if (hasRest) return 'rest';
   return 'unknown';
+}
+
+// =============================================================================
+// Catalog-wide trust state machine (CHARIOT::§5.2, CH-02)
+// =============================================================================
+
+/**
+ * CHARIOT-SPEC.md:363-373 (`### 5.2 VerifiedCatalog state machine`):
+ *
+ *   | State      | Trigger                          | Effective catalog        |
+ *   |------------|-----------------------------------|---------------------------|
+ *   | `verified` | Signature valid, freshness OK     | Full catalog              |
+ *   | `stale`    | Signature valid, age > 7 days     | Full catalog with WARN log|
+ *   | `invalid`  | Signature mismatch or missing     | Empty catalog (CH-02)     |
+ *
+ *   "The state transition is computed on every catalog load and on every
+ *   refresh cycle. In 4.0.0, `invalid` also covers retrieval-manifest
+ *   mismatch, encoder mismatch, and any sealed-bundle signature failure."
+ *
+ * CH-02 (CHARIOT-SPEC.md:245): "A catalog whose signature fails
+ * verification produces an empty effective catalog, never a partial one."
+ */
+export type CatalogWideState = 'verified' | 'stale' | 'invalid';
+
+/**
+ * Seven days, in milliseconds — the §5.2 freshness boundary. Mirrors
+ * `DEFAULT_CATALOG_TRUST_CONFIG.staleDetection.maxAgeMs` (types.ts) and
+ * `isCatalogStaleFromMaterializedAt`'s default caller
+ * (`AdapterCatalog.ts`), which both already encode this same 7-day value;
+ * exported here so the ONE governing boundary constant for §5.2 lives next
+ * to the state machine that implements the clause.
+ */
+export const CATALOG_STATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface CatalogStateInput {
+  /**
+   * Result of the Ed25519 signature check on the catalog document (or
+   * bundle envelope). `false` covers BOTH "mismatch" and "missing" per the
+   * `invalid` row's trigger text — the caller does not need to distinguish
+   * the two; both mean "signature did not verify."
+   */
+  signatureValid: boolean;
+  /**
+   * Epoch-ms the catalog was materialized/signed, when known. Absent/
+   * non-finite is treated as "no staleness evidence" — NOT `invalid`.
+   * §5.2's `invalid` triggers are a closed enumeration (signature
+   * mismatch/missing, or one of the three CHARIOT::§5.2::5 4.0.0
+   * conditions); an unstamped `materializedAt` is not among them, and this
+   * mirrors the codebase's existing precedent for the same field
+   * (`isCatalogStaleFromMaterializedAt` in `AdapterCatalog.ts`, which
+   * returns "not stale" on absence — "a field no publisher stamps yet",
+   * not a signal to withhold admission). A signature-valid catalog with no
+   * age evidence is `verified`, same as one with a fresh timestamp.
+   */
+  materializedAtMs?: number;
+  /** Clock reference for the freshness check. Defaults to `Date.now()`. */
+  now?: number;
+  /** Freshness boundary. Defaults to {@link CATALOG_STATE_MAX_AGE_MS} (7 days). */
+  maxAgeMs?: number;
+  /**
+   * CHARIOT::§5.2::5 — 4.0.0 additions. Any one of these three, regardless
+   * of `signatureValid`, forces `invalid`.
+   */
+  retrievalManifestMismatch?: boolean;
+  encoderMismatch?: boolean;
+  sealedBundleSignatureFailed?: boolean;
+  /**
+   * CHARIOT-SPEC.md:383 (§5.4, amended): "`publicKeyPem?: string, //
+   * optional additional caller-supplied key; SHALL be validated as a
+   * member of the compiled-in CHARIOT_CATALOG_PUBLIC_KEYS rotation set
+   * (§5.1 trust anchor) before use — a supplied key outside that set
+   * SHALL be rejected, never substituted for it`." CHARIOT-SPEC.md:523
+   * (§5.7 "Trust anchor"): "A caller-supplied key outside that rotation
+   * set SHALL be rejected." Set when a caller-supplied
+   * `CatalogSourceConfig.publicKeyPem` (`AdapterCatalog.ts`) intersected
+   * to zero members of the compiled-in rotation set — forces `invalid`
+   * regardless of `signatureValid` (there is no key left to even attempt
+   * a signature check against, so `signatureValid` was never meaningfully
+   * computed).
+   */
+  acceptedKeysOutsideRotationSet?: boolean;
+}
+
+export interface CatalogStateResult {
+  state: CatalogWideState;
+  /** Human-readable trigger, always populated (never blank). */
+  reason: string;
+}
+
+/**
+ * CHARIOT::§5.2::1 — pure function: signature-valid + fresh → `verified`.
+ * CHARIOT::§5.2::2 — signature-valid + age > 7 days → `stale` (WARN is the
+ *   caller's responsibility — this function only classifies state; it has
+ *   no logging side effect so it stays independently unit-testable).
+ * CHARIOT::§5.2::3 — signature mismatch/missing → `invalid`.
+ * CHARIOT::§5.2::5 — retrieval-manifest mismatch / encoder mismatch /
+ *   sealed-bundle signature failure → `invalid`, checked FIRST so they
+ *   force `invalid` even when `signatureValid` is true (the adapter
+ *   catalog's own Ed25519 check can pass while a DIFFERENT 4.0.0 gate on
+ *   the same sealed bundle fails).
+ * CHARIOT-SPEC.md:383 / :523 — a caller-supplied key set that intersected
+ *   to zero members of the compiled-in rotation set → `invalid`, checked
+ *   FIRST of all (before even the §5.2::5 triggers): with no key to
+ *   attempt a signature check against, `signatureValid` was never a
+ *   meaningful fact to gate on.
+ *
+ * Never throws. Every input combination maps to exactly one state.
+ */
+export function computeCatalogState(input: CatalogStateInput): CatalogStateResult {
+  // CHARIOT-SPEC.md:383 / :523 — checked first: with zero keys left to
+  // even attempt a signature check against, there is nothing for
+  // `signatureValid` to have meaningfully measured.
+  if (input.acceptedKeysOutsideRotationSet) {
+    return { state: 'invalid', reason: 'accepted-keys-outside-rotation-set' };
+  }
+  if (input.sealedBundleSignatureFailed) {
+    return { state: 'invalid', reason: 'sealed-bundle Ed25519 envelope signature failed (CHARIOT::§5.2::5)' };
+  }
+  if (input.retrievalManifestMismatch) {
+    return { state: 'invalid', reason: 'retrieval-manifest mismatch (CHARIOT::§5.2::5)' };
+  }
+  if (input.encoderMismatch) {
+    return { state: 'invalid', reason: 'encoder mismatch (CHARIOT::§5.2::5)' };
+  }
+  if (!input.signatureValid) {
+    return { state: 'invalid', reason: 'catalog signature mismatch or missing (CH-02)' };
+  }
+
+  const maxAgeMs = input.maxAgeMs ?? CATALOG_STATE_MAX_AGE_MS;
+  const now = input.now ?? Date.now();
+  const materializedAtMs = input.materializedAtMs;
+
+  // Absent/non-finite materializedAt: no staleness evidence, not an
+  // enumerated `invalid` trigger — verified (see field doc above).
+  if (materializedAtMs === undefined || !Number.isFinite(materializedAtMs)) {
+    return { state: 'verified', reason: 'catalog signature valid; no materialization timestamp to evaluate freshness against (treated as fresh)' };
+  }
+
+  const age = now - materializedAtMs;
+  if (age > maxAgeMs) {
+    return { state: 'stale', reason: `catalog signature valid but age ${age}ms exceeds ${maxAgeMs}ms (CHARIOT::§5.2::2)` };
+  }
+  return { state: 'verified', reason: 'catalog signature valid and freshness OK (CHARIOT::§5.2::1)' };
+}
+
+/**
+ * CH-02 / CHARIOT::§5.2::3 — the effective catalog on `invalid` is empty,
+ * "never a partial one." `verified` and `stale` both serve the FULL
+ * catalog (the `stale` row differs only by the WARN log the caller emits
+ * alongside this, not by truncating entries).
+ */
+export function effectiveCatalogEntries<T>(state: CatalogWideState, fullEntries: readonly T[]): T[] {
+  return state === 'invalid' ? [] : [...fullEntries];
 }
 
 // =============================================================================
@@ -147,8 +313,23 @@ export class VerifiedCatalog {
    * Record a successful verification for an adapter.
    * @param adapterName - Adapter identifier
    * @param verifiedAt - Optional ISO-8601 timestamp override (defaults to now)
+   *
+   * CHARIOT::§16.1 Catalog (CHARIOT-SPEC.md:1351, rulings item 91) — emits
+   * `catalog.signature_verified` only after the record is written below
+   * (never before the fail-closed timestamp check above, which can throw).
    */
   markVerified(adapterName: string, verifiedAt?: string): AdapterVerificationRecord {
+    // Fail closed on write: an unparseable timestamp would make
+    // isStaleTimestamp() see NaN and never report the record stale,
+    // leaving the adapter 'verified' forever. Reject it here.
+    if (
+      verifiedAt !== undefined &&
+      !Number.isFinite(new Date(verifiedAt).getTime())
+    ) {
+      throw new Error(
+        `markVerified(${adapterName}): invalid verifiedAt timestamp: ${verifiedAt}`,
+      );
+    }
     const key = this.verificationKey(adapterName);
     const record: AdapterVerificationRecord = {
       adapterName,
@@ -158,11 +339,15 @@ export class VerifiedCatalog {
       consecutiveFailures: 0,
     };
     this.verificationRecords.set(key, record);
+    chariotEmitter.send('catalog.signature_verified', { data: { adapterName } });
     return record;
   }
 
   /**
    * Record a failed verification with a reason.
+   *
+   * CHARIOT::§16.1 Catalog (CHARIOT-SPEC.md:1351, rulings item 91) — emits
+   * `catalog.signature_failed` after the record is written below.
    */
   markFailed(adapterName: string, reason: string): AdapterVerificationRecord {
     const key = this.verificationKey(adapterName);
@@ -175,6 +360,12 @@ export class VerifiedCatalog {
       consecutiveFailures: (existing?.consecutiveFailures ?? 0) + 1,
     };
     this.verificationRecords.set(key, record);
+    chariotEmitter.send('catalog.signature_failed', {
+      severity: 'urgent',
+      alertWorthy: true,
+      data: { adapterName, reason, consecutiveFailures: record.consecutiveFailures },
+      message: reason,
+    });
     return record;
   }
 
@@ -227,9 +418,18 @@ export class VerifiedCatalog {
 
   /**
    * Check if a timestamp is stale relative to the configured threshold.
+   *
+   * Fails CLOSED: a timestamp that cannot be proven fresh is stale.
+   * - Malformed/unparseable timestamps (NaN age) → stale.
+   * - Future timestamps beyond a small clock-skew tolerance → stale
+   *   (a future lastVerifiedAt yields a permanently negative age and
+   *   would otherwise keep the record 'verified' indefinitely).
    */
   isStaleTimestamp(isoTimestamp: string): boolean {
-    const age = Date.now() - new Date(isoTimestamp).getTime();
+    const t = new Date(isoTimestamp).getTime();
+    if (!Number.isFinite(t)) return true; // malformed → fail closed
+    const age = Date.now() - t;
+    if (age < -CLOCK_SKEW_TOLERANCE_MS) return true; // future beyond skew → untrustworthy
     return age > this.config.staleDetection.maxAgeMs;
   }
 
@@ -318,7 +518,9 @@ export class VerifiedCatalog {
    * - Prerelease identifiers compared per spec: numeric < alpha, numeric by
    *   value, alpha lexically (ASCII), longer prerelease set wins if all
    *   preceding identifiers are equal.
-   * - Falls back to localeCompare with numeric option for unparseable input.
+   * - Falls back to ASCII byte-order comparison (asciiCompare) for
+   *   unparseable input — deliberately locale-independent so ordering is
+   *   deterministic across machines; do NOT replace with localeCompare.
    */
   private compareVersions(a: string, b: string): number {
     const parse = (v: string) => {

@@ -1,0 +1,33 @@
+{{- if .Values.imageVerification.enabled -}}
+# Offline / portable Notation trust material (trust policy + named-store certs).
+# In-chart EKS admission enforcement uses the Kyverno policy's INLINE attestor
+# cert (image-verify-policy.yaml), so this ConfigMap intentionally has no in-chart
+# pod mount. Operators running `notation verify` directly (offline CLI / ECS)
+# mount these keys via subPath into
+# NOTATION_CONFIG/truststore/x509/signingAuthority/<name>/certs.pem.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chariot.fullname" . }}-notation-trust
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+data:
+  trustpolicy.json: |-
+    {{- $tp := .Values.imageVerification.notation.trustPolicy -}}
+    {{- dict
+      "version" "1.0"
+      "trustPolicies" (list (dict
+        "name" $tp.name
+        "registryScopes" $tp.registryScopes
+        "signatureVerification" (dict "level" "strict")
+        "trustStores" $tp.trustStores
+        "trustedIdentities" $tp.trustedIdentities
+      )) | toPrettyJson | nindent 4 }}
+  # Named trust-store certs (Notary Project layout). Mount each into
+  # truststore/x509/signingAuthority/<name>/certs.pem via a subPath volumeMount;
+  # notation does NOT read a flat truststore/certs.pem.
+  aws-signer-ts.certs.pem: |-
+    {{- .Values.imageVerification.notation.certs | nindent 4 }}
+  aws-us-gov-signer-ts.certs.pem: |-
+    {{- .Values.imageVerification.notation.certs | nindent 4 }}
+{{- end -}}

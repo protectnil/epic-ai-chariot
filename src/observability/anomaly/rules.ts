@@ -18,10 +18,21 @@ import type {
 
 /**
  * Sliding-window bookkeeping helper. Stores timestamps within a
- * window; prunes anything older than `windowMs` from `now`.
+ * window; prunes anything older than `windowMs` from the highest
+ * timestamp observed so far.
+ *
+ * ORDER-INDEPENDENT by contract (types.ts): multi-shard audit
+ * writers deliver signals with out-of-order timestamps, so pruning
+ * must not assume the entries array is chronologically sorted. A
+ * front-shift prune would stall behind a single future-skewed entry
+ * at index 0 and never evict anything behind it, inflating counts
+ * into false rate-spike/burst findings. Pruning filters the whole
+ * array against a monotonic high-water mark so a late-arriving old
+ * signal can never resurrect a larger window.
  */
 class SlidingWindow {
-  private readonly entries: number[] = [];
+  private entries: number[] = [];
+  private maxSeenMs = -Infinity;
   constructor(private readonly windowMs: number) {}
 
   add(epochMs: number): void {
@@ -35,14 +46,14 @@ class SlidingWindow {
   }
 
   reset(): void {
-    this.entries.length = 0;
+    this.entries = [];
+    this.maxSeenMs = -Infinity;
   }
 
   private prune(nowMs: number): void {
-    const cutoff = nowMs - this.windowMs;
-    while (this.entries.length > 0 && this.entries[0] < cutoff) {
-      this.entries.shift();
-    }
+    this.maxSeenMs = Math.max(this.maxSeenMs, nowMs);
+    const cutoff = this.maxSeenMs - this.windowMs;
+    this.entries = this.entries.filter((t) => t >= cutoff);
   }
 }
 
@@ -253,5 +264,45 @@ export class CrossTenantDriftRule implements AnomalyRule {
   reset(): void {
     this.seen.clear();
     this.lastFiredMs.clear();
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Rule 4: Scope violation — a read-only-scoped actor issues a destructive
+// (write/mutate/delete) tool call. This is a SINGLE-EVENT security
+// violation, not a volume/rate anomaly: one occurrence already means the
+// authorization boundary between "what was granted" and "what was allowed
+// to execute" failed, so the rule is intentionally stateless and fires on
+// every matching signal. Noise control (dedupe/cooldown) is the AlertQueue's
+// job downstream, not this rule's — a scope violation must never be
+// silently dropped by the detector itself.
+// ────────────────────────────────────────────────────────────────────────
+
+export class ScopeViolationRule implements AnomalyRule {
+  readonly id = 'scope-violation';
+  readonly label = 'Read-only-scoped actor issued a destructive tool call';
+
+  observe(signal: AnomalySignal): AnomalyFinding | null {
+    if (!signal.grantedReadOnly || !signal.destructive) return null;
+
+    const nowMs = signal.timestamp.getTime();
+    return {
+      ruleId: this.id,
+      label: this.label,
+      severity: 'critical',
+      detectedAt: new Date(nowMs),
+      trigger: signal,
+      suggestedAction:
+        `Actor ${signal.actorId} in tenant ${signal.tenantId} was granted READ-ONLY scope but ` +
+        `invoked destructive tool '${signal.toolName}' on adapter '${signal.adapterId}'. This ` +
+        'indicates either a forged/escalated token or an authorization-gate bug that failed to ' +
+        'enforce the granted scope. Revoke the session and audit the authorization path immediately.',
+      context: { grantedReadOnly: signal.grantedReadOnly, destructive: signal.destructive },
+    };
+  }
+
+  /** Stateless rule — nothing to reset, but implemented for interface conformance. */
+  reset(): void {
+    // no-op
   }
 }

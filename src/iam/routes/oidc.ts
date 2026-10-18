@@ -21,9 +21,77 @@ import { isMfaEnrolled } from '../services/mfa.js';
 import { oidcAssertedMfa } from '../services/idp-mfa.js';
 import * as audit from '../services/audit.js';
 import { isAuthRateLimited, recordAuthFailure, clearAuthFailures } from '../services/auth-rate-limit.js';
-import type { EnterpriseUserDocument } from '../types.js';
+import { clientIp as clientIpHelper } from '../utils/url.js';
+import { chariotEmitter } from '../../observability/emitter.js';
+import { decryptFields, splitEncryptedIv, VaultUpgradePersistFailedError } from '../crypto.js';
+import { COLLECTION as IAM_TENANTS_COLLECTION } from '../services/tenant.js';
+import type { EnterpriseUserDocument, OidcConfig } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
 
-const router = Router();
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.oidc');
+
+const router = Router({ mergeParams: true });
+
+/**
+ * §10.3::1 — the client secret is stored encrypted at rest as an AES-256-GCM
+ * "encrypted:iv" blob bound to the tenant (see updateSso). Resolve the runtime
+ * plaintext here by decrypting the blob when present; otherwise fall back to a
+ * legacy plaintext `clientSecret` (documents seeded before at-rest encryption,
+ * or builds without the native crypto binding) so OIDC stays operational.
+ */
+export async function resolveOidcClientSecret(
+  oidcConfig: OidcConfig,
+  tenantId: string,
+  sourceField: 'sso.oidc' | 'settings.oidc',
+): Promise<string> {
+  if (oidcConfig.clientSecretEncrypted) {
+    // splitEncryptedIv (crypto.ts) uses the LAST ':' as the separator, not
+    // the first — `clientSecretEncrypted` is `${encrypted}:${iv}` and a
+    // CH-10 v2-format `encrypted` value itself carries an internal "v2:"
+    // colon, so `indexOf(':')`/`.split(':')` split at the WRONG colon and
+    // silently produce a garbage iv for every v2 record. See crypto.ts.
+    const parts = splitEncryptedIv(oidcConfig.clientSecretEncrypted);
+    if (!parts) {
+      throw new Error('OIDC clientSecretEncrypted is malformed');
+    }
+    // CH-10 (§12.2) AAD binding — must match the fixed record identifier
+    // updateSso/encryptOidcSecretAtRest (tenant.ts) encrypted this under.
+    const result = await decryptFields(parts.encrypted, parts.iv, tenantId, 'oidc-client-secret');
+    // CH-10 upgrade-on-decrypt (§12.2, rulings item 59, "the caller MUST
+    // persist {encrypted, iv} back to the SAME record, in the SAME
+    // operation"). CAS on the legacy combined blob we just read: a
+    // concurrent upgrader that already rewrote this field makes the CAS
+    // match zero documents — an idempotent no-op, never a clobber. A
+    // genuine write error is NOT swallowed — it fails this login attempt.
+    if (result.upgraded) {
+      try {
+        const col = await getCollection(IAM_TENANTS_COLLECTION);
+        const writeRes = await col.updateOne(
+          { tenantId, [`${sourceField}.clientSecretEncrypted`]: oidcConfig.clientSecretEncrypted },
+          { $set: { [`${sourceField}.clientSecretEncrypted`]: `${result.upgraded.encrypted}:${result.upgraded.iv}` } },
+        );
+        void writeRes;
+      } catch (writeBackErr) {
+        moduleLog.error('OIDC client-secret upgrade-on-decrypt write-back failed', {
+          tenantId,
+          error: writeBackErr instanceof Error ? writeBackErr.message : String(writeBackErr),
+        });
+        throw new VaultUpgradePersistFailedError('oidc', `${tenantId}:oidc-client-secret`, writeBackErr);
+      }
+    }
+    return result.fields.value;
+  }
+  // §10.3::1 — new writes are encrypted at rest via updateSso. A config that
+  // still carries only a legacy plaintext `clientSecret` — seeded before at-rest
+  // encryption, or in a build WITHOUT the native crypto binding required to
+  // decrypt `clientSecretEncrypted` — is tolerated on read so OIDC stays
+  // operational. The write path (updateSso) always encrypts going forward.
+  if (oidcConfig.clientSecret) {
+    return oidcConfig.clientSecret;
+  }
+  throw new Error('OIDC clientSecret not configured');
+}
 
 /**
  * GET /oidc/authorize
@@ -34,9 +102,9 @@ const router = Router();
  */
 router.get('/oidc/authorize', async (req: Request, res: Response): Promise<void> => {
   try {
-    const tenantId = req.tenantId
-      || (req.query.tenant as string)
-      || (req.headers['x-tenant-id'] as string);
+    // §10.8::5 — tenant comes only from the URL (validated upstream by
+    // requireUrlTenantIsolation); never from a query param or header.
+    const tenantId = req.params.tenantId as string;
 
     if (!tenantId) {
       res.status(400).json({ error: 'Tenant not resolved' });
@@ -52,6 +120,7 @@ router.get('/oidc/authorize', async (req: Request, res: Response): Promise<void>
 
     // OIDC config may be at tenant.sso.oidc or tenant.settings.oidc
     const oidcConfig = tenant.sso?.oidc || tenant.settings?.oidc;
+    const oidcConfigField: 'sso.oidc' | 'settings.oidc' = tenant.sso?.oidc ? 'sso.oidc' : 'settings.oidc';
 
     if (!oidcConfig) {
       res.status(404).json({ error: 'OIDC not configured for this tenant' });
@@ -62,7 +131,7 @@ router.get('/oidc/authorize', async (req: Request, res: Response): Promise<void>
     const config = await client.discovery(
       new URL(oidcConfig.issuer),
       oidcConfig.clientId,
-      oidcConfig.clientSecret,
+      await resolveOidcClientSecret(oidcConfig, tenantId, oidcConfigField),
     );
 
     // Generate PKCE code verifier and challenge
@@ -101,7 +170,9 @@ router.get('/oidc/authorize', async (req: Request, res: Response): Promise<void>
     const legacyScope = oidcConfig.scope;
     const rawScopes: string[] | undefined = oidcConfig.scopes
       ?? (Array.isArray(legacyScope) ? legacyScope : legacyScope ? [legacyScope] : undefined);
-    const scopes: string[] = rawScopes ?? ['openid', 'profile', 'email'];
+    // §10.3::1: default scopes are ['openid','profile','email','groups'] —
+    // 'groups' is required so the IdP returns group claims for RBAC mapping.
+    const scopes: string[] = rawScopes ?? ['openid', 'profile', 'email', 'groups'];
 
     const parameters: Record<string, string> = {
       redirect_uri: oidcConfig.redirectUri,
@@ -120,7 +191,7 @@ router.get('/oidc/authorize', async (req: Request, res: Response): Promise<void>
     res.redirect(redirectTo.href);
   } catch (err) {
      
-    console.error('[iam/oidc] authorize initiation failed', err);
+    moduleLog.error('[iam/oidc] authorize initiation failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to initiate OIDC authorization' });
   }
 });
@@ -140,16 +211,28 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
   // parameter, then the `x-tenant-id` header. No-ops when no tenant can be
   // resolved at all. Never throws — rate-limit-store failures are logged.
   const recordAuthFailureSafe = async (): Promise<void> => {
-    const failIp = req.ip ?? 'unknown';
+    const failIp = clientIpHelper(req);
+    // §10.8::5 — cookie-bound tenant (signed state) is primary; else the URL
+    // tenant. Never a query param or header.
     const failTenant = parsedStateTenant
-      || (typeof req.query.tenant === 'string' ? req.query.tenant : '')
-      || (typeof req.headers['x-tenant-id'] === 'string' ? req.headers['x-tenant-id'] : '');
+      || (typeof req.params.tenantId === 'string' ? req.params.tenantId : '');
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) —
+    // recordAuthFailureSafe() is called from every failure branch in this
+    // handler, so this is the single natural site for auth.failure.
+    // Emitted even when failTenant is empty (an unresolvable tenant on a
+    // failed OIDC callback is itself a failure worth recording); the
+    // early-return below only skips the rate-limit bookkeeping, which
+    // genuinely needs a concrete tenant to key against.
+    chariotEmitter.send('auth.failure', {
+      severity: 'warning',
+      data: { tenantId: failTenant || null, method: 'oidc', ip: failIp },
+    });
     if (!failTenant) return;
     try {
       await recordAuthFailure(failIp, failTenant);
     } catch (rateLimitErr) {
        
-      console.error('[iam/oidc] recordAuthFailure failed', rateLimitErr);
+      moduleLog.error('[iam/oidc] recordAuthFailure failed', { error: rateLimitErr instanceof Error ? rateLimitErr.message : String(rateLimitErr) });
     }
   };
 
@@ -180,10 +263,12 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
     // if they diverge, failures accumulate under one key while the gate
     // reads another and 429 never fires. `recordAuthFailureSafe` is the
     // single source of truth for failure keying; this gate mirrors it.
-    const clientIp = req.ip ?? 'unknown';
+    // Trusted-proxy-aware IP (utils/url.clientIp), NOT req.ip — behind the
+    // reverse proxy req.ip is the nginx hop and collapses all clients into
+    // one bucket, enabling a tenant-wide SSO login DoS.
+    const clientIp = clientIpHelper(req);
     const gateTenantId = parsedStateTenant
-      || (typeof req.query.tenant === 'string' ? req.query.tenant : '')
-      || (typeof req.headers['x-tenant-id'] === 'string' ? req.headers['x-tenant-id'] : '');
+      || (typeof req.params.tenantId === 'string' ? req.params.tenantId : '');
     if (gateTenantId && await isAuthRateLimited(clientIp, gateTenantId)) {
       res.status(429).json({ error: 'Too many failed login attempts. Try again in 15 minutes.' });
       return;
@@ -215,6 +300,15 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
 
     const { state: expectedState, codeVerifier, tenantId, nonce: expectedNonce } = storedState;
 
+    // §10.8::5 — the URL tenant must equal the tenant bound into the signed
+    // state cookie at /authorize time. A mismatch is a cross-tenant callback
+    // attempt; fail closed and count it against the rate limiter.
+    if (tenantId !== req.params.tenantId) {
+      await recordAuthFailureSafe();
+      res.status(403).json({ error: 'Tenant mismatch' });
+      return;
+    }
+
  // A state cookie produced by /oidc/authorize after this fix is
     // shipped will always carry `nonce`. A cookie missing `nonce` is either
     // tampered or pre-fix (an attacker could intentionally forge a nonce-less
@@ -240,6 +334,7 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
 
     const tenant = await getByTenantId(tenantId);
     const oidcConfig = tenant?.sso?.oidc || tenant?.settings?.oidc;
+    const oidcConfigField: 'sso.oidc' | 'settings.oidc' = tenant?.sso?.oidc ? 'sso.oidc' : 'settings.oidc';
 
     if (!oidcConfig) {
       res.status(400).json({ error: 'OIDC not configured for this tenant' });
@@ -250,7 +345,7 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
     const config = await client.discovery(
       new URL(oidcConfig.issuer),
       oidcConfig.clientId,
-      oidcConfig.clientSecret,
+      await resolveOidcClientSecret(oidcConfig, tenantId, oidcConfigField),
     );
 
     // Exchange the authorization code for tokens
@@ -282,9 +377,22 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
     const sub = claims.sub;
     const name = claims.name as string | undefined;
     const groups = (claims.groups as string[] | undefined) ?? [];
+    const emailVerified = claims.email_verified as boolean | undefined;
 
     if (!email) {
       res.status(401).json({ error: 'Email claim missing from ID token' });
+      return;
+    }
+
+    // Account-binding defense: email is the JIT-provisioning / identity key
+    // below, so an id_token asserting email=victim@tenant with
+    // email_verified=false must NOT be allowed to adopt or create that
+    // identity. Reject an EXPLICIT false. (Undefined is tolerated — Entra ID
+    // and some enterprise IdPs omit the claim; requiring true unconditionally
+    // would break conformant IdPs.)
+    if (emailVerified === false) {
+      await recordAuthFailureSafe();
+      res.status(401).json({ error: 'Email not verified by identity provider' });
       return;
     }
 
@@ -318,7 +426,7 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
 
     if (!upsertResult) {
        
-      console.error(
+      moduleLog.error(
         `[iam/oidc] JIT provisioning returned null for tenant=${tenantId} email=${email}`,
       );
       res.status(500).json({ error: 'Failed to provision user' });
@@ -361,6 +469,18 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
     // Issue session. Stamp `mfaVerified: true` when either the tenant
     // doesn't require MFA or the IdP asserted MFA via the amr claim.
     const mfaVerified = !tenant.settings?.mfaRequired || idpMfa.asserted;
+
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) —
+    // `mfa.skipped_via_idp`: fires ONLY when the tenant requires MFA and
+    // the IdP already asserted it via the amr claim, skipping Chariot's
+    // own TOTP challenge. A tenant with mfaRequired=false has nothing to
+    // skip and must not emit this event.
+    if (tenant.settings?.mfaRequired && idpMfa.asserted) {
+      chariotEmitter.send('mfa.skipped_via_idp', {
+        data: { tenantId, userId: user._id.toString(), method: 'oidc', amr: idpMfa.amr },
+      });
+    }
+
     const token = await issueToken(user, tenant, { mfaVerified });
     const jti = (JSON.parse(
       Buffer.from(token.split('.')[1], 'base64url').toString(),
@@ -390,7 +510,7 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
         // Non-fatal — the session itself is valid. Log and continue;
         // MCP-dispatch will fall through to static credentials for
         // adapters that allow that fallback.
-        console.warn('[iam/oidc] setIdJagSubjectToken failed (non-fatal)', e);
+        moduleLog.warn('[iam/oidc] setIdJagSubjectToken failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
       }
     }
 
@@ -410,8 +530,16 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
         amr: idpMfa.amr,
         mfaRequired: Boolean(tenant.settings?.mfaRequired),
       },
-      ip: req.ip ?? 'unknown',
+      ip: clientIpHelper(req),
       userAgent: req.headers['user-agent'] ?? 'unknown',
+    });
+
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) — this
+    // point is only reached for a COMPLETED login: the MFA-required branch
+    // above returns early before here, so this never double-fires
+    // alongside mfa.ts's own auth.success on MFA completion.
+    chariotEmitter.send('auth.success', {
+      data: { tenantId, userId: user._id.toString(), method: 'oidc' },
     });
 
     // Set session cookies and redirect
@@ -438,7 +566,7 @@ router.get('/oidc/callback', async (req: Request, res: Response): Promise<void> 
     // IdP URLs, token response fragments, library stack hints, or other
     // sensitive material that must not reach the client.
      
-    console.error('[iam/oidc] callback auth failed', err);
+    moduleLog.error('[iam/oidc] callback auth failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(401).json({ error: 'OIDC authentication failed' });
   }
 });

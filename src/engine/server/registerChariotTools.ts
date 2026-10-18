@@ -9,21 +9,33 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ChariotState } from './ChariotState.js';
-import { handleRemember, handleRecall, handleForget } from './memoryHandlers.js';
-import {
-  handleResolveEntity,
-  handleCompareEntities,
-  handleEntityProfile,
-} from '../entity/handlers.js';
-import { handleQuery, handleCall, handleList, handleValidateClaim } from './toolHandlers.js';
+import { handleQuery, handleCall, handleList, credentialPrompterStorage } from './toolHandlers.js';
+import { createCredentialPrompter } from '../credentials/credentialPrompter.js';
+
+// C4AMD::§2::1 — Chariot's client-visible MCP tool surface is exactly these
+// three tools (chariot_query, chariot_call, chariot_list) per C4AMD §2 and
+// CHARIOT-SPEC §17.3/§22.2. chariot_remember, chariot_resolve_entity,
+// chariot_recall, chariot_compare_entities, chariot_forget,
+// chariot_entity_profile, and chariot_validate_claim were previously
+// registered here unconditionally; neither clause admits a conditional home
+// for them on the MCP surface, so they are NOT registered here. The memory
+// and entity handlers (memoryHandlers.ts, entity/handlers.ts) were deleted on
+// 2026-09-03 (rulings item 73, C4AMD::§2::1 — exactly three client-visible
+// tools); handleValidateClaim remains in toolHandlers.ts because it is
+// dispatched from the HTTP REST surface at transports/rest.ts:325.
+export const CLIENT_VISIBLE_TOOL_NAMES = ['chariot_query', 'chariot_call', 'chariot_list'] as const;
 
 // cap every string arg at the same length so JSON error payloads can
 // never serialize a multi-megabyte attacker-controlled string. One constant so
 // the limit stays consistent if tuned.
 const MAX_ARG_LEN = 256;
+// Natural-language searches need more room than identifiers and filters.
+// Keep the tighter cap for adapter/tool/category/search arguments while
+// allowing the model to preserve a complete user request in chariot_query.
+const MAX_QUERY_LEN = 1024;
 
 /**
- * Per-instance security context for a registered McpServer (bug-tracker-ref).
+ * Per-instance security context for a registered McpServer.
  * Each McpServer is built per-request on the streamable-HTTP path and
  * per-process on stdio, so a single context per registration is enough.
  *
@@ -38,7 +50,7 @@ export interface ChariotToolSecurityContext {
   /** Caller's verified tenant (per-request on HTTP; process tenant on stdio/loopback). */
   tenantId: string;
   /** RBAC grants from the verified session; undefined → anonymous (deny-by-default unless localMode). */
-  auth?: { allowedOperations?: Record<string, string[]>; userId: string };
+  auth?: { allowedOperations?: Record<string, string[]>; userId: string; isAdmin?: boolean };
   /** Single-user trust opt-in (stdio / shared-bearer loopback). NEVER true on the multi-tenant JWT path. */
   localMode: boolean;
   /**
@@ -58,6 +70,14 @@ export interface ChariotToolSecurityContext {
    * stdio / shared-bearer loopback (no per-user downstream credential path).
    */
   sessionJti?: string;
+  /**
+   * Client IP the request originated from, when the transport can determine
+   * one (streamable-HTTP — from the request socket). Threaded into
+   * handleCall's CallContext so the serve-path audit record (recordDispatch)
+   * carries it. Undefined on stdio (no per-request network origin) — never
+   * fabricated.
+   */
+  sourceIp?: string;
 }
 
 export function registerChariotTools(
@@ -68,16 +88,20 @@ export function registerChariotTools(
   // chariot_query — natural language search over configured or full-catalog adapters
   server.tool(
     'chariot_query',
+    'Natural language search over your configured adapters (or the full bundled ' +
+      'catalog with discover:true) that ranks and returns matching adapters and ' +
+      'their tools, for use as input to chariot_call.',
     {
-      query: z.string().max(MAX_ARG_LEN).describe(
+      query: z.string().max(MAX_QUERY_LEN).describe(
         'Natural language query. PRESERVE concrete signals from the user\'s ' +
           'request when rephrasing: error states (5xx, crash, failure), metric ' +
           'types (rate, p99, latency, count), and time windows (last hour, ' +
           'yesterday, Q4). Do NOT collapse these into generic terms like ' +
           '"monitoring" — they steer routing toward the right adapter ' +
           '(observability vs CI/CD vs analytics). Searches your configured ' +
-          'adapters by default. Use discover:true to search the full bundled ' +
-          'catalog.',
+          'adapters by default. Keep the query at or below 1,024 characters; ' +
+          'if the request is longer, summarize it while preserving those ' +
+          'concrete signals. Use discover:true to search the full bundled catalog.',
       ),
       detail: z.enum(['full', 'summary']).optional().describe(
         'full (default): top 20 with tool lists. summary: one-line adapter summaries — use this when the first call missed.',
@@ -94,10 +118,12 @@ export function registerChariotTools(
       // surfaced to this conversation. Casting via unknown because
       // RequestHandlerExtra typings vary across SDK minor versions.
       const sessionId = (extra as unknown as { sessionId?: string } | undefined)?.sessionId ?? sec.sessionId;
-      // bug-tracker-ref: thread the caller's verified tenant so the query-side
+      // Thread the caller's verified tenant so the query-side
       // adapter inventory and per-tenant context budget are tenant-isolated.
       // Tenant is session/process-configured, never from tool args.
-      const result = await handleQuery(args, state, { sessionId, tenantId: sec.tenantId });
+      // CHARIOT::§16.2 step 4 (rulings item 91(2)/115) — isAdmin threaded
+      // from the verified session only (sec.auth), never from `args`.
+      const result = await handleQuery(args, state, { sessionId, tenantId: sec.tenantId, isAdmin: sec.auth?.isAdmin });
  // surface query-side isError + estimatedTokenCost via the
       // MCP envelope so callers see budget-exceeded as a tool error and
       // can read the context-cost contribution as _meta.
@@ -111,9 +137,19 @@ export function registerChariotTools(
     },
   );
 
+  // Out-of-band credential entry (the AI is the interface; the model never sees
+  // a secret). Created ONLY for the single-user local transport: in multi-tenant
+  // HTTP (`localMode:false`) there is no private page to send a tenant to, and
+  // tenant credentials go through the IAM vault, so no prompter exists there.
+  const credentialPrompter = sec.localMode
+    ? createCredentialPrompter({ server: server.server as unknown as Parameters<typeof createCredentialPrompter>[0]['server'] })
+    : undefined;
+
   // chariot_call — execute a tool on a specific adapter
   server.tool(
     'chariot_call',
+    'Execute a specific tool on a specific adapter that was returned by a prior ' +
+      'chariot_query response. Do not invent adapter or tool names.',
     {
       adapter: z.string().max(MAX_ARG_LEN).describe(
         'Adapter ID returned by chariot_query in matchedAdapters[].id ' +
@@ -122,7 +158,7 @@ export function registerChariotTools(
       ),
       tool: z.string().max(MAX_ARG_LEN).describe(
         'Tool name to call on the adapter. MUST be a tool name that ' +
-          'appears in matchedAdapters[adapter].tools from a prior ' +
+          'appears as matchedAdapters[adapter].tools[].name from a prior ' +
           'chariot_query response. Do NOT fabricate tool names based on ' +
           'the adapter description or your prior knowledge of the vendor ' +
           'API — only the names returned by chariot_query are guaranteed ' +
@@ -133,7 +169,7 @@ export function registerChariotTools(
       args: z.record(z.string(), z.unknown()).optional().describe('Arguments to pass to the tool'),
     },
     async (toolArgs, extra) => {
-      // bug-tracker-ref: enforce per-operation RBAC + tenant isolation from the
+      // Enforce per-operation RBAC + tenant isolation from the
       // verified per-request context (sec), not a hardcoded localMode:true.
       //   - HTTP / verified JWT: sec.localMode=false + sec.auth → handleCall
       //     enforces isOperationAllowed (deny-by-default) for sec.tenantId.
@@ -141,7 +177,7 @@ export function registerChariotTools(
       //     local operator is the only caller and is implicitly trusted.
       // Tenant identity + RBAC scope always come from sec, never tool args.
       const sessionId = (extra as unknown as { sessionId?: string } | undefined)?.sessionId ?? sec.sessionId;
-      const result = await handleCall(toolArgs, state, {
+      const dispatch = () => handleCall(toolArgs, state, {
         tenantId: sec.tenantId,
         auth: sec.auth,
         localMode: sec.localMode,
@@ -149,7 +185,13 @@ export function registerChariotTools(
         // ID-JAG per-user subject-token exchange (REST parity, rest.ts:57):
         // present only on the verified JWT path; absent on stdio/loopback.
         ...(sec.sessionJti !== undefined ? { sessionJti: sec.sessionJti } : {}),
+        // Client IP (REST parity, rest.ts:callContextFromRequest)
+        // so the serve-path audit record carries sourceIp. Absent on stdio.
+        ...(sec.sourceIp !== undefined ? { sourceIp: sec.sourceIp } : {}),
       });
+      const result = credentialPrompter
+        ? await credentialPrompterStorage.run(credentialPrompter, dispatch)
+        : await dispatch();
  // surface estimatedTokenCost as MCP _meta so external
       // callers see the context-cost contribution. Without this, the new
       // metadata is dropped at the MCP boundary even though handleCall
@@ -165,245 +207,25 @@ export function registerChariotTools(
   // chariot_list — browse available adapters by category or keyword
   server.tool(
     'chariot_list',
+    'Browse the full bundled adapter catalog by category name or keyword, ' +
+      'independent of which adapters are currently configured.',
     {
       category: z.string().max(MAX_ARG_LEN).optional().describe(
         'Filter by category name (e.g., "cybersecurity", "healthcare", "devops", "finance").',
       ),
       search: z.string().max(MAX_ARG_LEN).optional().describe('Search by keyword across adapter names and descriptions'),
     },
-    async (args) => {
+    async (args, extra) => {
       // chariot_list browses the global bundled catalog (state.allAdapters),
       // which carries no tenant-private data, so no per-request tenant
-      // context is threaded here (bug-tracker-ref scope: query/call are the
-      // tenant-keyed surfaces).
-      const result = await handleList(args, state);
+      // context is threaded here (query/call are the
+      // tenant-keyed surfaces) — EXCEPT for the CHARIOT::§16.2 step 4
+      // pendingAlerts gate (rulings item 91(2)/115), which DOES need
+      // sessionId/tenantId/isAdmin, mirroring chariot_query's handler.
+      const sessionId = (extra as unknown as { sessionId?: string } | undefined)?.sessionId ?? sec.sessionId;
+      const result = await handleList(args, state, { sessionId, tenantId: sec.tenantId, isAdmin: sec.auth?.isAdmin });
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-      };
-    },
-  );
-
-  // chariot_remember — store a memory for the current user
-  // Tenant-scoped: memories are keyed on sec.tenantId so cross-tenant
-  // isolation is the same as query/call. localMode uses the process tenant.
-  server.tool(
-    'chariot_remember',
-    {
-      content: z.string().max(4096).describe(
-        'The information to remember. Be specific — vague strings reduce recall quality.',
-      ),
-      type: z.string().max(MAX_ARG_LEN).optional().describe(
-        'Memory category tag (e.g., "preference", "fact", "instruction", "context"). ' +
-          'Used to filter recall results by type. Defaults to "general".',
-      ),
-      importance: z.enum(['normal', 'medium', 'high']).optional().describe(
-        'Importance tier. "high" persists through capacity eviction; ' +
-          '"normal" (default) is evicted first when the store is full.',
-      ),
-    },
-    async (args) => {
-      const result = await handleRemember(args, state, sec.tenantId);
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-        ...(result.isError ? { isError: true } : {}),
-      };
-    },
-  );
-
-  // -------------------------------------------------------------------------
-  // Entity resolution tools.
-  //
-  // resolve_entity / compare_entities / entity_profile are engine-level
-  // controls that federate entity intelligence across the full adapter
-  // catalog via EntityResolver — no external gateway is required. They run
-  // under the caller's RBAC/tenant context (sec is threaded into the handler).
-  // -------------------------------------------------------------------------
-
-  // chariot_resolve_entity — resolve an entity across the adapter catalog
-  server.tool(
-    'chariot_resolve_entity',
-    {
-      entity: z.string().max(MAX_ARG_LEN).describe(
-        'Entity identifier or natural-language description to resolve (e.g. a username, ' +
-          'hostname, package name, alert ID, or org name). The resolver fans out to every ' +
-          'adapter in the catalog that exposes a search or lookup tool and returns ' +
-          'aggregated evidence with a canonical display name and entity type.',
-      ),
-      adapterIds: z.array(z.string().max(MAX_ARG_LEN)).max(32).optional().describe(
-        'Optional list of adapter IDs to restrict the resolution scope. ' +
-          'When omitted the full catalog is searched (up to maxAdapters adapters).',
-      ),
-      maxAdapters: z.number().int().min(1).max(50).optional().describe(
-        'Maximum number of adapters to probe in parallel (default 12). ' +
-          'Increase only when a broader sweep is needed.',
-      ),
-    },
-    async (args) => {
-      const result = await handleResolveEntity(args, state, {
-        tenantId: sec.tenantId,
-        auth: sec.auth,
-        localMode: sec.localMode,
-        sessionId: sec.sessionId,
-        ...(sec.sessionJti !== undefined ? { sessionJti: sec.sessionJti } : {}),
-      });
-      return {
-        content: [{ type: 'text' as const, text: result.content }],
-        isError: result.isError,
-        ...(result.estimatedTokenCost !== undefined
-          ? { _meta: { estimatedTokenCost: result.estimatedTokenCost } }
-          : {}),
-      };
-    },
-  );
-
-  // chariot_recall — retrieve memories for the current user
-  server.tool(
-    'chariot_recall',
-    {
-      type: z.string().max(MAX_ARG_LEN).optional().describe(
-        'Filter by memory type tag (must match the type used when storing). ' +
-          'Omit to retrieve across all types.',
-      ),
-      importance: z.enum(['normal', 'medium', 'high']).optional().describe(
-        'Filter to a specific importance tier. Omit to retrieve all tiers.',
-      ),
-      limit: z.number().int().min(1).max(100).optional().describe(
-        'Maximum number of memories to return (default 10, max 100).',
-      ),
-      sortBy: z.enum(['importance', 'recency', 'frequency']).optional().describe(
-        'Sort order: "recency" (newest first, default), "importance" (high → normal), ' +
-          '"frequency" (most-accessed first).',
-      ),
-    },
-    async (args) => {
-      const result = await handleRecall(args, state, sec.tenantId);
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-        ...(result.isError ? { isError: true } : {}),
-      };
-    },
-  );
-
-  // chariot_compare_entities — structural comparison of two entities
-  server.tool(
-    'chariot_compare_entities',
-    {
-      entityA: z.string().max(MAX_ARG_LEN).describe(
-        'First entity identifier or description (e.g. username, hostname, package name).',
-      ),
-      entityB: z.string().max(MAX_ARG_LEN).describe(
-        'Second entity identifier or description to compare against entityA.',
-      ),
-      adapterIds: z.array(z.string().max(MAX_ARG_LEN)).max(32).optional().describe(
-        'Optional adapter scope for both resolutions. Same semantics as chariot_resolve_entity.adapterIds.',
-      ),
-      maxAdapters: z.number().int().min(1).max(50).optional().describe(
-        'Maximum adapters to probe per entity (default 12).',
-      ),
-    },
-    async (args) => {
-      const result = await handleCompareEntities(args, state, {
-        tenantId: sec.tenantId,
-        auth: sec.auth,
-        localMode: sec.localMode,
-        sessionId: sec.sessionId,
-        ...(sec.sessionJti !== undefined ? { sessionJti: sec.sessionJti } : {}),
-      });
-      return {
-        content: [{ type: 'text' as const, text: result.content }],
-        isError: result.isError,
-        ...(result.estimatedTokenCost !== undefined
-          ? { _meta: { estimatedTokenCost: result.estimatedTokenCost } }
-          : {}),
-      };
-    },
-  );
-
-  // chariot_forget — soft-delete a memory by its id
-  server.tool(
-    'chariot_forget',
-    {
-      id: z.string().max(MAX_ARG_LEN).describe(
-        'Memory id returned by chariot_remember or chariot_recall. ' +
-          'MUST be an id from a prior chariot_recall response — do NOT invent ids.',
-      ),
-    },
-    async (args) => {
-      const result = await handleForget(args, state, sec.tenantId);
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result) }],
-        ...(result.isError ? { isError: true } : {}),
-      };
-    },
-  );
-
-  // chariot_entity_profile — build a structured profile for an entity
-  server.tool(
-    'chariot_entity_profile',
-    {
-      entity: z.string().max(MAX_ARG_LEN).describe(
-        'Entity identifier to profile (e.g. username, hostname, package name, alert ID). ' +
-          'The profiler fans out across the catalog and aggregates all returned data into a ' +
-          'flat attribute bag alongside raw per-adapter payloads.',
-      ),
-      adapterIds: z.array(z.string().max(MAX_ARG_LEN)).max(32).optional().describe(
-        'Optional adapter scope. Same semantics as chariot_resolve_entity.adapterIds.',
-      ),
-      maxAdapters: z.number().int().min(1).max(50).optional().describe(
-        'Maximum adapters to probe (default 12).',
-      ),
-    },
-    async (args) => {
-      const result = await handleEntityProfile(args, state, {
-        tenantId: sec.tenantId,
-        auth: sec.auth,
-        localMode: sec.localMode,
-        sessionId: sec.sessionId,
-        ...(sec.sessionJti !== undefined ? { sessionJti: sec.sessionJti } : {}),
-      });
-      return {
-        content: [{ type: 'text' as const, text: result.content }],
-        isError: result.isError,
-        ...(result.estimatedTokenCost !== undefined
-          ? { _meta: { estimatedTokenCost: result.estimatedTokenCost } }
-          : {}),
-      };
-    },
-  );
-
-  // chariot_validate_claim — engine-level claim-validation / data grounding.
-  // Native engine claim-validation / data-grounding tool.
-  // Evaluates whether caller-supplied evidence text supports, contradicts, or
-  // is insufficient to assess a stated claim.  Callers typically pass a prior
-  // chariot_call response as the evidence.  Uses an LLM when state.claimValidatorLlm
-  // is configured; falls back to deterministic heuristic grounding otherwise.
-  server.tool(
-    'chariot_validate_claim',
-    {
-      claim: z.string().min(1).max(512).describe(
-        'The assertion to validate (e.g., "Acme Corp is SOC-2 certified", ' +
-          '"the server returned HTTP 200"). Must be a concrete, falsifiable statement. ' +
-          'Do NOT pass a question — rephrase as a positive claim first.',
-      ),
-      evidence: z.string().max(8192).describe(
-        'Text evidence to ground the claim against. Typically the content field ' +
-          'from a prior chariot_call response. May also be any structured or ' +
-          'unstructured text (JSON, prose, log lines). Pass an empty string when ' +
-          'you have no evidence — the tool returns verdict:"no_evidence" in that case.',
-      ),
-    },
-    async (args) => {
-      const result = await handleValidateClaim(args, state, {
-        tenantId: sec.tenantId,
-        auth: sec.auth,
-        localMode: sec.localMode,
-        sessionId: sec.sessionId,
-        ...(sec.sessionJti !== undefined ? { sessionJti: sec.sessionJti } : {}),
-      });
-      return {
-        content: [{ type: 'text' as const, text: result.content }],
-        isError: result.isError,
-        ...(result.estimatedTokenCost !== undefined ? { _meta: { estimatedTokenCost: result.estimatedTokenCost } } : {}),
       };
     },
   );

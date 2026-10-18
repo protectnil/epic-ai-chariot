@@ -1,0 +1,59 @@
+Epic AI® Chariot — {{ include "chariot.fullname" . }} installed (chart {{ .Chart.Version }}, app {{ .Chart.AppVersion }}).
+
+Deployment topology (CH-27): gateway + MongoDB + Redis only. The vector store
+(Qdrant Edge) is embedded in the gateway image — no separate vector pod.
+
+Gateway image (CH-26, immutable):
+  {{ include "chariot.gatewayImage" . }}
+
+Reach the gateway in-cluster:
+  http://{{ include "chariot.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/health
+
+Port-forward to test locally:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "chariot.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://127.0.0.1:{{ .Values.service.port }}/health
+
+License (CH-24): provider = {{ .Values.license.provider }}.
+{{- if .Values.license.awsLicenseManager.enabled }}
+  AWS License Manager CheckoutLicense gates entitlement at boot.
+  {{- if not .Values.serviceAccount.roleArn }}
+
+  WARNING: license.awsLicenseManager.enabled=true but serviceAccount.roleArn is
+  empty. CheckoutLicense needs AWS access via IRSA (CH-25). Set serviceAccount.roleArn.
+  {{- end }}
+{{- else }}
+  Offline Ed25519 license path (default off-Marketplace).
+{{- end }}
+
+Air-gap (CH-29): install with -f values-airgap.yaml and
+--set global.imageRegistry=<your-marketplace-ecr>. All three images and the
+baked model/snapshot resolve from your registry; zero external egress.
+
+{{- if .Values.networkPolicy.enabled }}
+
+Pod egress NetworkPolicy (gap #8): ENABLED — deny-by-default egress. Only
+DNS{{ if .Values.mongodb.enabled }}, MongoDB{{ end }}{{ if .Values.redis.enabled }}, Redis{{ end }}, and
+{{ len .Values.networkPolicy.allowedEgress }} declared CIDR allowlist entr{{ if eq (len .Values.networkPolicy.allowedEgress) 1 }}y{{ else }}ies{{ end }} are permitted.
+Confirm your CNI enforces NetworkPolicy (Calico/Cilium/AWS VPC CNI w/ NP) —
+on a non-enforcing CNI this object has no effect (fails open).
+{{- else }}
+
+Pod egress NetworkPolicy (gap #8): DISABLED (default). Set
+networkPolicy.enabled=true and populate networkPolicy.allowedEgress with your
+MCP/AWS endpoint CIDRs to turn on deny-by-default egress.
+{{- end }}
+
+{{- if .Values.seccomp.customProfile.enabled }}
+
+Hardened seccomp profile (gap #10): ENABLED. Before this pod schedules,
+copy the "chariot-hardened.json" key from ConfigMap
+{{ include "chariot.fullname" . }}-seccomp-profile to
+<kubelet-root-dir>/seccomp/{{ .Values.seccomp.customProfile.localhostProfile }}
+on EVERY node that will run this pod — the kubelet reads localhostProfile
+from local disk and fails the pod closed if it is missing.
+{{- else }}
+
+Seccomp (gap #10): RuntimeDefault (default). Set
+seccomp.customProfile.enabled=true (after provisioning the profile file on
+every node — see helm/chariot/files/seccomp/) for the hardened profile.
+{{- end }}

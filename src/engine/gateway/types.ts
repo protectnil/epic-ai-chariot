@@ -96,6 +96,14 @@ export interface GatewayConfig {
   tlsCertPath?: string;
   /** Path to TLS private key file (.key / .pem). Required when tlsCertPath is set. */
   tlsKeyPath?: string;
+  /**
+   * Path to a client CA bundle (.crt / .pem). Optional. When set alongside
+   * tlsCertPath/tlsKeyPath, mutual TLS is enabled: the gateway requires and
+   * verifies a client certificate signed by this CA, rejecting any
+   * connection that presents none or an invalid one at the TLS layer.
+   * Absent (default): behavior is unchanged — one-way TLS or plain HTTP.
+   */
+  tlsCaPath?: string;
 }
 
 export const DEFAULT_GATEWAY_CONFIG: GatewayConfig = {

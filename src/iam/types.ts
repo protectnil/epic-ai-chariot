@@ -4,6 +4,12 @@
 
 import type { ObjectId } from 'mongodb';
 import type { Request } from 'express';
+import type { PrincipalType } from '../engine/trust/types.js';
+
+// Re-exported so IAM-layer consumers (middleware, session, mapping admin)
+// share the single canonical PrincipalType definition with the engine
+// trust layer instead of growing a parallel union that could drift.
+export type { PrincipalType } from '../engine/trust/types.js';
 
 // --- SAML / OIDC Configuration -----------------------------------------------
 
@@ -12,16 +18,28 @@ export interface SamlConfig {
   issuer: string;
   cert: string;
   callbackUrl: string;
-  signatureAlgorithm?: 'sha1' | 'sha256' | 'sha512';
-  digestAlgorithm?: 'sha1' | 'sha256' | 'sha512';
-  wantAssertionsSigned?: boolean;
-  wantAuthnResponseSigned?: boolean;
+  /** §10.2::2 pins signature verification to the secure values; the zod
+   *  samlConfigSchema rejects weaker ones and saml.ts enforces them at use. */
+  signatureAlgorithm?: 'sha256';
+  digestAlgorithm?: 'sha256' | 'sha512';
+  wantAssertionsSigned?: true;
+  wantAuthnResponseSigned?: true;
 }
 
 export interface OidcConfig {
   issuer: string;
   clientId: string;
-  clientSecret: string;
+  /**
+   * Plaintext client secret. Accepted as INPUT to updateSso, which encrypts it
+   * at rest (§10.3::1) and persists only `clientSecretEncrypted`. May still be
+   * present on legacy tenant documents written before at-rest encryption.
+   */
+  clientSecret?: string;
+  /**
+   * §10.3::1 — client secret encrypted at rest: an AES-256-GCM "encrypted:iv"
+   * blob bound to the tenant. Written by updateSso; read via decryptFields.
+   */
+  clientSecretEncrypted?: string;
   redirectUri: string;
   scopes?: string[];
   /**
@@ -42,6 +60,12 @@ export interface TenantSettings {
   ipAllowList: string[];
   allowedAdapterIds: string[];
   scimEnabled: boolean;
+  /** §10.8::2: idle-session timeout in minutes (0 = disabled). */
+  idleTimeoutMinutes?: number;
+  /** §10.8::2: enable Just-In-Time user provisioning on first SSO login. */
+  jitProvisioningEnabled?: boolean;
+  /** §10.8::2: audit-log retention in days. */
+  logRetentionDays?: number;
   /**
    * Name of the IdP group whose members are tenant administrators.
    * Defaults to "EpicAI-Admins" when unset (see
@@ -91,6 +115,14 @@ export interface TenantDocument {
     oidc?: OidcConfig;
   };
   scimBearerTokenHash?: string;
+  /**
+   * §10.8::4 — per-tenant encryption key reference: a KMS key pointer (e.g.
+   * `arn:aws:kms:...` / `projects/…/cryptoKeys/…`) or an env-key ID (e.g.
+   * `env:CHARIOT_MASTER_KEY`) identifying the material this tenant's data at
+   * rest is encrypted under. Recorded so key rotation can be tracked per
+   * tenant. Set at creation; never null once written.
+   */
+  encryptionKeyRef: string;
   active: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -128,6 +160,17 @@ export interface EnterpriseUserDocument {
    * { tenantId, idJagSubIdAliasCanon } (partial) in indexes.ts.
    */
   idJagSubIdAliasCanon?: string;
+  /**
+   * CHARIOT::§16.2 (CHARIOT-SPEC.md:1360, rulings item 91(2)) — "Slack
+   * adapter connected and admin has a known Slack user ID -> Slack DM."
+   * The admin's Slack workspace member ID (e.g. "U0123456"), set when the
+   * tenant's connected Slack adapter resolves this user's identity.
+   * Optional: absent means "no known Slack user ID" per the clause's own
+   * gating language, not a false/negative value — the channel-resolution
+   * step-1 check in src/observability/alertChannels.ts treats it as
+   * ABSENT (falls through to step 2), never as an error.
+   */
+  slackUserId?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -159,6 +202,27 @@ export interface GroupAdapterMappingDocument {
   adapterIds: string[];
   allowedOperations: string[];
   maxQueriesPerHour: number;
+  /**
+   * Principal-kind scope for this mapping (gap #3 — Wiz 2 human/agent/
+   * service partition). Recognized values: 'human' | 'agent' | 'service'
+   * (matched case-insensitively, same as native/src/rbac.rs).
+   *
+   * Absent or empty (every mapping authored before this field existed):
+   * the mapping applies to ANY principal kind — identical to pre-existing
+   * behavior, so legacy documents grant exactly as before.
+   *
+   * Non-empty: the mapping is honored ONLY for sessions whose
+   * `principalType` is in the list, and ONLY on the principal-aware
+   * enforcement path (`adapterFilterMiddleware` for agent/service
+   * sessions via `filterAdapterIdsForPrincipal`). Set `['human']` to mark
+   * a grant human-only: an agent/service principal then cannot inherit
+   * it. Typed `string[]` (not PrincipalType[]) because documents are
+   * operator-authored — an unrecognized value must survive normalization
+   * unchanged so the mapping fails CLOSED (matches no principal kind on
+   * the principal-aware path) rather than silently widening to
+   * "matches everyone".
+   */
+  principalScope?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -181,8 +245,45 @@ export interface AdapterCredentialDocument {
   expiresAt?: Date;
   revokedAt?: Date;
   revokedBy?: string;
+  /** Owning user id (`user.sub`); NULL for org-wide shared credentials (§10.5::3). */
+  userId?: string | null;
   /** True when this credential is org-wide shared (admin-connected). */
   shared?: boolean;
+  /**
+   * CHARIOT §10.5::1 — "Token refresh: background job every 5 minutes
+   * finds tokens within 10 minutes of expiry, refreshes via vendor
+   * refresh endpoint, updates `lastRefreshedAt`." Set by
+   * `src/iam/services/credentials.ts`'s refresh job on a successful
+   * vendor refresh; absent on a credential that has never been refreshed
+   * (a freshly-connected `oauth2` row, or any `api_key`/`basic_auth` row,
+   * which the refresh job never touches).
+   */
+  lastRefreshedAt?: Date;
+  /**
+   * CHARIOT §10.5 (rulings item 98(2)) — confidential-client OAuth
+   * credentials for the vendor refresh call, belonging to the TENANT's
+   * own vendor OAuth app registration (distinct from `apiKey`/`apiSecret`,
+   * which are the per-user access/refresh TOKENS). Plain (not encrypted):
+   * a client_id is the vendor's public application identifier — routinely
+   * visible in browser redirect URLs and vendor developer-console UIs —
+   * not a secret in the same sense as a refresh token.
+   *
+   * There is deliberately NO sibling `clientSecret` field on this
+   * document. The ruling text ("clientSecret (encrypted with the same
+   * vault path as the token fields)") is read as: encrypt it via the SAME
+   * `encryptFields`/`decryptFields` call this document already makes for
+   * `apiKey`/`apiSecret` — i.e. `clientSecret` rides as a THIRD key
+   * inside the existing single `encrypted`/`iv` blob, decrypted alongside
+   * the token fields in `src/iam/services/credentials.ts`'s
+   * `decrypted.fields.clientSecret`. This was chosen over adding a
+   * second `encrypted`/`iv` field pair (a `clientSecretEncrypted` +
+   * `clientSecretIv` sibling) because it reuses this document's existing
+   * one-blob shape exactly rather than introducing a second AES-256-GCM
+   * ciphertext lifecycle (its own IV uniqueness, its own CAS write-back
+   * path) for one additional secret. Never persisted in plaintext either
+   * way.
+   */
+  clientId?: string;
 }
 
 // --- Audit Events ------------------------------------------------------------
@@ -197,6 +298,9 @@ export type AuditEventType =
   | 'user_updated'
   | 'user_deactivated'
   | 'user_deleted'
+  | 'tenant_suspended'
+  | 'tenant_activated'
+  | 'tenant_deleted'
   | 'group_created'
   | 'group_updated'
   | 'group_deleted'
@@ -220,7 +324,11 @@ export type AuditEventType =
   | 'id_jag_token_issued'
   | 'id_jag_token_revoked'
   | 'id_jag_trust_added'
-  | 'id_jag_trust_revoked';
+  | 'id_jag_trust_revoked'
+  // C4AMD §8::6 — operational-telemetry consent versions (grant/revoke).
+  // Appended via src/iam/services/telemetry-consent.ts; never emitted
+  // directly by adapter-authorization code (§8::4 independence).
+  | 'telemetry_consent_changed';
 
 export type AuditTargetType =
   | 'user'
@@ -322,6 +430,24 @@ export interface EnterpriseSessionPayload {
    * (id-jag-issuer) and enforced by enterpriseAuthMiddleware.
    */
   cnf?: { jkt: string };
+  /**
+   * Principal kind of the session holder (gap #3 — Wiz 2 human/agent/
+   * service partition). Stamped at issuance by `issueToken()`:
+   *
+   *   - Interactive SSO paths (SAML callback, OIDC callback, session
+   *     refresh) do NOT set it — a human completed the login ceremony.
+   *   - ID-JAG token exchange (id-jag-issuer) stamps 'agent': the token
+   *     is minted for a client WORKLOAD presenting an identity assertion
+   *     on a user's behalf, not for the user at a keyboard.
+   *
+   * Absent (every legacy token and every interactive session) or any
+   * unrecognized value → consumers MUST treat as 'human', which keeps
+   * pre-partition behavior byte-identical. Only 'agent' / 'service'
+   * trigger the stricter principal-scope filtering in
+   * `adapterFilterMiddleware`, and only against mappings explicitly
+   * marked with a non-matching `principalScope`.
+   */
+  principalType?: PrincipalType;
 }
 
 // --- SCIM Types (RFC 7644) ---------------------------------------------------

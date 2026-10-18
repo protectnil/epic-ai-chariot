@@ -87,6 +87,51 @@ export function writeCredential(key: string, value: string): void {
   }
 }
 
+/**
+ * Remove KEY(s) from `~/.epic-ai/.env`, atomically (CH-38). Returns the keys
+ * that were actually present and removed. Used by `chariot remove` so an
+ * adapter's credential leaves no residue after removal. Atomic via
+ * same-directory tmp + renameSync, mode preserved at 0o600.
+ */
+export function removeCredential(keys: string[]): string[] {
+  if (!existsSync(ENV_FILE) || keys.length === 0) return [];
+  const drop = new Set(keys);
+  const removed: string[] = [];
+  const lines = readFileSync(ENV_FILE, 'utf-8').split('\n');
+  const kept: string[] = [];
+  for (const line of lines) {
+    const eq = line.indexOf('=');
+    const key = eq > 0 ? line.slice(0, eq) : '';
+    if (key && drop.has(key)) {
+      removed.push(key);
+      continue;
+    }
+    kept.push(line);
+  }
+  if (removed.length === 0) return [];
+
+  // Preserve a single trailing newline; collapse any blank tail.
+  let next = kept.join('\n').replace(/\n+$/, '');
+  if (next.length > 0) next += '\n';
+
+  const tmpPath = `${ENV_FILE}.tmp.${process.pid}.${Date.now()}`;
+  let fd: number | null = null;
+  try {
+    fd = openSync(tmpPath, 'wx', 0o600);
+    writeSync(fd, next, 0, 'utf-8');
+    closeSync(fd);
+    fd = null;
+    renameSync(tmpPath, ENV_FILE);
+  } catch (err) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* fd already closed by error path */ }
+    }
+    try { unlinkSync(tmpPath); } catch { /* tmp file may not exist */ }
+    throw err;
+  }
+  return removed;
+}
+
 export function parseEnvFile(content: string): Record<string, string> {
   const creds: Record<string, string> = {};
   for (const line of content.split('\n')) {

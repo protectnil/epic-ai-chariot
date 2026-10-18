@@ -1,0 +1,39 @@
+{{- /* `helm test` hook: probe the gateway /health endpoint. Runs non-root,
+       least-privilege, single-arch (CH-30). */ -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "chariot.fullname" . }}-test-connection
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  {{- with .Values.global.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+    - name: health
+      # Reuse the gateway image (already in-registry; air-gap-safe — no extra pull).
+      image: {{ include "chariot.gatewayImage" . }}
+      imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      command:
+        - node
+        - "-e"
+        - >-
+          require('node:http').get({host:'{{ include "chariot.fullname" . }}',port:{{ .Values.service.port }},path:'/health',timeout:5000},r=>process.exit(r.statusCode===200?0:1)).on('error',e=>{console.error(e.message);process.exit(1)}).on('timeout',function(){this.destroy();process.exit(1)})
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

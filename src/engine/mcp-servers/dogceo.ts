@@ -24,7 +24,7 @@ export class DogCeoMCPServer extends MCPAdapterBase {
       name: 'dogceo',
       displayName: 'Dog CEO Dog API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'dog', 'dogs', 'breeds', 'puppy', 'pet', 'animal', 'image',
         'random', 'dog image', 'dog breed', 'sub-breed',

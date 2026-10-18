@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chariot.fullname" . }}-config
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+data:
+  # ── Non-secret runtime configuration only. Secrets come from
+  #    gateway.existingSecret (CH-28). ──
+  NODE_ENV: "production"
+  PORT: {{ .Values.service.port | quote }}
+  # CH-30: all runtime writers target this mounted writable volume.
+  EPIC_AI_DIR_OVERRIDE: "/var/lib/chariot"
+  {{- if .Values.gateway.enterprise }}
+  CHARIOT_ENTERPRISE: "true"
+  {{- end }}
+
+  # ── License entitlement (CH-24) ──
+  {{- /* Effective provider: enabling License Manager MUST select it — do not
+         let the offline default override it. selectedLicenseProvider() treats
+         an explicit "offline" as authoritative, so emit aws-license-manager
+         whenever LM is enabled; otherwise emit license.provider (offline
+         default off-Marketplace). */ -}}
+  {{- if .Values.license.awsLicenseManager.enabled }}
+  CHARIOT_LICENSE_PROVIDER: "aws-license-manager"
+  CHARIOT_AWS_LICENSE_MANAGER: "true"
+  {{- with .Values.license.region }}
+  AWS_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.productSKU }}
+  CHARIOT_LM_PRODUCT_SKU: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.tier }}
+  CHARIOT_LM_TIER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.checkoutType }}
+  CHARIOT_LM_CHECKOUT_TYPE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.seats }}
+  CHARIOT_LM_SEATS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.tierEntitlement }}
+  CHARIOT_LM_TIER_ENTITLEMENT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.seatsEntitlement }}
+  CHARIOT_LM_SEATS_ENTITLEMENT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.keyFingerprint }}
+  CHARIOT_LM_KEY_FINGERPRINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.beneficiary }}
+  CHARIOT_LM_BENEFICIARY: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.license.awsLicenseManager.nodeId }}
+  CHARIOT_LM_NODE_ID: {{ . | quote }}
+  {{- end }}
+  {{- else }}
+  CHARIOT_LICENSE_PROVIDER: {{ .Values.license.provider | quote }}
+  {{- end }}

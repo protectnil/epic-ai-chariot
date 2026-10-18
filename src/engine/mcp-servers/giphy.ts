@@ -76,7 +76,7 @@ export class GiphyMCPServer extends MCPAdapterBase {
       name: 'giphy',
       displayName: 'Giphy',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'giphy', 'gif', 'gifs', 'animated', 'animation', 'trending',
         'search', 'random', 'meme', 'reaction', 'media', 'image',

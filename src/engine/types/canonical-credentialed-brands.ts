@@ -23,6 +23,10 @@
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
+import { REST_CREDENTIAL_MAP, type RestCredentialField, type RestCredentialEntry } from './rest-credential-map.generated.js';
+
+const EMPTY_REST_ENTRY: RestCredentialEntry = { required: [], alternatives: [], optional: [] };
+
 /**
  * Required env-keys per canonical credentialed brand id. The published
  * bundle does NOT carry credential metadata for many entries today — every
@@ -74,6 +78,11 @@ export interface AdapterCredentialShape {
   };
   rest?: {
     envKey?: string;
+    module?: string;
+    className?: string;
+    authType?: string;
+    baseUrl?: string;
+    discoveredEndpointsJson?: string;
   };
 }
 
@@ -87,6 +96,146 @@ export function effectiveEnvKeys(adapter: AdapterCredentialShape): readonly stri
     return adapter.mcp.envKeys;
   }
   return CANONICAL_CREDENTIALED_BRANDS[adapter.id] ?? [];
+}
+
+/**
+ * Resolve an adapter's full REST_CREDENTIAL_MAP entry (required/alternatives/
+ * optional field groups; see rest-credential-map.generated.ts). Returns the
+ * shared EMPTY_REST_ENTRY sentinel for adapters absent from the map (the
+ * legacy single `rest.envKey` -> apiKey path, or no credentials needed).
+ */
+export function restCredentialEntry(adapter: AdapterCredentialShape): RestCredentialEntry {
+  return REST_CREDENTIAL_MAP[adapter.id] ?? EMPTY_REST_ENTRY;
+}
+
+function isEnvVarSet(envVar: string, creds: Record<string, string>): boolean {
+  return !!(creds[envVar] || process.env[envVar]);
+}
+
+/**
+ * The alternatives[] group (if any) that is FULLY satisfied by the merged
+ * {creds, process.env} view — undefined if none is (or the adapter declares
+ * no alternatives).
+ */
+export function satisfiedRestAlternative(
+  adapter: AdapterCredentialShape,
+  creds: Record<string, string>,
+): readonly RestCredentialField[] | undefined {
+  const entry = restCredentialEntry(adapter);
+  for (const group of entry.alternatives) {
+    if (group.every(field => isEnvVarSet(field.envVar, creds))) return group;
+  }
+  return undefined;
+}
+
+/**
+ * Prompt/health-facing flat field list for an adapter's REST credential
+ * requirements: every `required` field, PLUS the FIRST `alternatives[]`
+ * group's fields when NO alternative group is yet satisfied by `creds`
+ * (matches the merged {creds, process.env} view `credentialStatus` uses,
+ * so a `chariot add` invoked after some creds are already on disk/env does
+ * not re-prompt for an alternative the operator already satisfied via a
+ * DIFFERENT group — e.g. username+password already set must not also
+ * prompt for bearerToken). `creds` defaults to `{}` for call sites that
+ * only need the STATIC declared set (matches pre-alternatives behavior).
+ * Does NOT include `optional` fields — those are never prompted-for/
+ * required; dispatch reads them directly from restCredentialEntry().
+ */
+export function restEnvKeys(
+  adapter: AdapterCredentialShape,
+  creds: Record<string, string> = {},
+): readonly RestCredentialField[] {
+  const entry = restCredentialEntry(adapter);
+  if (entry.alternatives.length === 0) return entry.required;
+  const satisfied = satisfiedRestAlternative(adapter, creds);
+  return [...entry.required, ...(satisfied ?? entry.alternatives[0])];
+}
+
+/**
+ * EVERY field an adapter could ever receive a REST credential for —
+ * required + every alternatives[] group (flattened, deduped) + optional.
+ * Used for purge (cmdRemove) and credential-scan matching, where the goal
+ * is "does the operator have ANY of this adapter's possible credentials
+ * on disk", not "what should we prompt for right now".
+ */
+export function restAllEnvKeys(adapter: AdapterCredentialShape): readonly RestCredentialField[] {
+  const entry = restCredentialEntry(adapter);
+  const seen = new Set<string>();
+  const out: RestCredentialField[] = [];
+  for (const field of [...entry.required, ...entry.alternatives.flat(), ...entry.optional]) {
+    if (!seen.has(field.envVar)) { seen.add(field.envVar); out.push(field); }
+  }
+  return out;
+}
+
+/** Result of {@link buildRestAdapterConfig}: either a fully-built config
+ * ready to pass to `new AdapterClass(config)`, or the list of missing
+ * required env-var names (fail-closed — never a partial config). */
+export type RestAdapterConfigResult =
+  | { ok: true; config: Record<string, string> }
+  | { ok: false; missing: readonly string[] };
+
+/**
+ * Build the `adapterConfig` object a REST adapter constructor receives,
+ * from a single merged {@code creds}/`process.env` view. This is the ONE
+ * place both live dispatch surfaces (toolHandlers.ts `chariot serve` REST
+ * dispatch, and setup.ts `cmdQuery` REST dispatch) must call — CHARIOT-
+ * SPEC.md:438 requires that "configured" credentials leave an adapter
+ * "Ready to be dispatched", and having two independent adapterConfig-
+ * building blocks let the two surfaces diverge: `cmdQuery` built ONLY
+ * `apiKey`/`baseUrl`/`endpointsJson`/`authType` from `adapter.rest.envKey`
+ * and NEVER consulted REST_CREDENTIAL_MAP, so a multi-field or
+ * alternatives-shaped adapter (redshift, paypal, acumatica, ...) always
+ * dispatched with an empty/incomplete config and the constructor threw,
+ * even with every required key present in the environment
+ * (setup.ts:2164-2180 prior to this fix).
+ *
+ * Field-building order mirrors the working toolHandlers.ts REST dispatch
+ * exactly: legacy single-token `rest.envKey` -> `apiKey`, `rest.baseUrl`,
+ * `rest.discoveredEndpointsJson` -> `endpointsJson`, `rest.authType` ->
+ * `authType`, then REST_CREDENTIAL_MAP `required` fields, then the first
+ * satisfied `alternatives[]` group (or the first group's env-vars are
+ * reported missing when none is satisfied), then `optional` fields.
+ * Fails CLOSED: any missing required/alternative field returns
+ * `{ ok: false, missing }` and the caller must refuse dispatch rather than
+ * let the adapter constructor throw an uncaught-shaped internal error.
+ */
+export function buildRestAdapterConfig(
+  adapter: AdapterCredentialShape,
+  creds: Record<string, string>,
+): RestAdapterConfigResult {
+  const config: Record<string, string> = {};
+  const mergedValue = (envVar: string): string | undefined => creds[envVar] ?? process.env[envVar];
+
+  if (adapter.rest?.envKey) {
+    const apiKey = mergedValue(adapter.rest.envKey);
+    if (typeof apiKey === 'string' && apiKey.length > 0) config['apiKey'] = apiKey;
+  }
+  if (adapter.rest?.baseUrl) config['baseUrl'] = adapter.rest.baseUrl;
+  if (adapter.rest?.discoveredEndpointsJson) config['endpointsJson'] = adapter.rest.discoveredEndpointsJson;
+  if (adapter.rest?.authType) config['authType'] = adapter.rest.authType;
+
+  const restEntry = restCredentialEntry(adapter);
+  const missing: string[] = [];
+  for (const { field, envVar } of restEntry.required) {
+    const value = mergedValue(envVar);
+    if (value) config[field] = value; else missing.push(envVar);
+  }
+  if (restEntry.alternatives.length > 0) {
+    const satisfied = satisfiedRestAlternative(adapter, creds);
+    if (satisfied) {
+      for (const { field, envVar } of satisfied) config[field] = mergedValue(envVar) as string;
+    } else {
+      for (const { envVar } of restEntry.alternatives[0]) missing.push(envVar);
+    }
+  }
+  for (const { field, envVar } of restEntry.optional) {
+    const value = mergedValue(envVar);
+    if (value) config[field] = value;
+  }
+
+  if (missing.length > 0) return { ok: false, missing };
+  return { ok: true, config };
 }
 
 /**
@@ -126,6 +275,12 @@ export interface CredentialDiscriminators {
   mcpSatisfied: boolean;
   /** The resolved required MCP env-keys (effectiveEnvKeys), exposed once. */
   mcpKeys: readonly string[];
+  /** ≥1 REST per-field credential (REST_CREDENTIAL_MAP) is required. */
+  restFieldsDeclared: boolean;
+  /** restFieldsDeclared AND every declared field's env-var resolves in the merged view. */
+  restFieldsSatisfied: boolean;
+  /** The resolved required REST credential fields (restEnvKeys), exposed once. */
+  restFields: readonly RestCredentialField[];
 }
 
 export type CredentialState =
@@ -181,10 +336,40 @@ export function credentialStatus(
     // (e.g. both declare the same token) must list it once, not twice.
     if (!missing.includes(k)) missing.push(k);
   }
+  const restEntry = restCredentialEntry(adapter);
+  const restFieldsDeclared = restEntry.required.length > 0 || restEntry.alternatives.length > 0;
+  const restRequiredMissing: string[] = [];
+  for (const { envVar } of restEntry.required) {
+    if (isEnvVarSet(envVar, creds)) continue;
+    restRequiredMissing.push(envVar);
+  }
+  const satisfiedAlternative = satisfiedRestAlternative(adapter, creds);
+  const restAlternativesSatisfied = restEntry.alternatives.length === 0 || !!satisfiedAlternative;
+  // Non-vacuous: an adapter absent from REST_CREDENTIAL_MAP (restFieldsDeclared
+  // === false) has zero required fields and zero alternatives, which would
+  // otherwise make `restRequiredMissing.length===0 && restAlternativesSatisfied`
+  // vacuously true — the exact "zero-cred adapter reports satisfied" class of
+  // bug mcpSatisfied's `let mcpSatisfied = mcpDeclared;` pattern (below) exists
+  // to prevent. Gate on restFieldsDeclared explicitly.
+  const restFieldsSatisfied = restFieldsDeclared && restRequiredMissing.length === 0 && restAlternativesSatisfied;
+  for (const envVar of restRequiredMissing) {
+    if (!missing.includes(envVar)) missing.push(envVar);
+  }
+  if (!restAlternativesSatisfied) {
+    // Name the FIRST alternative group's keys — matches restEnvKeys' prompt
+    // ordering so `chariot add`'s prompt list and `chariot health`'s
+    // "missing" diagnostic never disagree on which keys to ask for.
+    for (const { envVar } of restEntry.alternatives[0]) {
+      if (!missing.includes(envVar)) missing.push(envVar);
+    }
+  }
+  // Exposed once for callers (restEnvKeys' prompt-facing flat list).
+  const restFields = restEnvKeys(adapter, creds);
   const discriminators: CredentialDiscriminators = {
     restDeclared, restSatisfied, mcpDeclared, mcpSatisfied, mcpKeys,
+    restFieldsDeclared, restFieldsSatisfied, restFields,
   };
-  if (!restDeclared && !mcpDeclared) return { state: 'no-creds-required', ...discriminators };
+  if (!restDeclared && !mcpDeclared && !restFieldsDeclared) return { state: 'no-creds-required', ...discriminators };
   if (missing.length === 0) return { state: 'fully-credentialed', ...discriminators };
   return { state: 'partially-credentialed', missing, ...discriminators };
 }
@@ -251,7 +436,8 @@ export function auditCanonicalCoverage(
     if (isCurated(adapter.id)) continue;
     const restDeclared = typeof adapter.rest?.envKey === 'string' && adapter.rest.envKey.length > 0;
     const mcpDeclared = effectiveEnvKeys(adapter).length > 0;
-    if (!restDeclared && !mcpDeclared && !(adapter.id in CANONICAL_CREDENTIALED_BRANDS)) {
+    const restFieldsDeclared = restEnvKeys(adapter).length > 0;
+    if (!restDeclared && !mcpDeclared && !restFieldsDeclared && !(adapter.id in CANONICAL_CREDENTIALED_BRANDS)) {
       gaps.push({ id: adapter.id });
     }
   }

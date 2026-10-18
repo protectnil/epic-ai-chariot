@@ -24,7 +24,7 @@ export class EmojiHubMCPServer extends MCPAdapterBase {
       name: 'emojihub',
       displayName: 'EmojiHub',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'emoji', 'emojis', 'unicode', 'symbols', 'emoticons',
         'smileys', 'people', 'animals', 'food', 'flags',

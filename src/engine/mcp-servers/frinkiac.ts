@@ -37,7 +37,7 @@ export class FrinkiacMCPServer extends MCPAdapterBase {
       name: 'frinkiac',
       displayName: 'Frinkiac / Morbotron / Master of All Science',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'frinkiac', 'morbotron', 'masterofallscience',
         'simpsons', 'futurama', 'rick and morty',

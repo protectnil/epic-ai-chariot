@@ -41,7 +41,7 @@ export class EmojiOracleMCPServer extends MCPAdapterBase {
       name: 'emoji-oracle',
       displayName: 'Emoji Oracle',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'emoji', 'oracle', 'prophecy', 'fortune', 'fun',
         'mystical', 'interpretation', 'vibe', 'divination',

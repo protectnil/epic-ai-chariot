@@ -2,7 +2,7 @@
 /**
  * Chariot rollback driver.
  *
- * Deprecates @epicai/chariot@<X.Y.Z> and all four native sibling
+ * Deprecates @epicai/chariot@<X.Y.Z> and all five native sibling
  * packages in lockstep, then resets the npm `latest` dist-tag on
  * @epicai/chariot to a known-good prior version. Idempotent — re-running
  * against an already-deprecated version is a verified no-op, and resetting
@@ -30,6 +30,7 @@ import { join } from 'node:path';
 
 const PACKAGES = [
   '@epicai/chariot-bin-linux-x64-gnu',
+  '@epicai/chariot-bin-linux-arm64-gnu',
   '@epicai/chariot-bin-darwin-arm64',
   '@epicai/chariot-bin-darwin-x64',
   '@epicai/chariot-bin-win32-x64-msvc',

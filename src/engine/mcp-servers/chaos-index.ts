@@ -44,7 +44,7 @@ export class ChaosIndexMCPServer extends MCPAdapterBase {
       name: 'chaos-index',
       displayName: 'Chaos Index API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'chaos', 'chaos index', 'bitcoin', 'iss', 'earthquake', 'lunar phase',
         'temperature', 'score', 'combined metrics', 'stupidapis',

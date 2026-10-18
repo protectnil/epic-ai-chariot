@@ -55,7 +55,7 @@ export class MedlinePlusMCPServer extends MCPAdapterBase {
       name: 'medlineplus',
       displayName: 'MedlinePlus',
       version: '1.0.0',
-      category: 'health',
+      category: 'healthcare',
       keywords: [
         'medlineplus', 'nih', 'health', 'medical', 'consumer health',
         'icd-10', 'snomed', 'rxnorm', 'loinc', 'clinical codes',

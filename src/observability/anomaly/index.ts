@@ -3,6 +3,7 @@ export {
   ToolCallRateSpikeRule,
   DestructiveToolBurstRule,
   CrossTenantDriftRule,
+  ScopeViolationRule,
 } from './rules.js';
 export type {
   AnomalyRule,
@@ -16,3 +17,10 @@ export type {
   DestructiveBurstOptions,
   CrossTenantDriftOptions,
 } from './rules.js';
+export {
+  reportToolDispatch,
+  anomalyDetector,
+  anomalyAlertQueue,
+  anomalyEmitter,
+} from './wiring.js';
+export type { ToolDispatchReport } from './wiring.js';

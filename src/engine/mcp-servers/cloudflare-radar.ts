@@ -39,7 +39,7 @@ export class CloudflareRadarMCPServer extends MCPAdapterBase {
       name: 'cloudflare-radar',
       displayName: 'Cloudflare Radar — Internet Observatory',
       version: '1.0.0',
-      category: 'network',
+      category: 'devops',
       keywords: [
         'cloudflare', 'radar', 'internet', 'traffic', 'ddos', 'attack',
         'bgp', 'route leak', 'internet quality', 'iqi', 'latency', 'bandwidth',

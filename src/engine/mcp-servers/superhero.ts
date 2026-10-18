@@ -28,7 +28,7 @@ export class SuperheroMCPServer extends MCPAdapterBase {
       name: 'superhero',
       displayName: 'Superhero API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'superhero', 'superheroes', 'comics', 'marvel', 'dc',
         'powerstats', 'biography', 'heroes', 'villains',

@@ -104,7 +104,7 @@ export class NihReporterMCPServer extends MCPAdapterBase {
       name: 'nih-reporter',
       displayName: 'NIH RePORTER',
       version: '1.0.0',
-      category: 'health' as const,
+      category: 'healthcare' as const,
       keywords: [
         'nih', 'grants', 'biomedical', 'research', 'funding', 'pi', 'principal investigator',
         'institution', 'publications', 'pubmed', 'fiscal year', 'award', 'abstract',

@@ -32,7 +32,7 @@ export class MoviesMCPServer extends MCPAdapterBase {
       name: 'movies',
       displayName: 'Movies & TV Shows',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'movies', 'films', 'tv shows', 'television', 'itunes', 'tvmaze',
         'search movies', 'search tv', 'tv schedule', 'episodes', 'broadcast',

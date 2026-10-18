@@ -14,15 +14,29 @@
 import { readFileSync, existsSync, writeFileSync, copyFileSync, renameSync, chmodSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve as pathResolve, join as pathJoin } from 'node:path';
-import { verify as cryptoVerify } from 'node:crypto';
+import { verify as cryptoVerify, createHash } from 'node:crypto';
 import { createLogger } from '../logger.js';
 import {
   CHARIOT_CATALOG_PUBLIC_KEYS,
   type ChariotCatalogPublicKey,
 } from '../keys/chariot-catalog-public.js';
+// CHARIOT-SPEC.md:383 (§5.4, amended) / :523 (§5.7 trust anchor) — the
+// same choke point the catalog/bundle fast path (`verifyCatalogSignature.ts`)
+// routes every caller-supplied key through. Importing it here does NOT
+// create a cycle: `verifyCatalogSignature.ts` reads its own byte cap from
+// `artifact-limits.ts` directly rather than from this file (see that
+// file's own note).
+import { intersectWithRotationSet } from '../keys/verifyCatalogSignature.js';
 import { ARTIFACT_LIMITS } from '../keys/artifact-limits.js';
 import { resolvePublishedArtifactDir } from './artifact-publication.js';
+import { classifyCatalogAdmission } from './catalogAdmission.js';
 import { stripInvisibleChars } from '../persona/injection-defense.js';
+import { DEFAULT_CATALOG_TRUST_CONFIG } from '../../catalog/types.js';
+import {
+  computeCatalogState,
+  type CatalogWideState,
+} from '../../catalog/VerifiedCatalog.js';
+import { recordLoadedCatalogEpoch } from '../../observability/operational-telemetry/runtime-context.js';
 
 const log = createLogger('federation.catalog');
 
@@ -31,9 +45,17 @@ const log = createLogger('federation.catalog');
 // =============================================================================
 
 export type AdapterCategory =
-  | 'cybersecurity' | 'cloud' | 'devops' | 'data' | 'collaboration'
-  | 'crm' | 'commerce' | 'observability' | 'communication' | 'ai-ml'
-  | 'identity' | 'compliance' | 'finance' | 'social' | 'misc';
+  | 'aerospace' | 'agriculture' | 'ai' | 'ai-ml' | 'automotive'
+  | 'blockchain' | 'category' | 'cloud' | 'climate' | 'collaboration'
+  | 'commerce' | 'communication' | 'compliance' | 'construction' | 'crm'
+  | 'cybersecurity' | 'data' | 'design' | 'devops' | 'ecommerce'
+  | 'education' | 'employment' | 'energy' | 'engineering' | 'environment'
+  | 'erp' | 'finance' | 'food' | 'gaming' | 'government' | 'healthcare'
+  | 'hospitality' | 'housing' | 'hr' | 'identity' | 'insurance' | 'iot'
+  | 'legal' | 'logistics' | 'manufacturing' | 'marketing' | 'media'
+  | 'misc' | 'music' | 'observability' | 'politics' | 'productivity'
+  | 'real-estate' | 'reference' | 'sales' | 'science' | 'social' | 'sports'
+  | 'telecom' | 'test' | 'travel';
 
 export interface AdapterCatalogEntry {
   /**
@@ -57,6 +79,12 @@ export interface AdapterCatalogEntry {
   category: AdapterCategory;
   keywords: string[];
   toolNames: string[];
+  tools?: Array<{
+    name: string;
+    description?: string;
+    inputSchema?: Record<string, unknown>;
+    dispatchMechanisms: Array<'rest' | 'mcp'>;
+  }>;
   /**
  * EFFICIENCY #2 — Pre-built Set for O(1) tool-name lookup.
    * Populated by AdapterCatalog.buildIndex() from the `toolNames` array.
@@ -88,6 +116,16 @@ type AdapterCatalogPayload = AdapterCatalogEntry[] | { catalog?: unknown; epoch?
 export interface CatalogEpochState {
   epoch: number;
   catalogVersion: number;
+  /**
+   * SHA-256 (hex) of the exact signed bundle bytes that were accepted at
+   * this high-water mark. Binds the persisted (epoch, catalogVersion) pair
+   * to a concrete artifact so re-admitting the IDENTICAL bundle across a
+   * restart is an idempotent no-op, while a DIFFERENT bundle at the same
+   * epoch is still rejected as a replay (§5.6). Optional for backward
+   * compatibility with legacy epoch files written before identity binding;
+   * a legacy record is treated as hash-unknown and upgraded once.
+   */
+  bundleSha256?: string;
 }
 
 const EPOCH_FILE_BASENAME = '.chariot-catalog-epoch.json';
@@ -184,6 +222,63 @@ function extractEnvelopeMonotonicity(parsed: unknown): CatalogEpochState {
 }
 
 /**
+ * CHARIOT::§3.6::1 — "The system SHALL set staleDetection.maxAgeMs =
+ * 7*24*60*60*1000 (seven days) and SHALL treat a catalog older than seven
+ * days from its `materializedAt` timestamp as stale, producing a startup
+ * warning." (CHARIOT-SPEC.md:283, restated in CHARIOT-SPEC.md:371 §5.2's
+ * `stale` state row and independently corroborated by this repo's
+ * integrator-facing `docs/product/CHARIOT-SPEC.md` §4.3/§9.1, which names
+ * the exact event `catalog.stale_warning`).
+ *
+ * `materializedAt` is NOT one of §5.6's REQUIRED envelope fields
+ * (CHARIOT-SPEC.md:421 lists only catalog/registry/manifest/epoch/
+ * catalogVersion) and no publisher stamps it today — a repo-wide grep for
+ * `materializedAt` outside this change returns zero hits. Its extraction is
+ * therefore lenient (unlike `extractEnvelopeMonotonicity` above, which
+ * THROWS on a missing/malformed `epoch`/`catalogVersion` because those ARE
+ * required): a missing or non-numeric `materializedAt` yields `undefined`
+ * and never blocks catalog load. Type is `number` (Unix ms), matching
+ * `epoch`'s established convention in this same envelope (§5.6: the
+ * publisher MUST stamp `epoch = Date.now()`) — the only wall-clock-timestamp
+ * convention already pinned at this schema level.
+ */
+function extractMaterializedAt(parsed: unknown): number | undefined {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const v = (parsed as { materializedAt?: unknown }).materializedAt;
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * CHARIOT::§3.6::1 boundary check, pure and independently testable.
+ * Mirrors `VerifiedCatalog.isStaleTimestamp`'s strict `age > maxAgeMs`
+ * convention (src/catalog/VerifiedCatalog.ts) so the two staleness gates
+ * in this codebase — the existing per-adapter `lastVerifiedAt` check and
+ * this whole-catalog `materializedAt` check — apply the same boundary
+ * semantics (exactly 7 days old is NOT yet stale; one ms past 7 days IS).
+ *
+ * Returns `false` (not stale) when `materializedAt` is absent. This is a
+ * deliberate exception to the "ABSENT ≠ FALSE" rule: a startup WARNING is
+ * an affirmative claim ("this catalog IS stale") the code must not make
+ * about a field no publisher stamps yet, so silence — not a false warning
+ * — is correct until a publisher begins emitting the field. This differs from
+ * `isStaleTimestamp`'s fail-CLOSED handling of a present-but-malformed or
+ * future timestamp (which REJECTS the catalog, a security-relevant
+ * admission decision): this function only gates a WARN log, never
+ * admission, so a future `materializedAt` naturally evaluates as "not
+ * stale" (a large negative age) rather than needing its own clock-skew
+ * rule — the consequence of getting a warning-only check wrong is a
+ * missing/incorrect log line, not a bad catalog reaching the effective set.
+ */
+export function isCatalogStaleFromMaterializedAt(
+  materializedAt: number | undefined,
+  maxAgeMs: number,
+  now: number = Date.now(),
+): boolean {
+  if (materializedAt === undefined) return false;
+  return now - materializedAt > maxAgeMs;
+}
+
+/**
  * / Read the persisted high-water-mark for this
  * Chariot install. Returns null when no prior bundle has been
  * accepted (fresh install). Any read or parse error is treated as
@@ -194,7 +289,7 @@ export function loadPersistedEpoch(epochPath: string): CatalogEpochState | null 
   try {
     if (!existsSync(epochPath)) return null;
     const raw = readFileSync(epochPath, 'utf-8');
-    const parsed = JSON.parse(raw) as { epoch?: unknown; catalogVersion?: unknown };
+    const parsed = JSON.parse(raw) as { epoch?: unknown; catalogVersion?: unknown; bundleSha256?: unknown };
     if (!Number.isInteger(parsed.epoch) || !Number.isInteger(parsed.catalogVersion)) {
       log.warn('adapter-catalog.persisted_epoch_malformed', { epochPath, raw });
       return null;
@@ -202,6 +297,10 @@ export function loadPersistedEpoch(epochPath: string): CatalogEpochState | null 
     return {
       epoch: parsed.epoch as number,
       catalogVersion: parsed.catalogVersion as number,
+      // Legacy files carry no bundleSha256 — treated as hash-unknown.
+      ...(typeof parsed.bundleSha256 === 'string' && parsed.bundleSha256.length > 0
+        ? { bundleSha256: parsed.bundleSha256 }
+        : {}),
     };
   } catch (err) {
     log.warn('adapter-catalog.persisted_epoch_read_failed', {
@@ -221,7 +320,11 @@ export function loadPersistedEpoch(epochPath: string): CatalogEpochState | null 
  */
 export function persistEpoch(epochPath: string, state: CatalogEpochState): void {
   const tmp = `${epochPath}.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
-  const body = JSON.stringify({ epoch: state.epoch, catalogVersion: state.catalogVersion }) + '\n';
+  const body = JSON.stringify({
+    epoch: state.epoch,
+    catalogVersion: state.catalogVersion,
+    ...(state.bundleSha256 !== undefined ? { bundleSha256: state.bundleSha256 } : {}),
+  }) + '\n';
   writeFileSync(tmp, body, { encoding: 'utf-8', mode: 0o600 });
   try {
     chmodSync(tmp, 0o600);
@@ -257,10 +360,9 @@ export function persistEpoch(epochPath: string, state: CatalogEpochState): void 
 
 /**
  * Maximum byte length accepted on the adapter bundle file
- * BEFORE JSON.parse runs. 64 MB is well above the largest known
- * production bundle (~5 MB at 4,000+ adapters) and bounds memory +
- * parse cost on a hostile input. Rejects oversized payloads at the
- * envelope before any structural recursion happens.
+ * BEFORE JSON.parse runs. The cap is sized above the full production bundle
+ * while still bounding memory and parse cost on a hostile input. Rejects
+ * oversized payloads at the envelope before structural recursion happens.
  */
 // Sourced from the central artifact-limits policy so the
 // module-import invariant in artifact-limits.ts guards this cap against
@@ -400,6 +502,13 @@ export interface CatalogSourceConfig {
    * one MongoEpochStore between two AdapterCatalog instances.
    */
   epochStore?: import('./CatalogEpochStore.js').CatalogEpochStore;
+  /**
+   * CHARIOT::§5.2::2 freshness-boundary testability. Clock used by the
+   * catalog-wide state machine's age computation (`computeCatalogState`'s
+   * `now`). Defaults to `Date.now`. Tests use this to assert the exact
+   * 7-day boundary deterministically instead of racing the real clock.
+   */
+  now?: () => number;
 }
 
 export interface RevocationEntry {
@@ -421,6 +530,18 @@ export class AdapterCatalog {
   private revocationSet = new Set<string>();
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private refreshInFlight = false;
+  /**
+   * CHARIOT::§7.5::1 / §7.6::1 — subscribers notified every time
+   * `buildIndex()` runs (initial `load()` AND every refresh/refresh-fallback
+   * cycle that reaches a successful rebuild — see the `startRefresh()` call
+   * sites of `buildIndex`). This is the single hook point: FederationManager
+   * uses it to re-seed its revocation set from the catalog's freshly
+   * rebuilt `revocationSet` (§7.6::1) and to run the runtime-revocation
+   * teardown path for any currently-connected adapter newly marked
+   * `revoked: true`; RegistryLoader-driven callers can use it to trigger
+   * `reload()` so a signed-catalog refresh reconciles the live adapter set.
+   */
+  private readonly changeListeners: Array<() => void> = [];
   private readonly config: CatalogSourceConfig;
   private readonly verifyEnabled: boolean;
   /**
@@ -432,19 +553,73 @@ export class AdapterCatalog {
    */
   private _lastAcceptedEpoch: CatalogEpochState | null = null;
   /**
-   * Ed25519 public keys accepted for catalog signature verification. A
-   * caller-supplied `publicKeyPem` collapses this to one entry; the
-   * default uses the bundled multi-key array so a rotation overlap
-   * accepts both old and new signing keys.
+   * Ed25519 public keys accepted for catalog signature verification.
+   *
+   * CHARIOT-SPEC.md:383 (§5.4, amended): "`publicKeyPem?: string, //
+   * optional additional caller-supplied key; SHALL be validated as a
+   * member of the compiled-in CHARIOT_CATALOG_PUBLIC_KEYS rotation set
+   * (§5.1 trust anchor) before use — a supplied key outside that set
+   * SHALL be rejected, never substituted for it`." CHARIOT-SPEC.md:523
+   * (§5.7 "Trust anchor"), the same principle stated for the sealed
+   * EdgeShard's native key: "A caller-supplied key outside that rotation
+   * set SHALL be rejected." A caller-supplied `publicKeyPem` is therefore
+   * an ADDITIONAL candidate, never a substitute: it is intersected
+   * against `CHARIOT_CATALOG_PUBLIC_KEYS` via `intersectWithRotationSet`
+   * (`verifyCatalogSignature.ts`) — the identical choke point the
+   * catalog/bundle fast path routes every caller-supplied key through.
+   * The default (no `publicKeyPem`) intersects the compiled-in set
+   * against itself, which is always the full set unchanged, so a rotation
+   * overlap still accepts both old and new signing keys with no
+   * behavior change from before this field existed.
    */
   private readonly acceptedKeys: ReadonlyArray<ChariotCatalogPublicKey>;
+  /**
+   * CHARIOT-SPEC.md:383 / :523 — true only when the caller supplied a
+   * `publicKeyPem` AND it intersected to ZERO members of the compiled-in
+   * rotation set (never true for the default, unconfigured case — see
+   * `acceptedKeys` above). Consulted by `loadFromBundle`/`loadFromRegistry`
+   * so a load lands in `invalid` with the dedicated
+   * `accepted-keys-outside-rotation-set` reason instead of attempting a
+   * signature check against zero keys and misreporting a generic
+   * signature mismatch. Set once, at construction — never throws, and
+   * never silently falls back to the compiled-in set.
+   */
+  private readonly acceptedKeysOutsideRotationSet: boolean;
+
+  /**
+   * CHARIOT::§5.2::4 — catalog-wide Ed25519-gated trust state (CH-01/CH-02),
+   * distinct from the per-adapter `AdapterVerificationRecord` bookkeeping in
+   * `src/catalog/VerifiedCatalog.ts`. Starts `invalid` — fail-closed before
+   * any load has run (there is no verified catalog yet, so there is no
+   * effective catalog yet either; `entries_` starts `[]` to match).
+   */
+  private _state: CatalogWideState = 'invalid';
+  private _stateReason = 'catalog not yet loaded';
+
+  /** CHARIOT::§5.2 catalog-wide state: `verified` | `stale` | `invalid`. */
+  get state(): CatalogWideState {
+    return this._state;
+  }
+
+  /** Human-readable trigger for the current {@link state}. */
+  get stateReason(): string {
+    return this._stateReason;
+  }
 
   constructor(config: CatalogSourceConfig) {
     this.config = config;
     this.verifyEnabled = config.verifySignature !== false;
-    this.acceptedKeys = config.publicKeyPem
+    // CHARIOT-SPEC.md:383 / :523 — intersect BEFORE storing. Never throws
+    // here (construction never fails-closed by throwing) and never falls
+    // back to the compiled-in set silently on an empty result — an empty
+    // intersection is recorded in `acceptedKeysOutsideRotationSet` and
+    // surfaces as the catalog-wide `invalid` state the next time a load
+    // is attempted (see `loadFromBundle`/`loadFromRegistry` below).
+    const candidateKeys: ReadonlyArray<ChariotCatalogPublicKey> = config.publicKeyPem
       ? [{ id: 'caller-supplied', pem: config.publicKeyPem }]
       : CHARIOT_CATALOG_PUBLIC_KEYS;
+    this.acceptedKeys = intersectWithRotationSet(candidateKeys);
+    this.acceptedKeysOutsideRotationSet = config.publicKeyPem !== undefined && this.acceptedKeys.length === 0;
 
     if (!this.verifyEnabled) {
       // Every startup when verification is disabled emits a loud
@@ -468,7 +643,21 @@ export class AdapterCatalog {
     let raw: AdapterCatalogEntry[];
 
     if (this.config.source === 'registry' && this.config.registryUrl) {
-      raw = await this.loadFromRegistry();
+      // CHARIOT::§5.4::5 — "WHEN source is `registry` the system SHALL read
+      // the operator-configured registryUrl and SHALL fall back to bundle
+      // when refresh fails." An initial (load-time) registry failure is a
+      // refresh-failure case too — without this fallback the error
+      // propagated uncaught and the service never came up, even though a
+      // usable bundle was on disk.
+      try {
+        raw = await this.loadFromRegistry();
+      } catch (err) {
+        log.error('adapter-catalog.load.registry_failed', {
+          error: String(err),
+          note: 'falling back to bundle catalog',
+        });
+        raw = await this.loadFromBundle();
+      }
     } else {
       raw = await this.loadFromBundle();
     }
@@ -521,11 +710,21 @@ export class AdapterCatalog {
    * both bundle and registry load paths after byte-size / signature
    * checks but before parsing the full catalog payload. Throws
    * CatalogIntegrityError on missing/invalid envelope, replay
-   * (epoch <= persisted), or downgrade (catalogVersion < persisted).
+   * (epoch below or equal to persisted), or downgrade
+   * (catalogVersion < persisted).
    * On accept, persists the new pair BEFORE returning so a subsequent
    * load in the same process sees the bumped baseline.
+   *
+   * IDENTITY BINDING (§5.6): `bundleSha256` is the SHA-256 of the exact
+   * signed bytes being admitted. It supplements, but does not replace, the
+   * strictly-increasing epoch requirement: even identical bytes cannot be
+   * republished at an already-consumed epoch.
    */
-  private async enforceMonotonicityAndPersist(parsed: unknown, source: 'bundle' | 'registry'): Promise<void> {
+  private async enforceMonotonicityAndPersist(
+    parsed: unknown,
+    source: 'bundle' | 'registry',
+    bundleSha256?: string,
+  ): Promise<void> {
     const envelope = extractEnvelopeMonotonicity(parsed);
     const store = await this.resolveEpochStore();
     // EFFICIENCY #11 — in-process cache short-circuits a store read for
@@ -536,41 +735,75 @@ export class AdapterCatalog {
     const persisted = this._lastAcceptedEpoch ?? (await store.load());
     const epochPath = this.resolveEpochPath();
 
-    if (persisted !== null) {
-      if (envelope.epoch <= persisted.epoch) {
-        throw new CatalogIntegrityError(
-          `adapter-catalog bundle epoch ${envelope.epoch} is not strictly greater than ` +
-            `persisted epoch ${persisted.epoch} — refusing replay/rollback`,
-          {
-            envelopeEpoch: envelope.epoch,
-            persistedEpoch: persisted.epoch,
-            source,
-            epochStore: store.describe(),
-          },
-        );
-      }
-      if (envelope.catalogVersion < persisted.catalogVersion) {
-        throw new CatalogIntegrityError(
-          `adapter-catalog bundle catalogVersion ${envelope.catalogVersion} is less than ` +
-            `persisted catalogVersion ${persisted.catalogVersion} — refusing downgrade`,
-          {
-            envelopeCatalogVersion: envelope.catalogVersion,
-            persistedCatalogVersion: persisted.catalogVersion,
-            source,
-            epochStore: store.describe(),
-          },
-        );
-      }
-    }
-
-    await store.persist(envelope);
-    // EFFICIENCY #11: update the in-process cache so subsequent loads in
-    // the same process lifetime skip the disk read.
-    this._lastAcceptedEpoch = envelope;
-    log.info('adapter-catalog.envelope_accepted', {
-      source,
+    // §5.6 admission — the SINGLE shared classifier (CHARIOT-SPEC.md:436).
+    // This site MUST NOT restate the comparison locally; the local copy that
+    // used to live here rejected every equal epoch and bricked boot on the
+    // second start.
+    const admission = classifyCatalogAdmission({
       epoch: envelope.epoch,
       catalogVersion: envelope.catalogVersion,
+      ...(bundleSha256 !== undefined ? { bundleSha256 } : {}),
+      persisted,
+    });
+
+    if (admission.kind === 'rejection') {
+      log.warn('catalog.epoch_replay_rejected', {
+        bundleEpoch: envelope.epoch,
+        persistedEpoch: persisted?.epoch ?? null,
+        reason: admission.reason,
+        source,
+      });
+      throw new CatalogIntegrityError(`adapter-catalog ${admission.message}`, {
+        envelopeEpoch: envelope.epoch,
+        persistedEpoch: persisted?.epoch ?? null,
+        envelopeCatalogVersion: envelope.catalogVersion,
+        persistedCatalogVersion: persisted?.catalogVersion ?? null,
+        bundleSha256: bundleSha256 ?? null,
+        persistedBundleSha256: persisted?.bundleSha256 ?? null,
+        admissionReason: admission.reason,
+        source,
+        epochStore: store.describe(),
+      });
+    }
+
+    // CHARIOT::§3.6::1 — computed on every accepted load (advance AND
+    // re-admission), matching §5.2's "state transition is computed on
+    // every catalog load and on every refresh cycle" (CHARIOT-SPEC.md:373).
+    // A rejection above already threw, so this only runs for a catalog that
+    // IS going to be served.
+    const materializedAt = extractMaterializedAt(parsed);
+    if (isCatalogStaleFromMaterializedAt(materializedAt, DEFAULT_CATALOG_TRUST_CONFIG.staleDetection.maxAgeMs)) {
+      log.warn('catalog.stale_warning', {
+        materializedAt,
+        ageMs: Date.now() - (materializedAt as number),
+        maxAgeMs: DEFAULT_CATALOG_TRUST_CONFIG.staleDetection.maxAgeMs,
+        source,
+      });
+    }
+
+    const accepted: CatalogEpochState = {
+      epoch: envelope.epoch,
+      catalogVersion: envelope.catalogVersion,
+      ...(bundleSha256 !== undefined ? { bundleSha256 } : {}),
+    };
+    // A re-admission is NOT a publication: the high-water mark SHALL NOT be
+    // rewritten (CHARIOT-SPEC.md:431, :457). Only an advance persists. The
+    // values are unchanged by definition on a re-admission, so skipping the
+    // write is also the correct no-op — but the reason it is skipped is the
+    // clause, not an equality test.
+    if (admission.kind === 'advance') {
+      await store.persist(accepted);
+    }
+    // EFFICIENCY #11: update the in-process cache so subsequent loads in
+    // the same process lifetime skip the disk read.
+    this._lastAcceptedEpoch = accepted;
+    // C4AMD §8 closed field set: the loaded signed catalog's epoch rides on
+    // every telemetry event as `catalogEpoch` (local state only; no I/O).
+    recordLoadedCatalogEpoch(accepted.epoch);
+    log.info('adapter-catalog.envelope_accepted', {
+      source,
+      epoch: accepted.epoch,
+      catalogVersion: accepted.catalogVersion,
       epochPath,
       hadPriorBaseline: persisted !== null,
     });
@@ -615,28 +848,51 @@ export class AdapterCatalog {
       }
 
       // 1.3.0: bundled catalog signature enforcement.
+      //
+      // CHARIOT::§5.2::3 (CH-02): "A catalog whose signature fails
+      // verification produces an empty effective catalog, never a partial
+      // one." A missing/mismatched signature on this — the TERMINAL load
+      // path (there is no further fallback once the local bundle itself
+      // fails; `registry` failures fall back to here per §5.4, but a
+      // bundle failure has nowhere left to fall back to) — MUST NOT throw
+      // and crash startup. It sets the catalog-wide state to `invalid` and
+      // resolves with an empty entry list so `load()` completes normally
+      // with "no adapters available" (CHARIOT-SPEC.md:1477), matching the
+      // documented failure-mode row. This replaces the pre-4.0.0 behavior
+      // of throwing here, which brought the whole process down instead.
       if (this.verifyEnabled) {
+        // CHARIOT-SPEC.md:383 / :523 — checked BEFORE any file I/O, same
+        // ordering rationale as `verifyAndReadArtifact`'s own gate: a
+        // caller-supplied `publicKeyPem` outside the compiled-in rotation
+        // set is a CONFIGURATION error, independent of whether the
+        // catalog/.sig files even exist, and must be diagnosed with its
+        // own reason rather than misreported as a signature mismatch
+        // against a file that was never actually checked.
+        if (this.acceptedKeysOutsideRotationSet) {
+          this.applyLoadedState({ signatureValid: false, acceptedKeysOutsideRotationSet: true }, {
+            note: 'publicKeyPem override contained no member of the compiled-in CHARIOT_CATALOG_PUBLIC_KEYS rotation set (CHARIOT-SPEC.md:383, :523)',
+            catalogPath,
+          });
+          return [];
+        }
         if (!existsSync(sigPath)) {
-          throw new Error(
-            'adapter-catalog.json.sig not found alongside adapter-catalog.json. ' +
-              'Chariot requires a signed bundled catalog by default. ' +
-              'Either reinstall @epicai/chariot (which ships a signed .sig), ' +
-              're-sign your custom catalog with scripts/sign-catalog.mjs, ' +
-              'or explicitly set verifySignature: false in CatalogSourceConfig ' +
-              'to opt out (not recommended — see SECURITY.md).',
-          );
+          this.applyLoadedState({ signatureValid: false }, {
+            note: 'adapter-catalog.json.sig not found alongside adapter-catalog.json',
+            catalogPath,
+            sigPath,
+          });
+          return [];
         }
         const sigB64 = readFileSync(sigPath, 'utf-8').trim();
         const verifyResult = this.verifyAgainstAnyKey(catalogBytes, sigB64);
         if (!verifyResult.matched) {
           const acceptedIds = this.acceptedKeys.map((k) => k.id).join(', ');
-          throw new Error(
-            'adapter-catalog.json signature verification failed. ' +
-              'The bundled catalog bytes do not match the detached signature ' +
-              `against any accepted key. Tried: ${acceptedIds}. ` +
-              'This indicates either catalog tampering or a key mismatch — ' +
-              'do not proceed without investigating. See SECURITY.md.',
-          );
+          this.applyLoadedState({ signatureValid: false }, {
+            note: 'adapter-catalog.json signature verification failed against any accepted key',
+            triedKeys: acceptedIds,
+            catalogPath,
+          });
+          return [];
         }
         log.info('adapter-catalog.signature_verified', {
           source: 'bundle',
@@ -649,13 +905,93 @@ export class AdapterCatalog {
  // / Envelope monotonicity. Runs AFTER signature
       // verification so we never persist an unsigned envelope's claims,
       // and BEFORE unpackCatalogPayload so a stale-but-signed bundle
-      // never reaches the index. Persists on accept.
-      await this.enforceMonotonicityAndPersist(parsed, 'bundle');
+      // never reaches the index. Persists on accept. The SHA-256 of the
+      // exact verified bytes identity-binds the high-water mark so the
+      // unchanged on-disk bundle re-admits across restarts (§5.6).
+      await this.enforceMonotonicityAndPersist(
+        parsed,
+        'bundle',
+        createHash('sha256').update(catalogBytes).digest('hex'),
+      );
+      // CHARIOT::§5.2::1/2/4 — state recomputed on every accepted load.
+      // `enforceMonotonicityAndPersist` already threw on a rejected
+      // (replayed/downgraded) envelope above, so reaching here means this
+      // catalog IS going to be served; `verifyEnabled === false` (opt-out,
+      // its own loud startup warning fires in the constructor) is treated
+      // as `signatureValid: true` — there is no meaningful "signature
+      // valid" fact to gate on when verification itself was disabled by
+      // the operator, and §5.2 has no fourth state for "unverified."
+      this.applyLoadedState(
+        { signatureValid: true, materializedAtMs: extractMaterializedAt(parsed) },
+        { source: 'bundle' },
+      );
       return unpackCatalogPayload(parsed);
     } catch (err) {
       log.error('loadFromBundle failed', { error: String(err) });
       throw err;
     }
+  }
+
+  /**
+   * CHARIOT::§5.2::1-4 — apply `computeCatalogState`'s result to this
+   * instance and log it. Centralizes state assignment so `loadFromBundle`
+   * and `loadFromRegistry` (both success and the bundle's terminal
+   * signature-failure path) share one code path to the `state`/
+   * `stateReason` getters. Does not touch `entries_` — callers that need
+   * the CH-02 empty-effective-catalog consequence of `invalid` call
+   * `this.buildIndex([])` (or rely on the bundle-failure caller returning
+   * `[]`, which `load()`/`startRefresh()` then index).
+   */
+  private applyLoadedState(
+    input: { signatureValid: boolean; materializedAtMs?: number; acceptedKeysOutsideRotationSet?: boolean },
+    logContext: Record<string, unknown>,
+  ): CatalogWideState {
+    const result = computeCatalogState({
+      signatureValid: input.signatureValid,
+      ...(input.materializedAtMs !== undefined ? { materializedAtMs: input.materializedAtMs } : {}),
+      ...(input.acceptedKeysOutsideRotationSet ? { acceptedKeysOutsideRotationSet: true } : {}),
+      maxAgeMs: DEFAULT_CATALOG_TRUST_CONFIG.staleDetection.maxAgeMs,
+      now: (this.config.now ?? Date.now)(),
+    });
+    this._state = result.state;
+    this._stateReason = result.reason;
+    if (result.state === 'invalid') {
+      log.error('adapter-catalog.state_invalid', { reason: result.reason, ...logContext });
+    } else if (result.state === 'stale') {
+      log.warn('adapter-catalog.state_stale', { reason: result.reason, ...logContext });
+    } else {
+      log.info('adapter-catalog.state_verified', { reason: result.reason, ...logContext });
+    }
+    return result.state;
+  }
+
+  /**
+   * CHARIOT::§5.2::5 — 4.0.0: the `invalid` state SHALL also be produced
+   * by a retrieval-manifest mismatch, an encoder mismatch, or any
+   * sealed-bundle signature failure. Those three conditions are detected
+   * by `VectorIndexVerifier.admit()` (`src/engine/retrieval/
+   * VectorIndexVerifier.ts`) against the SAME sealed bundle envelope this
+   * catalog's `catalog` array is drawn from, not by this class's own
+   * Ed25519 check — a caller that observes one of those `AdmissionResult`
+   * failures on this catalog's envelope reports it here so the
+   * catalog-wide state and effective (adapter) catalog stay CH-02
+   * compliant even though the failing gate lives outside this file.
+   * Forces the effective catalog empty, per CH-02, and never throws.
+   */
+  markInvalidFromSealedBundleFailure(
+    kind: 'retrieval_manifest_mismatch' | 'encoder_mismatch' | 'sealed_bundle_signature_failed',
+    reason: string,
+  ): void {
+    const result = computeCatalogState({
+      signatureValid: true,
+      retrievalManifestMismatch: kind === 'retrieval_manifest_mismatch',
+      encoderMismatch: kind === 'encoder_mismatch',
+      sealedBundleSignatureFailed: kind === 'sealed_bundle_signature_failed',
+    });
+    this._state = result.state;
+    this._stateReason = `${result.reason} — ${reason}`;
+    this.buildIndex([]);
+    log.error('adapter-catalog.state_invalid', { kind, reason, state: this._state });
   }
 
   private async loadFromRegistry(): Promise<AdapterCatalogEntry[]> {
@@ -727,8 +1063,25 @@ export class AdapterCatalog {
  // / Envelope monotonicity, same semantics as
       // the bundle path. The persisted (epoch, catalogVersion) is
       // shared across both load paths so a registry-served replay of
-      // a previously-bundled catalog is also rejected.
-      await this.enforceMonotonicityAndPersist(entries, 'registry');
+      // a previously-bundled catalog is also rejected. Identity-bound
+      // to the SHA-256 of the verified wire bytes (§5.6).
+      await this.enforceMonotonicityAndPersist(
+        entries,
+        'registry',
+        createHash('sha256').update(bodyBytes).digest('hex'),
+      );
+      // CHARIOT::§5.2::1/2/4 — same state recomputation as the bundle path.
+      // A registry SIGNATURE failure above still throws (unlike the bundle
+      // terminal path): §5.4 requires a registry failure to fall back to
+      // bundle, and that fallback's own `loadFromBundle()` call sets the
+      // FINAL state for this `load()`/refresh cycle — setting `invalid`
+      // here first would just be overwritten a moment later. This call
+      // only covers the SUCCESS case, where `loadFromBundle` is never
+      // invoked and state would otherwise never leave its initial value.
+      this.applyLoadedState(
+        { signatureValid: true, materializedAtMs: extractMaterializedAt(entries) },
+        { source: 'registry', url },
+      );
       return unpackCatalogPayload(entries);
     } catch (err) {
       log.error('failed to load catalog from registry', { url, error: String(err) });
@@ -795,11 +1148,20 @@ export class AdapterCatalog {
   }
 
   private buildIndex(entries: AdapterCatalogEntry[]): void {
-    // Clear all indexes — atomic replace.
-    this.categoryIndex.clear();
-    this.keywordIndex.clear();
-    this.nameIndex.clear();
-    this.revocationSet.clear();
+    // §5.5: build the new catalog entirely into FRESH local structures and
+    // only reassign the instance references once, at the very end, on
+    // success. Mutating the live this.categoryIndex/keywordIndex/nameIndex/
+    // revocationSet in place (clear-then-refill) let a reader observe a
+    // cleared-but-not-yet-repopulated index mid-build, and — worse — left
+    // the live catalog PERMANENTLY corrupted if a CatalogIntegrityError
+    // threw partway through the loop below (the clear had already run, the
+    // throw aborted the refill). Building off to the side means a thrown
+    // build leaves the previously-loaded catalog completely untouched, and
+    // a successful build becomes a single atomic reference swap.
+    const categoryIndex = new Map<AdapterCategory, AdapterCatalogEntry[]>();
+    const keywordIndex = new Map<string, Set<string>>();
+    const nameIndex = new Map<string, AdapterCatalogEntry>();
+    const revocationSet = new Set<string>();
 
  // collision detection scratch — tracks every identifier we
     // have already inserted into nameIndex during this build pass.
@@ -883,7 +1245,7 @@ export class AdapterCatalog {
         );
       }
       seenIds.add(entry.name);
-      this.nameIndex.set(entry.name, entry);
+      nameIndex.set(entry.name, entry);
 
       if (entry.id && entry.id !== entry.name) {
         if (seenIds.has(entry.id)) {
@@ -893,24 +1255,24 @@ export class AdapterCatalog {
           );
         }
         seenIds.add(entry.id);
-        this.nameIndex.set(entry.id, entry);
+        nameIndex.set(entry.id, entry);
       }
 
       // Category index
-      if (!this.categoryIndex.has(entry.category)) {
-        this.categoryIndex.set(entry.category, []);
+      if (!categoryIndex.has(entry.category)) {
+        categoryIndex.set(entry.category, []);
       }
-      const catList = this.categoryIndex.get(entry.category);
+      const catList = categoryIndex.get(entry.category);
       if (!catList) throw new Error(`invariant: category ${entry.category} missing from index`);
       catList.push(entry);
 
       // Keyword index: token → set of adapter names
       for (const keyword of entry.keywords) {
         const lower = keyword.toLowerCase();
-        if (!this.keywordIndex.has(lower)) {
-          this.keywordIndex.set(lower, new Set());
+        if (!keywordIndex.has(lower)) {
+          keywordIndex.set(lower, new Set());
         }
-        const kwSet = this.keywordIndex.get(lower);
+        const kwSet = keywordIndex.get(lower);
         if (!kwSet) throw new Error(`invariant: keyword ${lower} missing from index`);
         kwSet.add(entry.name);
       }
@@ -918,10 +1280,10 @@ export class AdapterCatalog {
       // Tool name index: treat tool names as keywords too
       for (const toolName of entry.toolNames) {
         const lower = toolName.toLowerCase();
-        if (!this.keywordIndex.has(lower)) {
-          this.keywordIndex.set(lower, new Set());
+        if (!keywordIndex.has(lower)) {
+          keywordIndex.set(lower, new Set());
         }
-        const tnSet = this.keywordIndex.get(lower);
+        const tnSet = keywordIndex.get(lower);
         if (!tnSet) throw new Error(`invariant: tool keyword ${lower} missing from index`);
         tnSet.add(entry.name);
       }
@@ -933,20 +1295,63 @@ export class AdapterCatalog {
       // callers pass the package name. Both must resolve to the same
       // revocation state.
       if (entry.revoked) {
-        this.revocationSet.add(entry.name);
+        revocationSet.add(entry.name);
         if (entry.id) {
-          this.revocationSet.add(entry.id);
+          revocationSet.add(entry.id);
         }
       }
 
       sanitizedEntries.push(entry);
     }
 
+    // §5.5 atomic swap: every field is reassigned here, in one synchronous
+    // block, only after the build above has fully succeeded. A thrown
+    // CatalogIntegrityError (or any other throw) above never reaches this
+    // point, so the previously-loaded catalog is left completely intact.
+    this.categoryIndex = categoryIndex;
+    this.keywordIndex = keywordIndex;
+    this.nameIndex = nameIndex;
+    this.revocationSet = revocationSet;
     // Replace `entries_` with the sanitized + filtered list so
     // `entries()` and `size` reflect what was actually indexed, not
     // what was offered. Callers querying the catalog see ONLY clean,
     // schema-valid entries — never raw bundle data.
     this.entries_ = sanitizedEntries;
+
+    // CHARIOT::§7.5::1 / §7.6::1 — notify subscribers AFTER the atomic
+    // reference swap above, so a listener that reads `this.entries()` /
+    // `this.revokedNames()` synchronously from inside the callback always
+    // observes the just-rebuilt state, never the stale pre-swap one.
+    for (const listener of this.changeListeners) {
+      try {
+        listener();
+      } catch (err) {
+        log.error('adapter-catalog.change_listener_failed', { error: String(err) });
+      }
+    }
+  }
+
+  /**
+   * CHARIOT::§7.5::1 / §7.6::1 — subscribe to catalog rebuilds (initial
+   * load and every successful refresh/refresh-fallback cycle). Listeners
+   * are invoked synchronously, in registration order, after the new
+   * entries/revocationSet are already live.
+   */
+  onChanged(listener: () => void): void {
+    this.changeListeners.push(listener);
+  }
+
+  /**
+   * CHARIOT::§7.6::1 — "The set is populated from ... the catalog's
+   * per-entry `revoked: true` flag." Read-only view of the catalog's
+   * own revocation index, keyed by both `name` and `id` for every
+   * `revoked: true` entry (see `buildIndex`'s alias handling above) —
+   * the same keys `isRevoked()` checks. FederationManager unions this
+   * into its own revocation set rather than re-deriving it from
+   * `entries()`, so the two never drift out of alias-handling sync.
+   */
+  revokedNames(): ReadonlySet<string> {
+    return this.revocationSet;
   }
 
   // ---------------------------------------------------------------------------
@@ -1042,8 +1447,16 @@ export class AdapterCatalog {
    *     tick is skipped rather than overlapping. This prevents two
    *     concurrent `setEntries()` rebuilds from racing.
    *   - Failure preserves state: when the fetch or signature check
-   *     fails, the existing entries stay in place. A refresh failure
-   *     NEVER leaves the catalog empty or partially populated.
+   *     fails and the bundle fallback ALSO fails to even complete (I/O
+   *     error, replay/downgrade rejection), the existing entries stay in
+   *     place — a refresh failure never leaves the catalog partially
+   *     populated. The one exception is CHARIOT::§5.2::3 (CH-02): if the
+   *     bundle fallback itself COMPLETES but its signature is invalid,
+   *     that is a confirmed integrity failure on the terminal load path,
+   *     and CH-02 ("empty effective catalog, never a partial one") wins —
+   *     the catalog goes empty (`state` becomes `invalid`) rather than
+   *     continuing to serve a stale-but-formerly-good catalog past a
+   *     confirmed signature break.
    *   - `unref()`'d: the refresh timer does not keep the Node event
    *     loop alive. Shutting down the agent without calling
    *     `stopRefresh()` is safe.
@@ -1070,11 +1483,34 @@ export class AdapterCatalog {
             keyId: this.verifyEnabled ? this.acceptedKeys[0]?.id ?? 'unknown' : 'disabled',
           });
         })
-        .catch((err) => {
+        .catch(async (err) => {
           log.error('adapter-catalog.refresh.failed', {
             error: String(err),
-            note: 'retaining current catalog — previous entries remain in effect',
+            note: 'falling back to bundle catalog',
           });
+          // CHARIOT::§5.4::5 — "SHALL fall back to bundle when refresh
+          // fails." Retaining the stale in-memory catalog (the prior
+          // behavior here) is not a bundle fallback; read
+          // chariot-adapter-bundle.json and rebuild the index from it. If
+          // the bundle read throws (I/O error, replay/downgrade — NOT a
+          // signature failure, which `loadFromBundle` now resolves rather
+          // than throws), preserve the invariant above by retaining
+          // current in-memory state. If the bundle fallback instead
+          // COMPLETES with an invalid signature, `loadFromBundle` already
+          // set `state` to `invalid` and returned `[]`; `buildIndex([])`
+          // below then correctly empties the catalog per CH-02.
+          try {
+            const bundleEntries = await this.loadFromBundle();
+            this.buildIndex(bundleEntries);
+            log.info('adapter-catalog.refresh.bundle_fallback_success', {
+              entries: bundleEntries.length,
+            });
+          } catch (bundleErr) {
+            log.error('adapter-catalog.refresh.bundle_fallback_failed', {
+              error: String(bundleErr),
+              note: 'retaining current catalog — previous entries remain in effect',
+            });
+          }
         })
         .finally(() => {
           this.refreshInFlight = false;

@@ -64,13 +64,31 @@ export interface McpClientInfo {
   configPath: string;
   configKey: string;
   hint?: string;
+  /**
+   * On-disk format of the client's config file (CH-48). Defaults to 'json'.
+   * Codex reads TOML (`[mcp_servers.<name>]`); writing JSON to it is a silent
+   * no-op the client never loads. 'yaml' clients (Goose) require manual setup.
+   */
+  format?: 'json' | 'toml' | 'yaml';
 }
 
 export interface SystemInfo {
   nodeVersion: string;
+  /** CHARIOT::§17.2::1 — whether `nodeVersion` clears the >=20 floor. */
+  nodeVersionSupported: boolean;
   platform: string;
   arch: string;
   localPort: number | null;
   localBackend: string | null;
   mcpClients: McpClientInfo[];
+  /** CHARIOT::§17.2::2 — Python/Go/Rust runtime detection. */
+  runtimes: { python: string | null; go: string | null; rust: string | null };
+  /** CHARIOT::§17.2::3 — CPU/RAM/GPU hardware detection. */
+  hardware: {
+    cpuModel: string;
+    cpuCores: number;
+    ramTotalBytes: number;
+    gpu: { vendor: 'nvidia' | 'apple-silicon'; name: string; vramBytes: number | null; unifiedMemory: boolean } | null;
+    gpuAbsentReason: 'none-detected' | 'unsupported-platform' | null;
+  };
 }

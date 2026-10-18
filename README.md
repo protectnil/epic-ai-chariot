@@ -67,6 +67,17 @@ npx @epicai/chariot
 
 The setup wizard detects your AI client, writes the MCP config, and makes curated open-data integrations available — no credentials required for those adapters. You're running in under 60 seconds.
 
+### Offline kit
+
+Air-gapped and evaluation customers may receive a recipient-specific Chariot tarball instead of the public package. It carries a `kit/` directory holding the retrieval models, a sealed catalog shard, the ONNX Runtime library and your licence, all listed with SHA-256 hashes in `kit/kit-manifest.json`. Install the tarball and run the wizard:
+
+```bash
+npm install -g ./epicai-chariot-<version>.tgz
+chariot
+```
+
+Before anything else the wizard checks every file against the manifest. If any file is missing, unlisted, a symbolic link, outside the expected layout or has the wrong hash, setup stops and nothing is installed. When the check passes, the licence is activated (the same checks as `chariot license activate`) and the other files are copied into `~/.epic-ai/` (`models/`, `edgeshard/`, `lib/`), with files readable only by you. The wizard prints one line per artifact type. Running `chariot` again skips files that are already installed and never replaces a licence that has since been renewed. The public npm package never contains a kit.
+
 ### Add Adapters
 
 ```bash
@@ -83,6 +94,40 @@ chariot discover ./src
 ```
 
 Scans your codebase for OpenAPI specs and Express route definitions. You select which services to expose. The AI stops confusing your internal payment service with Stripe.
+
+#### Non-interactive discovery (`--config <file>`)
+
+For CI/scripted use, `chariot discover --config <file>` skips the interactive service picker and reads the allowlist from a JSON file instead. First run `chariot discover <path>` interactively once to see the service names it detects (shown as `<name> (<framework>)`), then write a config that lists which of those names to expose:
+
+```json
+{
+  "codebasePath": "/absolute/path/to/your/codebase",
+  "defaults": {
+    "baseUrl": "http://localhost:3000",
+    "authType": "none"
+  },
+  "services": {
+    "server": { "include": true }
+  }
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `codebasePath` | yes | Absolute path to the directory to scan. |
+| `defaults.baseUrl` | yes | Base URL your AI will call this service at. |
+| `defaults.authType` | yes | One of `none`, `bearer`, `api_key`. |
+| `defaults.authEnvKey` | no | Env var holding the credential, when `authType` isn't `none`. |
+| `services.<name>.include` | yes, per service | Only services with `include: true` are exposed — every other discovered service is silently excluded. The key is the service name `chariot discover` printed (e.g. `server`); if two discovered services share a name, key by the disambiguating slug the CLI reports instead. |
+| `services.<name>.baseUrl` / `.authType` / `.authEnvKey` | no | Override the top-level `defaults` for just this service. |
+
+Run it with:
+
+```bash
+chariot discover --config discovery.config.json --json
+```
+
+`--json` requires `--config` — non-interactive mode needs an explicit allowlist since there's no prompt to resolve selection ambiguity.
 
 ### Check License
 
@@ -141,13 +186,13 @@ Single user. Full functionality. No license file required. When the team needs m
 
 **Don't trust us. Docker it. Kill the network. It still works.**
 
-- **Zero egress.** Chariot makes no outbound connections. No license server. No telemetry. Verify it yourself in a network-isolated container.
+- **Egress you can verify.** In air-gapped mode Chariot makes no outbound connections. In connected mode the only Epic AI®-operated server it contacts is the license host (`license.epic-ai.io`), for license renewal every six hours. No telemetry unless you opt in: `chariot telemetry enable` records nine non-sensitive metadata fields (tool id, success or failure, latency, failure stage, hour, version, platform, catalog epoch — never queries, arguments, results or credentials), and sends them only if you also select automatic upload on a connected licensed install; air-gapped installs can only export a signed file. Verify it yourself in a network-isolated container.
 - **Source-available engine.** The TypeScript engine is source-available under Elastic License 2.0 in the public repository (`github.com/protectnil/epic-ai-chariot`); the npm package ships the compiled engine and TypeScript type declarations.
 - **Compiled binary.** The enterprise binary (IAM, RBAC, credential vault, discovery) is compiled Rust via napi-rs. Interface-verified at load time.
 - **Credential vault.** AES-256-GCM encryption with per-tenant HKDF-SHA256 key derivation. Master key required at startup — no defaults, no fallbacks.
 - **Audit trail.** SHA-256 hash-chained, append-only, tamper-evident. Optimistic-locking writes with full chain verification. Export as JSON, CSV, or syslog.
 - **Fail-fast startup.** Enterprise mode validates all secrets (JWT, master key), backing services (MongoDB, Redis), and binary integrity before mounting any routes. Missing or insecure configuration is rejected with an explicit error — Chariot does not limp along in a partially configured state.
-- **License enforcement.** Locally enforced via Ed25519 signature verification. Offline validation — no license server. Single-user mode is free and fully functional. Multi-user mode requires a valid license file. The transition is enforced by middleware, not by policy text.
+- **License enforcement.** Locally enforced via Ed25519 signature verification. Validation works offline; connected deployments renew against the license host (`license.epic-ai.io`) every six hours. Single-user mode is free and fully functional. Multi-user mode requires a valid license file. The transition is enforced by middleware, not by policy text.
 - **Rust memory safety.** No buffer overflows. No use-after-free. No null pointer dereferences.
 
 ### Artifacts We Ship

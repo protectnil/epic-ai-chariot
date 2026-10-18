@@ -7,89 +7,99 @@
 
 import type { ToolInfo } from '../types.js';
 
+// CHARIOT::§8.11::2 — "Each profile SHALL run eight canonical tools (list,
+// search, read, write-shadow, delete-shadow, error-handling, auth-failure,
+// rate-limit) ..." (CHARIOT-SPEC.md:824). This is the single source of truth
+// for the name list; every backend (stdio/http/api) MUST register exactly
+// these tools, in this order for display purposes (assertion order is
+// order-insensitive per the clause, which does not specify an ordering).
+// CHARIOT::§8.11::2 — the eight canonical tools per profile
 export const CANONICAL_TOOL_NAMES = [
-  'echo', 'sleep', 'fail', 'malformed',
-  'approval_target', 'multi_step', 'stateful_counter', 'ping',
+  'list', 'search', 'read', 'write-shadow',
+  'delete-shadow', 'error-handling', 'auth-failure', 'rate-limit',
 ] as const;
 
 export type CanonicalToolName = (typeof CANONICAL_TOOL_NAMES)[number];
 
+// CHARIOT::§8.11::2
 export const CANONICAL_TOOLS: ToolInfo[] = [
   {
-    name: 'echo',
-    description: 'Returns the input unchanged. Proves basic tool invocation.',
+    name: 'list',
+    description: 'Lists shadow records with pagination. Proves list/discovery behavior against deterministic seed-1337 fixtures.',
     parameters: {
       type: 'object',
       properties: {
-        message: { type: 'string', description: 'Message to echo back' },
-      },
-      required: ['message'],
-    },
-  },
-  {
-    name: 'sleep',
-    description: 'Delays for the specified duration. Proves timeout and latency handling.',
-    parameters: {
-      type: 'object',
-      properties: {
-        ms: { type: 'number', description: 'Milliseconds to sleep (max 5000)' },
-      },
-      required: ['ms'],
-    },
-  },
-  {
-    name: 'fail',
-    description: 'Always returns a structured error. Proves error propagation.',
-    parameters: {
-      type: 'object',
-      properties: {
-        reason: { type: 'string', description: 'Optional failure reason' },
+        offset: { type: 'number', description: 'Pagination offset (default 0)' },
+        limit: { type: 'number', description: 'Page size, max 50 (default 10)' },
       },
     },
   },
   {
-    name: 'malformed',
-    description: 'Returns partial or invalid data. Proves parser and resilience behavior.',
+    name: 'search',
+    description: 'Searches shadow records by query string against title/severity. Proves filtered-read behavior.',
     parameters: {
       type: 'object',
       properties: {
-        variant: { type: 'number', description: 'Malformed variant index (0-2)' },
+        query: { type: 'string', description: 'Search query matched against title (substring) or severity (exact)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'read',
+    description: 'Reads a single shadow record by id. Proves single-resource fetch and not-found handling.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Record id to read' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'write-shadow',
+    description: 'Creates or updates a record in the harness shadow store (never the real vendor). Proves write-path handling.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Record id to update; omit to create' },
+        fields: { type: 'object', description: 'Fields to set on the record' },
+      },
+      required: ['fields'],
+    },
+  },
+  {
+    name: 'delete-shadow',
+    description: 'Deletes a record from the harness shadow store by id. Proves delete-path and not-found handling.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Record id to delete' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'error-handling',
+    description: 'Deterministically returns malformed/partial/sensitive/injection-bearing payloads. Proves parser and resilience behavior.',
+    parameters: {
+      type: 'object',
+      properties: {
+        variant: { type: 'number', description: 'Malformed variant index (0-3)' },
       },
     },
   },
   {
-    name: 'approval_target',
-    description: 'Requires approval gating in config. Proves approval-needed event flow.',
-    parameters: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', description: 'Action requiring approval' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'multi_step',
-    description: 'Returns data that triggers follow-up tool calls. Proves planner iteration.',
-    parameters: {
-      type: 'object',
-      properties: {
-        step: { type: 'number', description: 'Current step number (1-based)' },
-      },
-      required: ['step'],
-    },
-  },
-  {
-    name: 'stateful_counter',
-    description: 'Increments per call. Proves connection state, isolation, and reset.',
+    name: 'auth-failure',
+    description: 'Deterministically returns a structured authentication-failure result. Proves downstream auth-failure handling.',
     parameters: {
       type: 'object',
       properties: {},
     },
   },
   {
-    name: 'ping',
-    description: 'Returns health status and backend identity. Proves liveness.',
+    name: 'rate-limit',
+    description: 'Deterministically returns a structured rate-limit-exceeded result with retry-after. Proves backoff/retry handling.',
     parameters: {
       type: 'object',
       properties: {},

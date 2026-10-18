@@ -36,8 +36,13 @@ import * as audit from '../services/audit.js';
 import { isAuthRateLimited, recordAuthFailure, clearAuthFailures } from '../services/auth-rate-limit.js';
 import { clientIp as extractClientIp, userAgent as extractUserAgent } from '../utils/url.js';
 import type { EnterpriseUserDocument } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
+import { chariotEmitter } from '../../observability/emitter.js';
 
-const router = Router();
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.mfa');
+
+const router = Router({ mergeParams: true });
 
 const COOKIE_PENDING = 'enterprise_mfa_pending';
 const COOKIE_TOKEN = 'enterprise_token';
@@ -130,6 +135,14 @@ async function completeMfaLogin(
   res.clearCookie(COOKIE_PENDING);
   res.redirect('/');
 
+  // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) — this
+  // is the completed-login site for the MFA-required flow (SAML/OIDC's own
+  // auth.success sites return early into the MFA-pending redirect before
+  // ever reaching their audit.log('login'), so there is no double-fire).
+  chariotEmitter.send('auth.success', {
+    data: { tenantId, userId, method: 'mfa-totp' },
+  });
+
   // Fire-and-forget audit — must not block or fail the auth response.
   audit.log(tenantId, 'login', {
     actorId: userId,
@@ -141,7 +154,7 @@ async function completeMfaLogin(
     userAgent: extractUserAgent(req),
   }).catch((err: unknown) => {
      
-    console.error('[iam/mfa] audit log failed after successful MFA login', err);
+    moduleLog.error('[iam/mfa] audit log failed after successful MFA login', { error: err instanceof Error ? err.message : String(err) });
   });
 }
 
@@ -253,7 +266,7 @@ router.post('/mfa/verify', async (req: Request, res: Response): Promise<void> =>
     plaintextSecret = decryptTotpSecret(mfaDoc.encrypted, mfaDoc.iv, payload.tenantId);
   } catch {
      
-    console.error('[iam/mfa] TOTP secret decryption failed', { tenantId: payload.tenantId, userId: payload.userId });
+    moduleLog.error('[iam/mfa] TOTP secret decryption failed', { tenantId: payload.tenantId, userId: payload.userId });
     res.status(500).json({ error: 'MFA secret unavailable.' });
     return;
   }
@@ -261,6 +274,14 @@ router.post('/mfa/verify', async (req: Request, res: Response): Promise<void> =>
   const valid = await verifyTotpCode(plaintextSecret, token);
 
   if (!valid) {
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) — this
+    // is the login-completing MFA challenge (/mfa/verify), distinct from
+    // /mfa/setup/verify's enrollment-confirmation code check above (not a
+    // login attempt, so it does not emit auth.failure).
+    chariotEmitter.send('auth.failure', {
+      severity: 'warning',
+      data: { tenantId: payload.tenantId, userId: payload.userId, method: 'mfa-totp' },
+    });
     await recordAuthFailure(clientIp, payload.tenantId);
     res.status(401).json({ error: 'Invalid TOTP code.' });
     return;

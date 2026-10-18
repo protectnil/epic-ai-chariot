@@ -71,10 +71,15 @@ export function canSetHighImportance(actor: MemoryActor | undefined): boolean {
 // ---------------------------------------------------------------------------
 
 export class InMemoryStore implements MemoryStoreAdapter {
+  /** scopeKey(tenantId,userId) → entries. NEVER keyed on userId alone (§8.5::1). */
   private readonly store = new Map<string, StoredMemory[]>();
 
-  /** userId → memoryId index for O(1) lookup in recordAccess/promoteImportance */
-  private readonly idIndex = new Map<string, { userId: string; entry: StoredMemory }>();
+  /**
+   * (tenantId, memoryId) → entry index for O(1) lookup in
+   * recordAccess/promoteImportance. Keyed WITH the tenant so a memoryId from
+   * one tenant can never resolve an entry owned by another (the cross-tenant memory isolation fix).
+   */
+  private readonly idIndex = new Map<string, { tenantId: string; userId: string; entry: StoredMemory }>();
 
   /** Per-scope high-importance count cache — updated incrementally on save/promote/soft-delete. */
   private readonly highCount = new Map<string, number>();
@@ -85,6 +90,20 @@ export class InMemoryStore implements MemoryStoreAdapter {
   constructor(options: InMemoryStoreOptions = {}) {
     this.maxEntriesPerScope      = options.maxEntriesPerScope      ?? DEFAULT_MAX_ENTRIES_PER_SCOPE;
     this.maxHighImportancePerScope = options.maxHighImportancePerScope ?? DEFAULT_MAX_HIGH_IMPORTANCE_PER_SCOPE;
+  }
+
+  /**
+   * §8.5::1 — the memory scope is (tenantId, userId), never userId alone.
+   * NUL is used as the separator because it cannot occur in either component,
+   * so no pair of distinct (tenant,user) values can collide on the joined key.
+   */
+  private scopeKey(tenantId: string, userId: string): string {
+    return `${tenantId}\u0000${userId}`;
+  }
+
+  /** (tenantId, memoryId) index key — see idIndex. */
+  private indexKey(tenantId: string, memoryId: string): string {
+    return `${tenantId}\u0000${memoryId}`;
   }
 
   // -------------------------------------------------------------------------
@@ -108,11 +127,13 @@ export class InMemoryStore implements MemoryStoreAdapter {
    *   If the scope is at MAX_ENTRIES_PER_SCOPE non-deleted entries, the
    *   lowest-importance / oldest entry is evicted (soft-deleted) before insert.
    */
-  save(userId: string, entry: MemoryEntry, actor?: MemoryActor): Promise<StoredMemory> {
+  save(tenantId: string, userId: string, entry: MemoryEntry, actor?: MemoryActor): Promise<StoredMemory> {
+    const scope = this.scopeKey(tenantId, userId);
     // Actor capability check
     let effectiveImportance: MemoryImportance = entry.importance;
     if (effectiveImportance === 'high' && !canSetHighImportance(actor)) {
       log.warn('importance downgrade: actor lacks memory:high capability', {
+        tenantId,
         userId,
         from: 'high',
         to: 'medium',
@@ -121,7 +142,7 @@ export class InMemoryStore implements MemoryStoreAdapter {
     }
 
     // Single-pass: collect live count + high count simultaneously
-    const all = this.store.get(userId) ?? [];
+    const all = this.store.get(scope) ?? [];
     let liveCount = 0;
     const live: StoredMemory[] = [];
     for (const m of all) {
@@ -133,15 +154,16 @@ export class InMemoryStore implements MemoryStoreAdapter {
 
     // Per-scope high-importance cap check (use incremental cache)
     if (effectiveImportance === 'high') {
-      const currentHigh = this.highCount.get(userId) ?? 0;
+      const currentHigh = this.highCount.get(scope) ?? 0;
       if (currentHigh >= this.maxHighImportancePerScope) {
         const err = Object.assign(
           new Error(
-            `[InMemoryStore] high-importance cap exceeded: scope "${userId}" already holds ` +
+            `[InMemoryStore] high-importance cap exceeded: scope "${tenantId}/${userId}" already holds ` +
             `${currentHigh} high-importance entries (cap: ${this.maxHighImportancePerScope})`,
           ),
           {
             code: CHARIOT_ERROR_CODES.HIGH_IMPORTANCE_CAP_EXCEEDED as ChariotErrorCode,
+            tenantId,
             userId,
             cap: this.maxHighImportancePerScope,
           },
@@ -152,7 +174,7 @@ export class InMemoryStore implements MemoryStoreAdapter {
 
     // Capacity cap + eviction
     if (liveCount >= this.maxEntriesPerScope) {
-      this._evictOne(userId, live);
+      this._evictOne(tenantId, userId, live);
     }
 
     // Insert
@@ -160,6 +182,7 @@ export class InMemoryStore implements MemoryStoreAdapter {
       ...entry,
       importance: effectiveImportance,
       id: randomUUID(),
+      tenantId,
       userId,
       createdAt: new Date(),
       accessCount: 0,
@@ -168,14 +191,14 @@ export class InMemoryStore implements MemoryStoreAdapter {
     };
 
     all.push(memory);
-    this.store.set(userId, all);
+    this.store.set(scope, all);
 
     // Index for O(1) lookup
-    this.idIndex.set(memory.id, { userId, entry: memory });
+    this.idIndex.set(this.indexKey(tenantId, memory.id), { tenantId, userId, entry: memory });
 
     // Update high-count cache
     if (effectiveImportance === 'high') {
-      this.highCount.set(userId, (this.highCount.get(userId) ?? 0) + 1);
+      this.highCount.set(scope, (this.highCount.get(scope) ?? 0) + 1);
     }
 
     return Promise.resolve(memory);
@@ -193,8 +216,8 @@ export class InMemoryStore implements MemoryStoreAdapter {
    * recordAccess() explicitly. Importance promotion must go through
    * promoteImportance().
    */
-  recall(userId: string, options: RecallOptions): Promise<StoredMemory[]> {
-    let memories = this._liveEntries(userId);
+  recall(tenantId: string, userId: string, options: RecallOptions): Promise<StoredMemory[]> {
+    let memories = this._liveEntries(tenantId, userId);
 
     // Filter by type
     if (options.type) {
@@ -245,8 +268,8 @@ export class InMemoryStore implements MemoryStoreAdapter {
    *
  * This is the ONLY path that may mutate accessCount / lastAccessed.
    */
-  recordAccess(memoryId: string): Promise<void> {
-    const ref = this.idIndex.get(memoryId);
+  recordAccess(tenantId: string, memoryId: string): Promise<void> {
+    const ref = this.idIndex.get(this.indexKey(tenantId, memoryId));
     if (!ref || ref.entry.isDeleted) return Promise.resolve();
 
     ref.entry.accessCount++;
@@ -265,25 +288,26 @@ export class InMemoryStore implements MemoryStoreAdapter {
  * Promotion to 'high' is subject to MAX_HIGH_IMPORTANCE_PER_SCOPE.
    *   If the scope is at cap, rejects with { code: 'HIGH_IMPORTANCE_CAP_EXCEEDED' }.
    */
-  promoteImportance(memoryId: string, newImportance: MemoryImportance): Promise<void> {
-    const ref = this.idIndex.get(memoryId);
+  promoteImportance(tenantId: string, memoryId: string, newImportance: MemoryImportance): Promise<void> {
+    const ref = this.idIndex.get(this.indexKey(tenantId, memoryId));
     if (!ref || ref.entry.isDeleted) return Promise.resolve();
 
     const prevImportance = ref.entry.importance;
+    const scope = this.scopeKey(ref.tenantId, ref.userId);
 
     if (newImportance === 'high' && prevImportance !== 'high') {
-      const userId = ref.userId;
-      const currentHigh = this.highCount.get(userId) ?? 0;
+      const currentHigh = this.highCount.get(scope) ?? 0;
       if (currentHigh >= this.maxHighImportancePerScope) {
         const err = Object.assign(
           new Error(
             `[InMemoryStore] high-importance cap exceeded on promoteImportance: ` +
-            `scope "${userId}" already holds ${currentHigh} high-importance entries ` +
+            `scope "${ref.tenantId}/${ref.userId}" already holds ${currentHigh} high-importance entries ` +
             `(cap: ${this.maxHighImportancePerScope})`,
           ),
           {
             code: CHARIOT_ERROR_CODES.HIGH_IMPORTANCE_CAP_EXCEEDED as ChariotErrorCode,
-            userId,
+            tenantId: ref.tenantId,
+            userId: ref.userId,
             cap: this.maxHighImportancePerScope,
           },
         );
@@ -294,11 +318,10 @@ export class InMemoryStore implements MemoryStoreAdapter {
     ref.entry.importance = newImportance;
 
     // Update high-count cache incrementally
-    const userId = ref.userId;
     if (prevImportance === 'high' && newImportance !== 'high') {
-      this.highCount.set(userId, Math.max(0, (this.highCount.get(userId) ?? 0) - 1));
+      this.highCount.set(scope, Math.max(0, (this.highCount.get(scope) ?? 0) - 1));
     } else if (prevImportance !== 'high' && newImportance === 'high') {
-      this.highCount.set(userId, (this.highCount.get(userId) ?? 0) + 1);
+      this.highCount.set(scope, (this.highCount.get(scope) ?? 0) + 1);
     }
 
     return Promise.resolve();
@@ -312,8 +335,8 @@ export class InMemoryStore implements MemoryStoreAdapter {
    * Returns live capacity metrics for a userId scope.
    * nearCap = true when entries >= 90% of cap.
    */
-  getCapacityStatus(userId: string): Promise<CapacityStatus> {
-    const entries = this._liveEntries(userId).length;
+  getCapacityStatus(tenantId: string, userId: string): Promise<CapacityStatus> {
+    const entries = this._liveEntries(tenantId, userId).length;
     const cap     = this.maxEntriesPerScope;
     return Promise.resolve({
       entries,
@@ -326,8 +349,8 @@ export class InMemoryStore implements MemoryStoreAdapter {
   // context()
   // -------------------------------------------------------------------------
 
-  context(userId: string): Promise<ContextSummary> {
-    const memories = this._liveEntries(userId);
+  context(tenantId: string, userId: string): Promise<ContextSummary> {
+    const memories = this._liveEntries(tenantId, userId);
 
     const memoryTypes = new Map<string, number>();
     let lastInteraction: Date | null = null;
@@ -365,9 +388,10 @@ export class InMemoryStore implements MemoryStoreAdapter {
   // delete()
   // -------------------------------------------------------------------------
 
-  delete(userId: string, memoryId: string): Promise<void> {
-    const memories = this.store.get(userId);
-    if (!memories) return Promise.resolve();
+  delete(tenantId: string, userId: string, memoryId: string): Promise<boolean> {
+    const scope = this.scopeKey(tenantId, userId);
+    const memories = this.store.get(scope);
+    if (!memories) return Promise.resolve(false);
 
     const memory = memories.find(m => m.id === memoryId);
     if (memory && !memory.isDeleted) {
@@ -375,10 +399,11 @@ export class InMemoryStore implements MemoryStoreAdapter {
       memory.deletedAt = new Date();
       // Update high-count cache if we just soft-deleted a high entry
       if (memory.importance === 'high') {
-        this.highCount.set(userId, Math.max(0, (this.highCount.get(userId) ?? 0) - 1));
+        this.highCount.set(scope, Math.max(0, (this.highCount.get(scope) ?? 0) - 1));
       }
+      return Promise.resolve(true);
     }
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
 
   // -------------------------------------------------------------------------
@@ -395,12 +420,63 @@ export class InMemoryStore implements MemoryStoreAdapter {
   }
 
   // -------------------------------------------------------------------------
+  // Durable-store hooks (durable memory across serve restarts)
+  //
+  // A durable subclass (FileStore) persists across process restarts by
+  // exporting the full entry set after every mutation and importing it on
+  // construction. These operate on ALL scopes and include soft-deleted
+  // entries so tombstones (isDeleted) and access/importance metadata survive a
+  // round-trip unchanged. They are `protected`: not part of the public
+  // MemoryStoreAdapter contract, only a subclass extension seam.
+  // -------------------------------------------------------------------------
+
+  /** Export every entry (including soft-deleted) across all userId scopes. */
+  protected exportEntries(): StoredMemory[] {
+    const out: StoredMemory[] = [];
+    for (const list of this.store.values()) {
+      for (const m of list) out.push(m);
+    }
+    return out;
+  }
+
+  /**
+   * Rebuild all in-memory indexes from a flat entry list. Clears existing
+   * state first, then re-derives the per-scope high-importance counts from the
+   * live (non-deleted) 'high' entries so getCapacityStatus / the high cap stay
+   * accurate after a hydrate.
+   */
+  protected importEntries(entries: StoredMemory[]): void {
+    this.store.clear();
+    this.idIndex.clear();
+    this.highCount.clear();
+    for (const e of entries) {
+      // §8.5::1 — a hydrated row with no tenantId is a legacy unscoped record.
+      // It is NOT assigned a default tenant (that would make it readable by an
+      // arbitrary tenant); it is skipped so it can never surface through a
+      // tenant-scoped read. Such rows must be exported and explicitly
+      // re-imported under an operator-assigned tenant.
+      if (typeof e.tenantId !== 'string' || e.tenantId.length === 0) {
+        log.warn('skipping legacy unscoped memory row (no tenantId)', { memoryId: e.id });
+        continue;
+      }
+      const scope = this.scopeKey(e.tenantId, e.userId);
+      const list = this.store.get(scope) ?? [];
+      list.push(e);
+      this.store.set(scope, list);
+      this.idIndex.set(this.indexKey(e.tenantId, e.id), { tenantId: e.tenantId, userId: e.userId, entry: e });
+      if (!e.isDeleted && e.importance === 'high') {
+        this.highCount.set(scope, (this.highCount.get(scope) ?? 0) + 1);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
 
-  /** Return all non-deleted entries for a userId scope. */
-  private _liveEntries(userId: string): StoredMemory[] {
-    return (this.store.get(userId) ?? []).filter(m => !m.isDeleted);
+  /** Return all non-deleted entries for a (tenantId, userId) scope. */
+  private _liveEntries(tenantId: string, userId: string): StoredMemory[] {
+    return (this.store.get(this.scopeKey(tenantId, userId)) ?? []).filter(m => !m.isDeleted);
   }
 
   /**
@@ -412,7 +488,7 @@ export class InMemoryStore implements MemoryStoreAdapter {
    *
    * Linear scan O(n) — no sort.
    */
-  private _evictOne(userId: string, live: StoredMemory[]): void {
+  private _evictOne(tenantId: string, userId: string, live: StoredMemory[]): void {
     if (live.length === 0) return;
 
     // Linear scan for the entry with the lowest (importanceRank, createdAt)
@@ -436,10 +512,12 @@ export class InMemoryStore implements MemoryStoreAdapter {
 
     // Update high-count cache if a high-importance entry was evicted
     if (victim.importance === 'high') {
-      this.highCount.set(userId, Math.max(0, (this.highCount.get(userId) ?? 0) - 1));
+      const scope = this.scopeKey(tenantId, userId);
+      this.highCount.set(scope, Math.max(0, (this.highCount.get(scope) ?? 0) - 1));
     }
 
     log.warn('eviction: scope reached cap', {
+      tenantId,
       userId,
       cap: this.maxEntriesPerScope,
       evictedId: victim.id,

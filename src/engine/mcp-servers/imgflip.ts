@@ -26,7 +26,7 @@ export class ImgflipMCPServer extends MCPAdapterBase {
       name: 'imgflip',
       displayName: 'Imgflip',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'imgflip', 'meme', 'memes', 'meme templates', 'image macros',
         'humor', 'funny', 'viral', 'internet culture', 'meme generator',

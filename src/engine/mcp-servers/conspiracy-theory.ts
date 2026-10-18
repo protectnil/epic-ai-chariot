@@ -41,7 +41,7 @@ export class ConspiracyTheoryMCPServer extends MCPAdapterBase {
       name: 'conspiracy-theory',
       displayName: 'Conspiracy Theory Generator',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'conspiracy', 'conspiracy theory', 'theory', 'humor', 'satire',
         'entertainment', 'generate', 'connect', 'investigate', 'tinfoil',

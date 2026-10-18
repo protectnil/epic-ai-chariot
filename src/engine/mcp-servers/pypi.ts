@@ -34,7 +34,7 @@ export class PypiMCPServer extends MCPAdapterBase {
       name: 'pypi',
       displayName: 'PyPI (Python Package Index)',
       version: '1.0.0',
-      category: 'developer-tools',
+      category: 'devops',
       keywords: [
         'pypi', 'python', 'pip', 'package', 'packages', 'dependencies',
         'package index', 'release', 'versions', 'python package',

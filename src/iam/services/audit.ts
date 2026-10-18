@@ -11,20 +11,30 @@ import { GENESIS_HASH } from '../../util/audit-chain.js';
 import { getCollection } from '../db.js';
 import type { AuditEventDocument, AuditEventType, AuditTargetType } from '../types.js';
 import { withAuditLock } from './audit-mutex.js';
+import { chariotEmitter } from '../../observability/emitter.js';
+import { createLogger } from '../../engine/logger.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.audit');
 
 const EVENTS_COLLECTION = 'iam_audit_events';
 const COUNTERS_COLLECTION = 'iam_audit_counters';
 const MAX_RETRIES = 10;
+/** §3.3::7: the per-tenant audit counter document is keyed by _id = `audit:{tenantId}`. */
+function auditCounterId(tenantId: string): string {
+  return `audit:${tenantId}`;
+}
 
 // ── Internal types ──────────────────────────────────────────────────────────
 
 interface AuditCounter {
+  _id: string;
   tenantId: string;
   seq: number;
   lastHash: string;
 }
 
-interface ChainedAuditEvent extends AuditEventDocument {
+export interface ChainedAuditEvent extends AuditEventDocument {
   seq: number;
   hash: string;
   previousHash: string;
@@ -79,11 +89,11 @@ function computeHash(
 async function ensureCounter(tenantId: string): Promise<AuditCounter> {
   const col = await getCollection<AuditCounter>(COUNTERS_COLLECTION);
 
-  const existing = await col.findOne({ tenantId });
+  const existing = await col.findOne({ _id: auditCounterId(tenantId) });
   if (existing) return existing;
 
   await col.updateOne(
-    { tenantId },
+    { _id: auditCounterId(tenantId) },
     {
       $setOnInsert: {
         tenantId,
@@ -94,7 +104,7 @@ async function ensureCounter(tenantId: string): Promise<AuditCounter> {
     { upsert: true },
   );
 
-  const created = await col.findOne({ tenantId });
+  const created = await col.findOne({ _id: auditCounterId(tenantId) });
   if (!created) {
     // Unreachable under normal operation: updateOne with upsert:true has just
     // succeeded. A null here means either a concurrent delete or a storage
@@ -123,7 +133,13 @@ export async function log(
   eventType: AuditEventType,
   opts: {
     actorId: string;
-    actorEmail: string;
+    /**
+     * §3.5::17 — optional: the pre-dispatch request boundary (CallContext) holds
+     * `auth.userId` but carries no email, and fabricating one would put a false
+     * identity in a hash-chained record. Absent is recorded as '' exactly like
+     * the neighbouring `ip` / `userAgent` fields.
+     */
+    actorEmail?: string;
     targetType: AuditTargetType;
     targetId: string;
     detail?: Record<string, unknown>;
@@ -144,7 +160,13 @@ async function logImpl(
   eventType: AuditEventType,
   opts: {
     actorId: string;
-    actorEmail: string;
+    /**
+     * §3.5::17 — optional: the pre-dispatch request boundary (CallContext) holds
+     * `auth.userId` but carries no email, and fabricating one would put a false
+     * identity in a hash-chained record. Absent is recorded as '' exactly like
+     * the neighbouring `ip` / `userAgent` fields.
+     */
+    actorEmail?: string;
     targetType: AuditTargetType;
     targetId: string;
     detail?: Record<string, unknown>;
@@ -184,7 +206,7 @@ async function logImpl(
 
     // Step 3 — CAS update counter
     const casResult = await countersCol.updateOne(
-      { tenantId, seq: previousSeqSnapshot },
+      { _id: auditCounterId(tenantId), seq: previousSeqSnapshot },
       { $set: { seq: nextSeq, lastHash: hash } },
     );
 
@@ -198,7 +220,7 @@ async function logImpl(
       seq: nextSeq,
       eventType,
       actorId: opts.actorId,
-      actorEmail: opts.actorEmail,
+      actorEmail: opts.actorEmail ?? '',
       targetType: opts.targetType,
       targetId: opts.targetId,
       detail: opts.detail ?? {},
@@ -227,17 +249,16 @@ async function logImpl(
       // hash-chain break.
       try {
         await countersCol.updateOne(
-          { tenantId, seq: nextSeq, lastHash: hash },
+          { _id: auditCounterId(tenantId), seq: nextSeq, lastHash: hash },
           { $set: { seq: previousSeqSnapshot, lastHash: previousHashSnapshot } },
         );
       } catch (rollbackErr) {
          
-        console.error(
+        moduleLog.error(
           `[iam/audit] CRITICAL: counter rollback failed after insert failure ` +
             `(tenant=${tenantId}, seq=${nextSeq}) — hash chain may be inconsistent. ` +
             `Original insert error: ${insertErr instanceof Error ? insertErr.message : String(insertErr)}. ` +
-            `Rollback error:`,
-          rollbackErr,
+            `Rollback error: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
         );
       }
       throw insertErr;
@@ -251,11 +272,71 @@ async function logImpl(
 
 // ── Query ───────────────────────────────────────────────────────────────────
 
+/**
+ * §3.5::21 (CH-15) — compare the chain head against the `iam_audit_counters`
+ * document and raise an integrity alert on a gap. A mismatch means events were
+ * deleted or the counter was tampered with: the tail the counter promises is
+ * not the tail the events collection actually holds.
+ *
+ * Fail-closed: the alert is emitted AND the caller is thrown to, so a tampered
+ * log can never be served as if it were intact. Deliberately unfiltered — the
+ * head is the tenant's true maximum `seq`, independent of any query filter.
+ */
+async function assertChainHeadMatchesCounter(
+  tenantId: string,
+  col: Awaited<ReturnType<typeof getCollection<ChainedAuditEvent>>>,
+): Promise<void> {
+  const counter = await ensureCounter(tenantId);
+  const head = await col.findOne({ tenantId }, { sort: { seq: -1 } });
+
+  const observedSeq = head?.seq ?? 0;
+  const observedHash = head?.hash ?? GENESIS_HASH;
+
+  if (counter.seq === observedSeq && counter.lastHash === observedHash) return;
+
+  chariotEmitter.send('system.error', {
+    severity: 'critical',
+    alertWorthy: true,
+    data: {
+      reason: 'iam_audit_chain_head_counter_mismatch',
+      tenantId,
+      counterSeq: counter.seq,
+      observedSeq,
+      counterHash: counter.lastHash,
+      observedHash,
+    },
+  });
+  // CHARIOT::§16.1 Audit (CHARIOT-SPEC.md:1349, rulings item 91/105) —
+  // the customer-facing, spec-pinned counterpart to the system.error
+  // emit directly above (CH-15's own generic operational event) — both
+  // fire, neither replaces the other. Also §16.2's own named critical-
+  // severity bypass event (CHARIOT-SPEC.md:1365).
+  chariotEmitter.send('audit.gap_detected', {
+    severity: 'critical',
+    alertWorthy: true,
+    data: {
+      tenantId,
+      counterSeq: counter.seq,
+      observedSeq,
+      counterHash: counter.lastHash,
+      observedHash,
+    },
+  });
+
+  throw new Error(
+    `[iam/audit] integrity gap detected for tenant=${tenantId}: ` +
+      `counter=(${counter.seq},${counter.lastHash}) head=(${observedSeq},${observedHash})`,
+  );
+}
+
 export async function query(
   tenantId: string,
   options: AuditQueryOptions = {},
 ): Promise<{ events: ChainedAuditEvent[]; total: number }> {
   const col = await getCollection<ChainedAuditEvent>(EVENTS_COLLECTION);
+
+  // §3.5::21 — gap detection runs on EVERY read, before any event is returned.
+  await assertChainHeadMatchesCounter(tenantId, col);
 
   const filter: Record<string, unknown> = { tenantId };
 
@@ -280,6 +361,21 @@ export async function query(
   ]);
 
   return { events, total };
+}
+
+/**
+ * Returns the single most recent event of `eventType` for `tenantId`, or
+ * null if none has ever been appended. Extension point for callers that
+ * derive a "current state" from the latest record in this append-only log
+ * (e.g. telemetry-consent.ts's `version` = the returned event's `seq`)
+ * without pulling the tenant's full history via `query()`.
+ */
+export async function queryLatest(
+  tenantId: string,
+  eventType: AuditEventType,
+): Promise<ChainedAuditEvent | null> {
+  const col = await getCollection<ChainedAuditEvent>(EVENTS_COLLECTION);
+  return col.findOne({ tenantId, eventType }, { sort: { seq: -1 } });
 }
 
 // ── Chain Verification ──────────────────────────────────────────────────────
@@ -361,6 +457,37 @@ export async function verifyChain(
 
     previousHash = event.hash;
     previousSeq = event.seq;
+  }
+
+  // §3.5::21 (CH-15) — the in-window checks above cannot see events truncated
+  // from the TAIL: deleting the last N events leaves a perfectly self-consistent
+  // chain. Compare the true head against the iam_audit_counters document, which
+  // records the seq/hash the chain is supposed to end on. Only meaningful for a
+  // full-range verification — a caller-bounded window legitimately ends early.
+  const isFullRange = startSeq === undefined && endSeq === undefined;
+  if (isFullRange) {
+    const counter = await ensureCounter(tenantId);
+    const headSeq = events.length > 0 ? events[events.length - 1].seq : 0;
+    const headHash = events.length > 0 ? events[events.length - 1].hash : GENESIS_HASH;
+
+    if (counter.seq !== headSeq || counter.lastHash !== headHash) {
+      errors.push(
+        `Counter/head mismatch: counter=(${counter.seq},${counter.lastHash}) ` +
+          `head=(${headSeq},${headHash})`,
+      );
+      chariotEmitter.send('system.error', {
+        severity: 'critical',
+        alertWorthy: true,
+        data: {
+          reason: 'iam_audit_chain_head_counter_mismatch',
+          tenantId,
+          counterSeq: counter.seq,
+          observedSeq: headSeq,
+          counterHash: counter.lastHash,
+          observedHash: headHash,
+        },
+      });
+    }
   }
 
   return {

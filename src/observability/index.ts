@@ -13,3 +13,27 @@
 export { ChariotEmitter, type ChariotEvent, type ChariotEventType, type AlertSeverity } from './emitter.js';
 export { ChariotMetrics } from './metrics.js';
 export { AlertQueue, type PendingAlert } from './alerts.js';
+
+// Real-time anomaly detection — rules, detector, and the dispatch-layer
+// wiring (reportToolDispatch) that feeds findings into the AlertQueue/
+// ChariotEmitter above. See ./anomaly/index.ts for the full surface.
+export {
+  AnomalyDetector,
+  ToolCallRateSpikeRule,
+  DestructiveToolBurstRule,
+  CrossTenantDriftRule,
+  ScopeViolationRule,
+  reportToolDispatch,
+  anomalyDetector,
+  anomalyAlertQueue,
+  anomalyEmitter,
+  type AnomalyRule,
+  type AnomalySignal,
+  type AnomalyFinding,
+  type AnomalySeverity,
+  type FindingCallback,
+  type RateSpikeOptions,
+  type DestructiveBurstOptions,
+  type CrossTenantDriftOptions,
+  type ToolDispatchReport,
+} from './anomaly/index.js';

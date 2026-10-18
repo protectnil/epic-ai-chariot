@@ -1,0 +1,102 @@
+{{- /*
+RHACS (Red Hat Advanced Cluster Security / StackRox) is the certified
+deploy-time image-signature verifier for the OpenShift / IBM Marketplace
+channel (imageVerification.engine: rhacs), the RHACS-equivalent of the
+Kyverno ClusterPolicy templates/image-verify-policy.yaml renders for EKS.
+
+RHACS has NO Helm-renderable CRD for either resource CH-54 needs — a
+SignatureIntegration (the trust material: Cosign public keys or a keyless
+Sigstore issuer/identity) and the enforcement Security Policy that references
+it by name. Both are owned by RHACS Central as REST resources, not Kubernetes
+custom resources (Red Hat Advanced Cluster Security for Kubernetes docs,
+"Operating > Verifying image signatures": SignatureIntegration is created via
+the Central UI, the Central API, or `roxctl central signature-integrations
+create` — none of which is `kubectl apply`-able). So this template ships a
+ConfigMap carrying the intended payload and the exact roxctl commands instead
+of a policy object — the "documented values block" the engine's own
+values.yaml comments point to.
+*/ -}}
+{{- include "chariot.assertImageVerifyFailClosed" . -}}
+{{- if and .Values.imageVerification.enabled (eq (include "chariot.imageVerificationEngine" .) "rhacs") -}}
+{{- $rhacs := .Values.imageVerification.rhacs -}}
+{{- $repo := include "chariot.gatewayImageRepository" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chariot.fullname" . }}-rhacs-signature-integration
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+data:
+  README.md: |
+    CH-54 / RHACS setup for {{ $repo }}
+    ====================================================================
+    This chart cannot apply RHACS's SignatureIntegration or enforcement
+    Security Policy for you (see the note at the top of this template's
+    source, templates/rhacs-signature-integration-note.yaml, for why RHACS
+    has no Helm-renderable CRD for either). Complete these steps once per
+    RHACS Central instance/cluster the chart is installed against:
+
+    1. Create the SignatureIntegration named
+       "{{ $rhacs.signatureIntegrationName }}" (from
+       imageVerification.rhacs.signatureIntegrationName):
+
+         roxctl central signature-integrations create \
+           --name "{{ $rhacs.signatureIntegrationName }}" \
+    {{- if $rhacs.cosign.publicKeys }}
+           --public-key-file <path-to-cosign-public-key.pem>
+       (see the `cosignPublicKeys` key in this ConfigMap for the PEM
+       material supplied via imageVerification.rhacs.cosign.publicKeys)
+    {{- else if and $rhacs.cosign.certificateOIDCIssuer $rhacs.cosign.certificateIdentity }}
+           --certificate-oidc-issuer "{{ $rhacs.cosign.certificateOIDCIssuer }}" \
+           --certificate-identity "{{ $rhacs.cosign.certificateIdentity }}"
+    {{- else }}
+           # imageVerification.rhacs.cosign has neither publicKeys nor a
+           # certificateOIDCIssuer/certificateIdentity pair set — supply one
+           # of the two before running this command.
+    {{- end }}
+
+    2. Create (or edit) a Security Policy named
+       "{{ $rhacs.enforcementPolicyName }}" (from
+       imageVerification.rhacs.enforcementPolicyName) in Central that:
+         - Scopes to image {{ $repo }} (all tags/digests the gateway ships).
+         - Adds policy criteria "Signature Verified": references the
+           "{{ $rhacs.signatureIntegrationName }}" integration created above.
+         - Enforcement: "Deploy-time" — block/fail the deployment when the
+           criteria is not met. This is what makes RHACS fail-closed the
+           same way the Kyverno ClusterPolicy's
+           validationFailureAction=Enforce/failurePolicy=Fail does on EKS.
+
+    3. RHACS re-verifies signatures on a fixed interval (Central docs: every
+       4 hours) and on integration/policy changes — this is a periodic
+       reconciliation model, not a per-admission-request check the way the
+       Kyverno webhook is. Factor that into any break-glass rotation timing.
+
+    4. This chart's own CH-54 fail-closed check
+       (chariot.assertImageVerifyFailClosed) only proves
+       signatureIntegrationName/enforcementPolicyName were supplied
+       deliberately — it cannot see into Central and cannot prove steps 1-2
+       were actually completed there. Confirm enforcement is live in Central
+       (Violations/Policies view) before treating this install as CH-54
+       compliant.
+  cosignPublicKeys: |
+    {{- if $rhacs.cosign.publicKeys }}
+    {{- range $rhacs.cosign.publicKeys }}
+    {{ . }}
+    {{- end }}
+    {{- else }}
+    # imageVerification.rhacs.cosign.publicKeys is empty — keyless
+    # (certificateOIDCIssuer/certificateIdentity) verification is configured
+    # instead, or neither is set yet (see signature-integration.json below).
+    {{- end }}
+  signature-integration.json: |
+    {
+      "name": {{ $rhacs.signatureIntegrationName | quote }},
+      "cosign": {
+        "publicKeys": {{ $rhacs.cosign.publicKeys | toJson }},
+        "certificateOIDCIssuer": {{ $rhacs.cosign.certificateOIDCIssuer | quote }},
+        "certificateIdentity": {{ $rhacs.cosign.certificateIdentity | quote }}
+      },
+      "enforcementPolicyName": {{ $rhacs.enforcementPolicyName | quote }},
+      "imageRepository": {{ $repo | quote }}
+    }
+{{- end -}}

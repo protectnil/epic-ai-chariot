@@ -57,7 +57,7 @@ export class TrefleMCPServer extends MCPAdapterBase {
       name: 'trefle',
       displayName: 'Trefle Plant Database',
       version: '1.0.0',
-      category: 'nature' as const,
+      category: 'science' as const,
       keywords: [
         'trefle', 'plants', 'botany', 'flora', 'species', 'scientific name',
         'common name', 'edible plants', 'medicinal plants', 'plant family',

@@ -1,0 +1,81 @@
+{
+  "family": "chariot-gateway",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "1024",
+  "memory": "4096",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/chariot-gateway-task-role",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/chariot-gateway-execution-role",
+  "volumes": [
+    {
+      "name": "chariot-data",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "REPLACE_WITH_EFS_FILESYSTEM_ID",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "REPLACE_WITH_EFS_ACCESS_POINT_ID",
+          "iam": "ENABLED"
+        }
+      }
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "chariot-gateway",
+      "image": "ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/chariot-gateway@sha256:REPLACE_WITH_IMAGE_DIGEST",
+      "essential": true,
+      "user": "1000:1000",
+      "readonlyRootFilesystem": true,
+      "linuxParameters": {
+        "capabilities": { "drop": ["ALL"] },
+        "initProcessEnabled": true,
+        "tmpfs": [
+          { "containerPath": "/tmp", "size": 64 }
+        ]
+      },
+      "portMappings": [
+        { "containerPort": 8000, "protocol": "tcp" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "chariot-data", "containerPath": "/var/lib/chariot", "readOnly": false }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "EPIC_AI_DIR_OVERRIDE", "value": "/var/lib/chariot" },
+        { "name": "PORT", "value": "8000" },
+        { "name": "CHARIOT_ENTERPRISE", "value": "true" },
+        { "name": "CHARIOT_LICENSE_PROVIDER", "value": "aws-license-manager" },
+        { "name": "AWS_REGION", "value": "AWS_REGION" },
+        { "name": "CHARIOT_LM_PRODUCT_SKU", "value": "REPLACE_WITH_MARKETPLACE_PRODUCT_SKU" },
+        { "name": "CHARIOT_LM_TIER", "value": "basic" },
+        { "name": "CHARIOT_LM_CHECKOUT_TYPE", "value": "PROVISIONAL" },
+        { "name": "CHARIOT_IMAGE_SEAL_REQUIRED", "value": "true" }
+      ],
+      "secrets": [
+        { "name": "ENTERPRISE_JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:AWS_REGION:ACCOUNT_ID:secret:chariot/ENTERPRISE_JWT_SECRET" },
+        { "name": "ENTERPRISE_MASTER_KEY", "valueFrom": "arn:aws:secretsmanager:AWS_REGION:ACCOUNT_ID:secret:chariot/ENTERPRISE_MASTER_KEY" },
+        { "name": "MONGODB_URI", "valueFrom": "arn:aws:secretsmanager:AWS_REGION:ACCOUNT_ID:secret:chariot/MONGODB_URI" },
+        { "name": "REDIS_URL", "valueFrom": "arn:aws:secretsmanager:AWS_REGION:ACCOUNT_ID:secret:chariot/REDIS_URL" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "node -e \"require('node:http').get({host:'127.0.0.1',port:process.env.PORT||8000,path:'/health',timeout:4000},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).on('timeout',function(){this.destroy();process.exit(1)})\" || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 40
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/chariot-gateway",
+          "awslogs-region": "AWS_REGION",
+          "awslogs-stream-prefix": "gateway"
+        }
+      }
+    }
+  ]
+}

@@ -64,7 +64,7 @@ export class WgerMCPServer extends MCPAdapterBase {
       name: 'wger',
       displayName: 'wger Workout Manager',
       version: '1.0.0',
-      category: 'health',
+      category: 'healthcare',
       keywords: [
         'wger', 'workout', 'exercise', 'fitness', 'muscles', 'equipment',
         'strength training', 'gym', 'muscle groups', 'training', 'bodybuilding',

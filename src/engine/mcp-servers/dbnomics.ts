@@ -29,7 +29,7 @@ export class DBnomicsMCPServer extends MCPAdapterBase {
       name: 'dbnomics',
       displayName: 'DBnomics — Global Economic & Statistical Data',
       version: '1.0.0',
-      category: 'economics',
+      category: 'finance',
       keywords: [
         'dbnomics', 'economics', 'statistics', 'macroeconomics', 'time series',
         'ECB', 'BLS', 'Eurostat', 'FRED', 'IMF', 'OECD', 'World Bank',

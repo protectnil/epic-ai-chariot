@@ -12,61 +12,85 @@ import type { Tool, ToolResult, ConnectionStatus } from '../../types/index.js';
 import type { MCPAdapter } from './base.js';
 import type { ServerConnection } from '../../types/index.js';
 import { createLogger } from '../../logger.js';
-import { guardNpmStdioAdapter, enforcePinnedArgs } from './npmIntegrityGuard.js';
+import { guardNpmStdioAdapter, enforcePinnedArgs, stripDangerousStdioEnv } from './npmIntegrityGuard.js';
+import { applyCuratedHostOverride } from '../../../catalog/curated.js';
+import { createMcpDispatchFetch } from '../mcpDispatchFetch.js';
 
 const BLOCKED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const logger = createLogger('MCPClientAdapter');
 
 /**
+ * Stdio launchers that carry a supply-chain integrity gate in connect().
+ * Only these may be spawned; any other stdio command fails closed. Adding a
+ * launcher here REQUIRES adding an equivalent per-launcher integrity gate
+ * (hash-pinned + offline resolution) in connect().
+ */
+const INTEGRITY_GATED_STDIO_COMMANDS = new Set<string>(['npx']);
+
+/** MCP content block types that are spec-legal but carry no `text` field. */
+const NON_TEXT_MCP_BLOCK_TYPES = new Set(['image', 'audio', 'resource', 'resource_link']);
+
+/**
  * Validate and normalize MCP tool result content.
+ *
+ * Returns `{ content, valid }`. `valid` is FALSE for a malformed/hostile
+ * shape so the caller can surface it as an error instead of presenting a
+ * broken payload as a successful result (fail-open → fail-closed).
+ *
  * Accepts:
  *   - string
- *   - Array of {type: string, text: string} objects (MCP content blocks)
- * Anything else is rejected: a warning is emitted and a sanitized string
- * representation is returned so callers always receive a usable value.
+ *   - Array of MCP content blocks: text blocks ({type:'text', text:string})
+ *     AND spec-legal non-text blocks (image/audio/resource/resource_link),
+ *     which are preserved with a descriptive placeholder so they are not
+ *     misclassified as malformed.
  */
 function validateMCPContent(
   content: unknown,
   serverName: string,
   toolName: string,
-): string | Array<{ type: string; text: string }> {
+): { content: string | Array<{ type: string; text: string }>; valid: boolean } {
   if (typeof content === 'string') {
-    return content;
+    return { content, valid: true };
   }
 
   if (Array.isArray(content)) {
     const normalized: Array<{ type: string; text: string }> = [];
     let allValid = true;
     for (const item of content) {
-      if (
-        item !== null &&
-        typeof item === 'object' &&
-        typeof (item as Record<string, unknown>).type === 'string' &&
-        typeof (item as Record<string, unknown>).text === 'string'
-      ) {
-        normalized.push({
-          type: (item as { type: string; text: string }).type,
-          text: (item as { type: string; text: string }).text,
-        });
-      } else {
-        allValid = false;
-        break;
+      const rec = item as Record<string, unknown>;
+      if (item !== null && typeof item === 'object' && typeof rec.type === 'string') {
+        const t = rec.type;
+        if (t === 'text' && typeof rec.text === 'string') {
+          normalized.push({ type: t, text: rec.text });
+          continue;
+        }
+        if (NON_TEXT_MCP_BLOCK_TYPES.has(t)) {
+          // Spec-legal non-text block — no `text` field. Preserve a
+          // descriptive placeholder rather than flagging it malformed.
+          normalized.push({ type: t, text: `[${t} content]` });
+          continue;
+        }
       }
+      allValid = false;
+      break;
     }
-    if (allValid) return normalized;
+    if (allValid) return { content: normalized, valid: true };
   }
 
-  // Unexpected shape — warn and return sanitized string representation
+  // Unexpected/malformed shape — warn and mark INVALID so the caller returns
+  // an error rather than presenting broken content as success.
   logger.warn(
     `server="${serverName}" tool="${toolName}": ` +
     `unexpected content shape (type=${Array.isArray(content) ? 'array' : typeof content}). ` +
-    `Content rejected; returning string representation.`,
+    `Content rejected as malformed.`,
   );
+  let repr: string;
   try {
-    return JSON.stringify(content);
+    repr = JSON.stringify(content);
   } catch {
-    return String(content);
+    repr = String(content);
   }
+  return { content: `Malformed MCP content from server: ${repr}`, valid: false };
 }
 
 /**
@@ -96,17 +120,36 @@ function sanitizeKeys(obj: Record<string, unknown>, seen?: WeakSet<object>): Rec
   return safe;
 }
 
+/** The subset of the MCP SDK Client this adapter actually drives. */
+type MCPClientLike = Pick<Client, 'connect' | 'listTools' | 'close' | 'callTool' | 'ping'>;
+
+/**
+ * Opt-in construction seams. When omitted (the ONLY production path) the
+ * adapter builds a real transport and Client exactly as before — the air-gap
+ * launcher allowlist, npm integrity guard, pinned-argument enforcement and
+ * offline mode all still run. Supplying a factory performs NO spawn, so these
+ * seams cannot be used to launch an ungated stdio launcher; they exist so
+ * behavior above the transport (timeout/abort handling) is testable without
+ * spawning a child process.
+ */
+export interface MCPClientAdapterSeams {
+  clientFactory?: () => MCPClientLike;
+  transportFactory?: () => StdioClientTransport | StreamableHTTPClientTransport;
+}
+
 export class MCPClientAdapter implements MCPAdapter {
   readonly name: string;
-  private client: Client | null = null;
+  private client: MCPClientLike | null = null;
   private transport: StdioClientTransport | StreamableHTTPClientTransport | null = null;
   private readonly config: ServerConnection;
+  private readonly seams: MCPClientAdapterSeams;
   private _status: ConnectionStatus = 'disconnected';
   private cachedTools: Tool[] = [];
 
-  constructor(config: ServerConnection) {
+  constructor(config: ServerConnection, seams: MCPClientAdapterSeams = {}) {
     this.name = config.name;
     this.config = config;
+    this.seams = seams;
   }
 
   get status(): ConnectionStatus {
@@ -118,9 +161,29 @@ export class MCPClientAdapter implements MCPAdapter {
     this._status = 'connecting';
 
     try {
-      if (this.config.transport === 'stdio') {
+      if (this.config.transport === 'stdio' && this.seams.transportFactory) {
+        // Test seam ONLY: an injected transport spawns no process, so the
+        // launcher allowlist / integrity guard below are not applicable (there
+        // is nothing to gate). Production never supplies a transportFactory.
+        this.transport = this.seams.transportFactory();
+      } else if (this.config.transport === 'stdio') {
         if (!this.config.command) {
           throw new Error(`Server "${this.name}": stdio transport requires a command`);
+        }
+        // Air-gap FAIL-CLOSED: only stdio launchers that have a supply-chain
+        // integrity gate below may be spawned. Previously the entire gate was
+        // behind `if (command === 'npx')`, so ANY other stdio command (uvx,
+        // docker, sh, node, …) fell through to a verbatim spawn with no hash
+        // verification and no offline flag — a registry/PyPI fetch and
+        // unpinned code execution. Reject unknown launchers up front rather
+        // than failing open. New launchers may be added ONLY together with an
+        // equivalent per-launcher integrity gate.
+        if (!INTEGRITY_GATED_STDIO_COMMANDS.has(this.config.command)) {
+          throw new Error(
+            `air-gap: "${this.name}" uses stdio launcher "${this.config.command}" which has no ` +
+            `supply-chain integrity gate; only ${[...INTEGRITY_GATED_STDIO_COMMANDS].join(', ')} ` +
+            `is supported. Refusing to spawn an unpinned/ungated launcher at runtime.`,
+          );
         }
         // Supply-chain integrity gate: when the ServerConnection carries npm
         // integrity fields, verify the tarball is in the local cache with the
@@ -153,10 +216,11 @@ export class MCPClientAdapter implements MCPAdapter {
           if (!guard.ok) {
             throw new Error(`supply-chain integrity check failed for "${this.name}": ${guard.reason}`);
           }
-          // Pin enforcement (bug-tracker-ref): catalog args are unversioned, so a
-          // verbatim spawn would let npx re-resolve `latest` from the
-          // registry and run code the guard never verified. Rewrite to
-          // pkg@version so what spawns is what was verified.
+          // Pin enforcement + §1.4 Win-1 launch form: enforcePinnedArgs now
+          // returns `--no-install <pkg@version> [server-args]` — npx launches
+          // only the pre-fetched, integrity-verified local copy, so no registry
+          // fetch and no install step (hence no lifecycle-script code-exec) at
+          // runtime, and `latest` cannot be re-resolved.
           const packageFromArgs = Array.isArray(this.config.args)
             && this.config.args.some((arg) =>
               typeof arg === 'string'
@@ -171,10 +235,15 @@ export class MCPClientAdapter implements MCPAdapter {
             this.config.integrityVersion as string,
             packageFromArgs,
           );
-          // Air-gap: npx must resolve from the local cache the guard verified
-          // and fail closed when offline resolution is impossible — never
-          // fetch from the registry at runtime.
+          // Security hardening: strip any code-exec/preload/npm_config_* channel a
+          // catalog row smuggled through this.config.env (NODE_OPTIONS,
+          // LD_PRELOAD, npm_config_call, …) BEFORE the engine sets its own npx
+          // config, so the engine flags are authoritative and un-overridable.
+          stripDangerousStdioEnv(spawnEnv);
+          // Air-gap: resolve from the local cache the guard verified, fail
+          // closed offline, and never run npm lifecycle scripts at dispatch.
           spawnEnv.npm_config_offline = 'true';
+          spawnEnv.npm_config_ignore_scripts = 'true';
         }
         this.transport = new StdioClientTransport({
           command: this.config.command,
@@ -184,7 +253,8 @@ export class MCPClientAdapter implements MCPAdapter {
       } else if (this.config.transport === 'streamable-http') {
         // Pool path supports stdio + streamable-http only. SSE adapters
         // are dispatched via the direct-call path in toolHandlers.ts.
-        if (!this.config.url) {
+        const url = applyCuratedHostOverride(this.config.url);
+        if (!url) {
           throw new Error(`Server "${this.name}": streamable-http transport requires a url`);
         }
         const requestInit: RequestInit = {};
@@ -203,29 +273,74 @@ export class MCPClientAdapter implements MCPAdapter {
           }
           requestInit.headers = headers;
         }
+        // Suppress the SDK's standalone GET SSE listening stream — it
+        // otherwise starves the tools/list POST on some remote hosts and hangs
+        // the connection until the listTools timeout (see createMcpDispatchFetch).
         this.transport = new StreamableHTTPClientTransport(
-          new URL(this.config.url),
-          { requestInit },
+          new URL(url),
+          { requestInit, fetch: createMcpDispatchFetch() },
         );
       } else {
         throw new Error(`Server "${this.name}": unsupported transport "${this.config.transport as string}"`);
       }
 
-      this.client = new Client(
+      this.client = this.seams.clientFactory?.() ?? new Client(
         { name: `epic-ai-${this.name}`, version: '0.1.0' },
         { capabilities: {} }
       );
 
       await this.client.connect(this.transport);
 
-      // Discover tools on connection
-      const toolsResponse = await this.client.listTools();
-      this.cachedTools = (toolsResponse.tools ?? []).map(t => ({
+      // Discover tools on connection. A hung MCP server must not block the
+      // connection attempt indefinitely — mirror the TSA POST timeout pattern
+      // in src/engine/audit/anchor.ts (CH-47). Default 30 s; override via
+      // CHARIOT_MCP_CONNECT_TIMEOUT_MS.
+      const connectEnvMs = parseInt(process.env.CHARIOT_MCP_CONNECT_TIMEOUT_MS ?? '', 10);
+      const connectTimeoutMs = Number.isFinite(connectEnvMs) && connectEnvMs > 0 ? connectEnvMs : 30_000;
+      const connectAbort = new AbortController();
+      const connectTimer = setTimeout(() => connectAbort.abort(), connectTimeoutMs);
+      let toolsResponse: Awaited<ReturnType<typeof this.client.listTools>>;
+      try {
+        toolsResponse = await this.client.listTools({}, { signal: connectAbort.signal });
+      } catch (err) {
+        // Detect the timeout via our controller signal OR the MCP SDK's own
+        // request-timeout error. Under load the SDK's internal timeout can win
+        // the race and surface (as McpError code -32001 / "Request timed out")
+        // before `signal.aborted` flips — so a bare signal check misses it. Both
+        // paths mean the same thing: emit the descriptive typed message.
+        const isTimeout =
+          connectAbort.signal.aborted ||
+          (err instanceof Error &&
+            ((err as { code?: number }).code === -32001 ||
+              /request timed out/i.test(err.message)));
+        if (isTimeout) {
+          throw new Error(
+            `MCP server "${this.name}" did not respond to listTools within ${connectTimeoutMs}ms (timed out)`,
+          );
+        }
+        throw err;
+      } finally {
+        clearTimeout(connectTimer);
+      }
+      // Cap tool count to guard against hostile servers returning unbounded lists
+      // that would exhaust heap. CHARIOT_MCP_TOOL_CAP overrides the default of 500.
+      const toolCapEnv = parseInt(process.env.CHARIOT_MCP_TOOL_CAP ?? '', 10);
+      const toolCap = Number.isFinite(toolCapEnv) && toolCapEnv > 0 ? toolCapEnv : 500;
+      const rawTools = toolsResponse.tools ?? [];
+      if (rawTools.length > toolCap) {
+        logger.warn(
+          `server="${this.name}" returned ${rawTools.length} tools; capping at ${toolCap} to prevent heap exhaustion`,
+        );
+      }
+      this.cachedTools = rawTools.slice(0, toolCap).map(t => ({
         name: t.name,
         description: t.description ?? '',
         parameters: (t.inputSchema as Record<string, unknown>) ?? {},
         server: this.name,
         tier: 'orchestrated' as const,
+        // Preserve MCP tool annotations (readOnlyHint etc.) so downstream
+        // consumers (e.g. Correlator read-only selection) can gate on them.
+        annotations: t.annotations as Tool['annotations'],
       }));
 
       this._status = 'connected';
@@ -285,12 +400,34 @@ export class MCPClientAdapter implements MCPAdapter {
     }
 
     const startTime = Date.now();
+    // Bound each MCP tool call so a hung server cannot block dispatch
+    // indefinitely. Mirrors the TSA POST timeout in anchor.ts (CH-47).
+    // Default 60 s; override via CHARIOT_MCP_CALL_TIMEOUT_MS.
+    // callTool's second parameter is a result schema (not options), so we use
+    // Promise.race with a timeout rejection rather than an AbortController
+    // signal on the SDK call itself.
+    const callEnvMs = parseInt(process.env.CHARIOT_MCP_CALL_TIMEOUT_MS ?? '', 10);
+    const callTimeoutMs = Number.isFinite(callEnvMs) && callEnvMs > 0 ? callEnvMs : 60_000;
+    let callTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_res, rej) => {
+      callTimer = setTimeout(() => {
+        rej(new Error(
+          `MCP server "${this.name}" tool "${name}" did not respond within ${callTimeoutMs}ms (timed out)`,
+        ));
+      }, callTimeoutMs);
+    });
     try {
       const safeArgs = sanitizeKeys(args);
-      const result = await this.client.callTool({ name, arguments: safeArgs });
+      const result = await Promise.race([
+        this.client.callTool({ name, arguments: safeArgs }),
+        timeoutPromise,
+      ]);
+      const validated = validateMCPContent(result.content, this.name, name);
       return {
-        content: validateMCPContent(result.content, this.name, name),
-        isError: Boolean(result.isError),
+        content: validated.content,
+        // Fail-closed: malformed/hostile content is an error, never a silent
+        // success — even when the server set isError:false.
+        isError: Boolean(result.isError) || !validated.valid,
         server: this.name,
         tool: name,
         durationMs: Date.now() - startTime,
@@ -303,6 +440,8 @@ export class MCPClientAdapter implements MCPAdapter {
         tool: name,
         durationMs: Date.now() - startTime,
       };
+    } finally {
+      clearTimeout(callTimer);
     }
   }
 

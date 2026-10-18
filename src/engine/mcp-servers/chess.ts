@@ -27,7 +27,7 @@ export class ChessMCPServer extends MCPAdapterBase {
       name: 'chess',
       displayName: 'Chess.com Public API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'chess', 'chess.com', 'player', 'games', 'leaderboard',
         'rating', 'blitz', 'bullet', 'rapid', 'daily', 'pgn',

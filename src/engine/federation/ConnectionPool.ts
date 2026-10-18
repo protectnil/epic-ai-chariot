@@ -27,6 +27,15 @@ const DEFAULT_RETRY: RetryPolicy = {
 const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 30000;
 
 /**
+ * §7.3: ConnectionPool is "a flat pool with a maxConnections ceiling, used
+ * in single-tenant deployments." 500 mirrors AdaptivePool's
+ * `globalMaxConnections` default (§7.3::3) — the sibling multi-tenant pool's
+ * global ceiling — since this flat pool has no per-tenant concept to derive
+ * a smaller number from.
+ */
+const DEFAULT_MAX_CONNECTIONS = 500;
+
+/**
  * Per-adapter connection state. Most adapters live in `connected` for
  * their entire lifetime. `unloading` is a transient state set by
  * `markUnloading()` when the federation layer decides to kick an
@@ -76,15 +85,28 @@ export class ConnectionPool {
    * open-source allow-all semantics (Simplify P2 finding).
    */
   private requirePolicyEngine = false;
+  /** §7.3 flat-pool ceiling: connect() refuses a new adapter once reached. */
+  private readonly maxConnections: number;
+  /**
+   * §7.3 in-flight reservations. connect() is async and yields at
+   * `await adapter.connect()`, so two concurrent connect() calls for
+   * DIFFERENT names could both observe `adapters.size < maxConnections`
+   * and then both insert, breaching the ceiling. A name is reserved here
+   * synchronously (no await between the ceiling check and the reservation)
+   * and released in a finally, so the ceiling counts settled + in-flight.
+   */
+  private readonly connecting = new Set<string>();
 
   constructor(
     retryPolicy?: RetryPolicy,
     healthCheckIntervalMs?: number,
     accessPolicyEngine?: AccessPolicyEngine,
+    maxConnections?: number,
   ) {
     this.retryPolicy = retryPolicy ?? DEFAULT_RETRY;
     this.healthCheckIntervalMs = healthCheckIntervalMs ?? DEFAULT_HEALTH_CHECK_INTERVAL_MS;
     this.accessPolicyEngine = accessPolicyEngine ?? null;
+    this.maxConnections = maxConnections ?? DEFAULT_MAX_CONNECTIONS;
   }
 
   /**
@@ -241,6 +263,22 @@ export class ConnectionPool {
     if (this.adapters.has(config.name)) {
       throw new Error(`Server "${config.name}" is already connected`);
     }
+    if (this.connecting.has(config.name)) {
+      throw new Error(`Server "${config.name}" is already being connected`);
+    }
+    // §7.3 maxConnections ceiling: refuse new adapters once the flat pool is
+    // at capacity rather than growing unbounded. Count settled adapters PLUS
+    // in-flight reservations so concurrent connect() calls for distinct names
+    // cannot each pass the check and then both breach the ceiling (TOCTOU).
+    if (this.adapters.size + this.connecting.size >= this.maxConnections) {
+      throw new Error(
+        `ConnectionPool is at capacity: ${this.adapters.size + this.connecting.size}/${this.maxConnections} ` +
+          `connections. Refusing to connect "${config.name}".`,
+      );
+    }
+    // Reserve the slot synchronously — no await between the ceiling check
+    // above and this line, so the reservation is atomic w.r.t. the event loop.
+    this.connecting.add(config.name);
 
     // Factory function for creating fresh adapter instances on each retry.
     // Avoids retry-state leakage from partially initialized adapters.
@@ -253,34 +291,41 @@ export class ConnectionPool {
 
     let lastError: Error | null = null;
 
-    for (let attempt = 0; attempt <= this.retryPolicy.maxRetries; attempt++) {
-      // Fresh adapter per attempt — no leaked transport/client state from prior failures
-      const adapter = createAdapter();
-      try {
-        await adapter.connect();
-        this.adapters.set(config.name, adapter);
-        this.adapterStates.set(config.name, 'connected');
-        this.inFlightCounts.set(config.name, 0);
-        this.emitHealth(config.name, adapter);
-        return adapter;
-      } catch (error) {
-        // Clean up failed adapter to release any partial resources
-        try { await adapter.disconnect(); } catch { /* best effort cleanup */ }
-        lastError = error instanceof Error ? error : new Error(String(error));
+    // The reservation added above is released in finally on EVERY exit path
+    // (success return, retry-exhausted throw, or an unexpected throw), so a
+    // failed connect can never leak a permanent slot against the ceiling.
+    try {
+      for (let attempt = 0; attempt <= this.retryPolicy.maxRetries; attempt++) {
+        // Fresh adapter per attempt — no leaked transport/client state from prior failures
+        const adapter = createAdapter();
+        try {
+          await adapter.connect();
+          this.adapters.set(config.name, adapter);
+          this.adapterStates.set(config.name, 'connected');
+          this.inFlightCounts.set(config.name, 0);
+          this.emitHealth(config.name, adapter);
+          return adapter;
+        } catch (error) {
+          // Clean up failed adapter to release any partial resources
+          try { await adapter.disconnect(); } catch { /* best effort cleanup */ }
+          lastError = error instanceof Error ? error : new Error(String(error));
 
-        if (attempt < this.retryPolicy.maxRetries) {
-          const backoff = Math.min(
-            this.retryPolicy.backoffMs * Math.pow(2, attempt),
-            this.retryPolicy.maxBackoffMs ?? 30000,
-          );
-          await this.sleep(backoff);
+          if (attempt < this.retryPolicy.maxRetries) {
+            const backoff = Math.min(
+              this.retryPolicy.backoffMs * Math.pow(2, attempt),
+              this.retryPolicy.maxBackoffMs ?? 30000,
+            );
+            await this.sleep(backoff);
+          }
         }
       }
-    }
 
-    throw new Error(
-      `Failed to connect to server "${config.name}" after ${this.retryPolicy.maxRetries + 1} attempts: ${lastError?.message}`,
-    );
+      throw new Error(
+        `Failed to connect to server "${config.name}" after ${this.retryPolicy.maxRetries + 1} attempts: ${lastError?.message}`,
+      );
+    } finally {
+      this.connecting.delete(config.name);
+    }
   }
 
   /**

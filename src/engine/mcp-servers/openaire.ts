@@ -24,7 +24,7 @@ export class OpenaireMCPServer extends MCPAdapterBase {
       name: 'openaire',
       displayName: 'OpenAIRE Graph API',
       version: '1.0.0',
-      category: 'research' as const,
+      category: 'science' as const,
       keywords: [
         'openaire', 'research', 'publications', 'scholarly', 'academic',
         'datasets', 'software', 'projects', 'eu', 'cordis', 'funding',

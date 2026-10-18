@@ -7,13 +7,14 @@
  */
 
 import { join } from 'node:path';
-import type { ServerConnection, AuthConfig } from '../types/index.js';
+import type { ServerConnection, AuthConfig, Tool } from '../types/index.js';
 import type { AdapterCatalog } from './AdapterCatalog.js';
 import { resolvePublishedArtifactDir } from './artifact-publication.js';
 import { verifiedReadOrNull } from '../keys/verifyCatalogSignature.js';
 import { createLogger } from '../logger.js';
 import { isEngineInternalCredentialKey } from '../../cli/credentials.js';
 import { effectiveEnvKeys } from '../types/canonical-credentialed-brands.js';
+import { applyCuratedHostOverride } from '../../catalog/curated.js';
 
 const log = createLogger('federation.registry-loader');
 
@@ -59,6 +60,44 @@ function unpackRegistryPayload(payload: RegistryPayload): RegistryEntry[] {
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload.registry)) return payload.registry;
   return [];
+}
+
+// ─── CHARIOT::§7.5 wiring seams ───────────────────────────────────────────────
+// Structural (not concrete-class) interfaces so this module does not need to
+// import FederationManager/ToolPreFilter directly — matches the existing
+// `catalog?: AdapterCatalog` seam's spirit of minimal coupling, and lets a
+// test double satisfy the shape without constructing the real classes.
+
+/** The subset of FederationManager's public surface RegistryLoader needs to
+ *  "wire each adapter into the pool" (CHARIOT §7.5). */
+export interface RegistryLoaderFederationTarget {
+  connect(
+    name: string,
+    config: ServerConnection,
+  ): Promise<unknown>;
+  unloadAdapter(
+    name: string,
+    reason: string,
+    options?: { maxQuiescenceMs?: number; revoked?: boolean },
+  ): Promise<{ success: boolean }>;
+  listTools(): Tool[];
+  /**
+   * CHARIOT::§7.5::1 — optional: names already connected (e.g. from
+   * `FederationConfig.servers` via `connectAll()`, run BEFORE
+   * `loadAndWire()` in the engine startup path). When present,
+   * `loadAndWire()` skips connecting any catalog-listed entry whose
+   * name is already in this list, so it never double-connects a server
+   * `connectAll()` already brought up. Omit to keep pre-1.4.1 behavior
+   * (always attempt `connect()`, relying on the target's own
+   * idempotence, if any).
+   */
+  listConnectedServerNames?(): string[];
+}
+
+/** The subset of ToolPreFilter's public surface RegistryLoader needs to
+ *  "register tools with ToolPreFilter" (CHARIOT §7.5). */
+export interface RegistryLoaderToolIndex {
+  index(tools: Tool[]): void;
 }
 
 // ─── Loader Options ──────────────────────────────────────────────────────────
@@ -120,6 +159,24 @@ export interface RegistryLoaderOptions {
    * enforced at load time.
    */
   catalog?: AdapterCatalog;
+
+  /**
+   * CHARIOT::§7.5 — when set, `loadAndWire()`/`reload()` actually
+   * instantiate each catalog-listed adapter (via `federation.connect()`,
+   * which builds the pool-backed adapter and registers its tools in the
+   * unified ToolRegistry) rather than only returning ServerConnection[]
+   * data for a caller to wire up itself. Omit to keep pre-1.4.0 `load()`
+   * behavior (data only, no side effects).
+   */
+  federation?: RegistryLoaderFederationTarget;
+
+  /**
+   * CHARIOT::§7.5 — when set (together with `federation`), `loadAndWire()`/
+   * `reload()` re-index this ToolPreFilter from `federation.listTools()`
+   * after wiring, so the pre-filter's shortlist reflects the adapters this
+   * loader just connected. Omit to skip pre-filter registration.
+   */
+  toolPreFilter?: RegistryLoaderToolIndex;
 }
 
 // ─── Loader Result ───────────────────────────────────────────────────────────
@@ -145,10 +202,20 @@ export interface RegistryLoadResult {
 // ─── Loader ──────────────────────────────────────────────────────────────────
 
 export class RegistryLoader {
-  private readonly options: Omit<Required<RegistryLoaderOptions>, 'catalog'> & {
+  private readonly options: Omit<Required<RegistryLoaderOptions>, 'catalog' | 'federation' | 'toolPreFilter'> & {
     catalog: AdapterCatalog | undefined;
+    federation: RegistryLoaderFederationTarget | undefined;
+    toolPreFilter: RegistryLoaderToolIndex | undefined;
   };
   private registry: RegistryEntry[] = [];
+  /**
+   * CHARIOT::§7.5 — names successfully wired by the most recent
+   * loadAndWire()/reload() call. reload() diffs against this set to
+   * decide which adapters to unloadAdapter() (no longer present, or
+   * newly filtered/revoked) versus connect() (newly present). Empty
+   * until loadAndWire() or reload() has run at least once.
+   */
+  private lastWired: Set<string> = new Set();
 
   constructor(options: RegistryLoaderOptions = {}) {
     const thisFile = import.meta.dirname || __dirname;
@@ -166,6 +233,8 @@ export class RegistryLoader {
       resolveCredential: options.resolveCredential || ((key: string) => process.env[key]),
       skipMissingCredentials: options.skipMissingCredentials ?? true,
       catalog: options.catalog,
+      federation: options.federation,
+      toolPreFilter: options.toolPreFilter,
     };
   }
 
@@ -239,6 +308,97 @@ export class RegistryLoader {
     return this.load().loaded.map(l => l.connection);
   }
 
+  /**
+   * CHARIOT::§7.5::1 — "instantiate each catalog-listed adapter, wire it
+   * into the pool, register its tools with ToolPreFilter." Runs `load()`
+   * to build the ServerConnection[] as before, then (when `federation`
+   * is configured) actually connects each one — which is what builds the
+   * live adapter instance and registers its tools in the unified
+   * ToolRegistry — and (when `toolPreFilter` is also configured) re-indexes
+   * it from the federation's now-current tool list. With neither wired,
+   * behaves exactly like `load()` (no side effects), preserving pre-1.4.0
+   * callers.
+   */
+  async loadAndWire(): Promise<RegistryLoadResult> {
+    const result = this.load();
+    const wired = new Set<string>();
+
+    if (this.options.federation) {
+      // CHARIOT::§7.5::1 — do not double-connect a server name the caller
+      // already connected (e.g. `EpicAI.start()` runs `connectAll()`
+      // against `FederationConfig.servers` before calling this). Those
+      // names are already live in `adapterMap`/the tool registry;
+      // reconnecting them here would be redundant at best and, for a
+      // stateful transport, could tear down and race a live connection.
+      const alreadyConnected = new Set(this.options.federation.listConnectedServerNames?.() ?? []);
+      for (const loaded of result.loaded) {
+        if (alreadyConnected.has(loaded.connection.name)) {
+          wired.add(loaded.connection.name);
+          continue;
+        }
+        await this.options.federation.connect(loaded.connection.name, loaded.connection);
+        wired.add(loaded.connection.name);
+      }
+      if (this.options.toolPreFilter) {
+        this.options.toolPreFilter.index(this.options.federation.listTools());
+      }
+    }
+
+    this.lastWired = wired;
+    return result;
+  }
+
+  /**
+   * CHARIOT::§7.5::1 — "expose reload() for runtime adapter unload."
+   * Re-reads the registry (and re-applies the catalog revocation gate)
+   * and reconciles the live federation against the new result: adapters
+   * present in the previous wire but absent from (or newly filtered/
+   * revoked out of) this one are unloaded; adapters newly present are
+   * connected. The ToolPreFilter is re-indexed once at the end so a
+   * caller sees a single consistent shortlist update rather than one
+   * per adapter change.
+   *
+   * Requires `federation` to have been configured — reload() is
+   * meaningless against data-only `load()` output, since there is no
+   * live adapter set to reconcile against.
+   */
+  async reload(): Promise<RegistryLoadResult> {
+    if (!this.options.federation) {
+      throw new Error(
+        'RegistryLoader.reload() requires a `federation` target (RegistryLoaderOptions.federation); ' +
+        'without one there is no live adapter set to reconcile against.',
+      );
+    }
+    const federation = this.options.federation;
+
+    const result = this.load();
+    const next = new Set(result.loaded.map((l) => l.connection.name));
+    const previous = this.lastWired;
+
+    // Unload adapters no longer present in the reconciled result — covers
+    // both "removed from the registry" and "newly revoked/filtered out",
+    // since both cases mean the entry no longer appears in result.loaded.
+    for (const name of previous) {
+      if (!next.has(name)) {
+        await federation.unloadAdapter(name, 'registry reload: adapter no longer present');
+      }
+    }
+
+    // Connect adapters newly present.
+    for (const loaded of result.loaded) {
+      if (!previous.has(loaded.connection.name)) {
+        await federation.connect(loaded.connection.name, loaded.connection);
+      }
+    }
+
+    if (this.options.toolPreFilter) {
+      this.options.toolPreFilter.index(federation.listTools());
+    }
+
+    this.lastWired = next;
+    return result;
+  }
+
   private resolveConnectionType(entry: RegistryEntry): 'mcp' | 'rest' | null {
     switch (this.options.strategy) {
       case 'mcp-only':
@@ -265,6 +425,20 @@ export class RegistryLoader {
     if (!mcp) return null;
 
     if (mcp.transport === 'stdio') {
+      // Air-gap FAIL-CLOSED at load time: only stdio launchers that carry a
+      // supply-chain integrity gate in MCPClientAdapter.connect() ('npx') may
+      // be built. `mcp.command` is a free-form catalog string; a non-npx
+      // launcher (uvx/docker/sh/…) has no runtime hash/offline gate and would
+      // fetch+execute unpinned code, so surface it as a load failure here
+      // rather than letting it fail open at first connect.
+      if (mcp.command !== undefined && mcp.command !== 'npx') {
+        log.warn(
+          `adapter "${entry.id}": stdio launcher "${mcp.command}" has no supply-chain integrity gate; ` +
+          `only npx is supported — skipping (fail-closed).`,
+        );
+        return null;
+      }
+
       // Resolve env vars for stdio MCP. review V4: 1696/1777
       // entries in the published bundle today ship without `mcp.envKeys`
       // (publisher gap). Without the CANONICAL_CREDENTIALED_BRANDS
@@ -326,17 +500,25 @@ export class RegistryLoader {
       const connection: ServerConnection = {
         name: entry.id,
         transport: 'streamable-http',
-        url: mcp.url,
+        url: applyCuratedHostOverride(mcp.url),
       };
 
       // If not OAuth, try to resolve a Bearer token from env
       if (!mcp.requiresOAuth) {
-        const tokenKey = deriveEnvKey(entry.id) + '_TOKEN';
+        const baseKey = deriveEnvKey(entry.id);
+        if (!baseKey) {
+          log.warn(`adapter "${entry.id}": id cannot be sanitised to a valid env-var name; credential unresolvable — skipping`);
+          return null;
+        }
+        const tokenKey = baseKey + '_TOKEN';
         const token = this.options.resolveCredential(tokenKey);
         if (token) {
           connection.auth = { type: 'bearer', token };
-        } else if (this.options.skipMissingCredentials) {
-          return null;
+        } else {
+          log.warn(`adapter "${entry.id}": credential ${tokenKey} not found in environment; adapter skipped`);
+          if (this.options.skipMissingCredentials) {
+            return null;
+          }
         }
       }
 
@@ -375,6 +557,21 @@ export class RegistryLoader {
   }
 }
 
-function deriveEnvKey(adapterId: string): string {
-  return adapterId.toUpperCase().replace(/-/g, '_');
+/**
+ * Derive an environment-variable name from an adapter id.
+ * Converts to UPPER_SNAKE_CASE and replaces ALL non-alphanumeric characters
+ * (dots, slashes, hyphens, etc.) with underscores so the result is a valid
+ * POSIX env-var name. Returns undefined if the sanitised name would be
+ * empty or start with a digit (both are invalid env-var names).
+ */
+function deriveEnvKey(adapterId: string): string | undefined {
+  const sanitised = adapterId.toUpperCase().replace(/[^A-Z0-9]/g, '_');
+  if (sanitised.length === 0 || /^[0-9]/.test(sanitised)) return undefined;
+  return sanitised;
 }
+
+// Test-only export — NOT part of the public API.
+// Allows the adversarial eval (src/engine/audit/derive-env-key-verify-anchor.test.ts)
+// to verify that adapter IDs containing dots, slashes, or hyphens are sanitised
+// to valid POSIX env-var names without needing a signed registry fixture.
+export { deriveEnvKey as __testOnly_deriveEnvKey };

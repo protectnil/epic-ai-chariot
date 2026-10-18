@@ -29,7 +29,7 @@ export class OpenLibraryMCPServer extends MCPAdapterBase {
       name: 'open-library',
       displayName: 'Open Library',
       version: '1.0.0',
-      category: 'books',
+      category: 'media',
       keywords: [
         'open library', 'books', 'isbn', 'authors', 'works', 'editions',
         'internet archive', 'book search', 'bibliography', 'book metadata',

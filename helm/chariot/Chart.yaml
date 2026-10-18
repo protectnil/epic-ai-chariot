@@ -1,0 +1,46 @@
+apiVersion: v2
+name: chariot
+description: >-
+  Epic AI® Chariot — IVA MCP Gateway with embedded hybrid retrieval (Qdrant Edge),
+  enterprise IAM/RBAC/credential-vault. Buyer-deployed: Amazon EKS (primary),
+  Amazon ECS task-definition (secondary, see ecs/), and EKS-Anywhere / self-managed
+  Kubernetes for fully air-gapped installs. CHARIOT-SPEC §23.2, CH-24…CH-30.
+type: application
+
+# Chart version — independent of the application; bump on every chart change.
+version: 0.1.0
+# Application version — mirrors package.json. The release pipeline restamps this
+# to the one-version value at integration (CHARIOT-SPEC §2.4 one-version rule).
+appVersion: "4.0.0"
+
+kubeVersion: ">=1.27.0-0"
+
+home: https://epic-ai.io
+sources:
+  - https://github.com/protectnil/epic-ai-chariot
+icon: https://epic-ai.io/favicon.ico
+keywords:
+  - mcp
+  - iva
+  - gateway
+  - ai
+  - retrieval
+  - air-gap
+  - aws-marketplace
+maintainers:
+  - name: protectNIL Inc.
+    url: https://epic-ai.io
+
+# Vendored subcharts (CH-28). MongoDB and Redis ship inside this chart so an
+# air-gapped install pulls nothing external (CH-29). Qdrant Edge is embedded in
+# the gateway image (CH-27) and therefore is intentionally NOT a dependency —
+# the deployment runs gateway + MongoDB + Redis only.
+dependencies:
+  - name: mongodb
+    version: 0.1.0
+    repository: "file://./charts/mongodb"
+    condition: mongodb.enabled
+  - name: redis
+    version: 0.1.0
+    repository: "file://./charts/redis"
+    condition: redis.enabled

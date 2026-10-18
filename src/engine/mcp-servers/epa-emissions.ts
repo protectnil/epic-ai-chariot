@@ -32,7 +32,7 @@ export class EpaEmissionsMCPServer extends MCPAdapterBase {
       name: 'epa-emissions',
       displayName: 'EPA Emissions (GHGRP + TRI)',
       version: '1.0.0',
-      category: 'environment',
+      category: 'science',
       keywords: [
         'epa', 'emissions', 'greenhouse gas', 'ghg', 'ghgrp', 'tri',
         'toxic release', 'toxic release inventory', 'co2', 'carbon',

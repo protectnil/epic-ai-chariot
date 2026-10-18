@@ -41,6 +41,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { imageDigestRef, notationSignCommand, notationVerifyCommand } from './image-seal.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -227,6 +228,28 @@ function stripInternalTelemetry(distRoot) {
 // process entrypoint.
 export { stripInternalTelemetry };
 
+/**
+ * Compute the immutable container image tag from the package version (CH-26).
+ * Format: `chariot-vX.Y.Z`. Refuses a missing / non-semver / `latest` version
+ * so a mutable or unversioned tag can never be emitted into a release. The
+ * container build pipeline uses this as the single source of truth for the tag:
+ *   TAG=$(node scripts/release.mjs --emit-image-tag)
+ */
+export function imageTag(version) {
+  const v = typeof version === 'string' ? version.trim() : '';
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(v)) {
+    throw new Error(
+      `release: refusing to emit image tag for invalid version "${version}" — expected semver X.Y.Z (CH-26).`
+    );
+  }
+  return `chariot-v${v}`;
+}
+
+// imageDigestRef is re-exported from image-seal.mjs (single source of truth for
+// digest-pinned refs) — imported above, re-exported here, and used internally by
+// the --emit-image-ref entrypoint (CH-54). No wrapper indirection.
+export { imageDigestRef };
+
 const __thisFilePath = fileURLToPath(import.meta.url);
 const __invokedFilePath = process.argv[1] ? resolve(process.argv[1]) : '';
 const IS_MAIN = __invokedFilePath === __thisFilePath;
@@ -247,6 +270,18 @@ function usage() {
   console.error('');
   console.error('  Verify-only (check existing manifest, no signing):');
   console.error('    node scripts/release.mjs --mode final --verify-only [--publish]');
+  console.error('');
+  console.error('  Emit immutable container image tag (CH-26), then exit:');
+  console.error('    node scripts/release.mjs --emit-image-tag');
+  console.error('');
+  console.error('  Emit digest-pinned container image reference (CH-54), then exit:');
+  console.error('    node scripts/release.mjs --emit-image-ref --repository <repo> --digest <sha256>');
+  console.error('');
+  console.error('  Emit notation sign argv (CH-54), then exit:');
+  console.error('    node scripts/release.mjs --emit-sign-args --image-ref <ref> --id <profile-arn> [--aws-region <r>] [--aws-profile <p>]');
+  console.error('');
+  console.error('  Emit notation verify argv (CH-54 post-sign confirmation), then exit:');
+  console.error('    node scripts/release.mjs --emit-verify-args --image-ref <ref> [--aws-region <r>] [--aws-profile <p>]');
   process.exit(1);
 }
 
@@ -266,6 +301,16 @@ let mode = '';
 let keyPath = '';
 let doPublish = false;
 let verifyOnly = false;
+let emitImageTag = false;
+let emitImageRef = false;
+let emitSignArgs = false;
+let emitVerifyArgs = false;
+let repositoryArg = '';
+let digestArg = '';
+let imageRefArg = '';
+let signingProfileArnArg = '';
+let awsRegionArg = '';
+let awsProfileArg = '';
 const platformArgs = [];
 
 for (let i = 0; i < args.length; i++) {
@@ -280,10 +325,80 @@ for (let i = 0; i < args.length; i++) {
     doPublish = true;
   } else if (a === '--verify-only') {
     verifyOnly = true;
+  } else if (a === '--emit-image-tag') {
+    emitImageTag = true;
+  } else if (a === '--emit-image-ref') {
+    emitImageRef = true;
+  } else if (a === '--emit-sign-args') {
+    emitSignArgs = true;
+  } else if (a === '--emit-verify-args') {
+    emitVerifyArgs = true;
+  } else if (a === '--repository' && args[i + 1]) {
+    repositoryArg = args[++i];
+  } else if (a === '--digest' && args[i + 1]) {
+    digestArg = args[++i];
+  } else if (a === '--image-ref' && args[i + 1]) {
+    imageRefArg = args[++i];
+  } else if (a === '--id' && args[i + 1]) {
+    signingProfileArnArg = args[++i];
+  } else if (a === '--aws-region' && args[i + 1]) {
+    awsRegionArg = args[++i];
+  } else if (a === '--aws-profile' && args[i + 1]) {
+    awsProfileArg = args[++i];
   } else {
     console.error(`Unknown argument: ${a}`);
     usage();
   }
+}
+
+// CH-26: emit the immutable container image tag and exit. Standalone — needs no
+// --mode/--key. Used by the container build to derive `chariot-vX.Y.Z`.
+if (emitImageTag) {
+  const pkgForTag = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf-8'));
+  process.stdout.write(`${imageTag(pkgForTag.version)}\n`);
+  process.exit(0);
+}
+
+if (emitImageRef) {
+  if (!repositoryArg || !digestArg) {
+    console.error('Error: --emit-image-ref requires --repository and --digest.');
+    usage();
+  }
+  process.stdout.write(`${imageDigestRef(repositoryArg, digestArg)}\n`);
+  process.exit(0);
+}
+
+// CH-54: emit the notation sign argv (one arg per line) so the release workflow
+// and the verify path share a single source of truth (scripts/image-seal.mjs).
+if (emitSignArgs) {
+  if (!imageRefArg || !signingProfileArnArg) {
+    console.error('Error: --emit-sign-args requires --image-ref and --id.');
+    usage();
+  }
+  const signArgv = notationSignCommand({
+    imageRef: imageRefArg,
+    signingProfileArn: signingProfileArnArg,
+    pluginAwsRegion: awsRegionArg,
+    pluginAwsProfile: awsProfileArg,
+  });
+  process.stdout.write(`${signArgv.join('\n')}\n`);
+  process.exit(0);
+}
+
+// CH-54: emit the notation verify argv (one arg per line) so the release workflow
+// post-sign confirmation step shares a single source of truth (scripts/image-seal.mjs).
+if (emitVerifyArgs) {
+  if (!imageRefArg) {
+    console.error('Error: --emit-verify-args requires --image-ref.');
+    usage();
+  }
+  const verifyArgv = notationVerifyCommand({
+    imageRef: imageRefArg,
+    pluginAwsRegion: awsRegionArg,
+    pluginAwsProfile: awsProfileArg,
+  });
+  process.stdout.write(`${verifyArgv.join('\n')}\n`);
+  process.exit(0);
 }
 
 if (mode !== 'merge' && mode !== 'final') {

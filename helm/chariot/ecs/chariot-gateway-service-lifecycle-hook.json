@@ -1,0 +1,11 @@
+{
+  "hookTargetArn": "arn:aws:lambda:AWS_REGION:ACCOUNT_ID:function:chariot-gateway-image-seal",
+  "roleArn": "arn:aws:iam::ACCOUNT_ID:role/chariot-gateway-ecs-hook-role",
+  "lifecycleStages": ["PRE_SCALE_UP"],
+  "hookDetails": {
+    "imageReference": "ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/chariot-gateway@sha256:REPLACE_WITH_IMAGE_DIGEST",
+    "notationBaseDir": "/var/task/notation",
+    "snsTopicArn": "arn:aws:sns:AWS_REGION:ACCOUNT_ID:chariot-image-seal",
+    "stopTask": true
+  }
+}

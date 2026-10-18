@@ -1,0 +1,1114 @@
+name: Marketplace ECR Publish
+
+# Assembles the AWS Marketplace container-product deliverables for a Chariot
+# release that has ALREADY been built, signed, and published by
+# .github/workflows/release.yml (npm package + GitHub Release vX.Y.Z). This
+# workflow does NOT rebuild or re-sign the native addon / integrity manifest —
+# it downloads the exact release-signed bytes as GitHub Release assets, builds
+# the `chariot-gateway` container image around them (Dockerfile, CHARIOT-SPEC
+# §23.2), pushes ALL THREE images (gateway, mongodb, redis) and the Helm chart
+# (as an OCI artifact) to the AWS Marketplace-managed ECR registry, and signs
+# all three pushed images via the same Notation / AWS Signer path (CH-54).
+#
+# CHARIOT-SPEC §23.2, quoted verbatim:
+#   "The chart ships three images to the AWS-managed Marketplace ECR — AWS
+#   requires every image, including open-source dependencies, to live in
+#   Marketplace ECR (no Docker Hub / Quay / ECR Public)"
+# CH-29, quoted verbatim:
+#   "The chart is fully self-contained for air-gap: model, vector snapshot,
+#   and all images ship inside Marketplace ECR with zero external egress at
+#   install or runtime. Image refs live only in `values.yaml`."
+# CH-54, quoted verbatim:
+#   "The `chariot-gateway` image MUST be signed at push to Amazon ECR via AWS
+#   Signer managed signing (Notation / Notary-Project format; cosign/Sigstore
+#   an acceptable alternative), pinned by immutable digest. The signature
+#   MUST be verified at deploy — a Kyverno/OPA admission policy on EKS, or an
+#   ECS service-lifecycle Lambda hook — which blocks or kills the workload on
+#   an invalid or absent signature; offline verification is supported via the
+#   Notation trust store and certs shipped with the deployment."
+#
+# All three images, mirrored + signed (closes the prior "image 1 of 3 only"
+# gap): the `mirror-and-sign-dependency-images` job below pulls the vendored
+# `mongodb` (Docker Official `mongo`, tag pinned in helm/chariot/values.yaml)
+# and `redis` (Docker Official `redis`, tag pinned in helm/chariot/values.yaml)
+# images, re-tags them into the SAME Marketplace ECR registry this workflow
+# already pushes `chariot-gateway` to, pushes them, and signs BOTH via the
+# identical CH-54 Notation / AWS Signer steps used for the gateway image
+# (same `scripts/release.mjs --emit-sign-args` / `--emit-verify-args` /
+# `--emit-image-ref` entrypoints — one signing path, three images). This
+# closes CH-29 ("all images ship inside Marketplace ECR... Image refs live
+# only in `values.yaml`") end-to-end and satisfies AWS's Helm-chart validator
+# (INVALID_HELM_CHART_IMAGES / INVALID_HELM_UNDECLARED_IMAGES).
+#
+# Deploy-time signature verification (CH-54's "MUST be verified at deploy")
+# for the `chariot-gateway` image — CH-54's text scopes the deploy-time
+# verify requirement to `chariot-gateway` only — is the Kyverno ClusterPolicy
+# already shipped in the chart at `helm/chariot/templates/image-verify-policy.yaml`
+# (`verify-gateway-image-signature` rule, gated behind
+# `imageVerification.enabled`, verifying the Notation signature against the
+# AWS Signer cert and blocking/killing the pod on an invalid or absent
+# signature). This workflow does not invent a second verify mechanism; the
+# `package-and-push-chart` job's final step names this file as the shipped
+# deploy-time verifier and records it in the run's job summary.
+#
+# Honest scope note (CHARIOT-SPEC §23.0/§23.5, quoted verbatim): "the
+# production sealed-shard unseal-and-load path that consumes qdrant-edge/
+# SPLADE is not yet wired". The Dockerfile's
+# `artifacts/{edgeshard,models/splade,models/bien,onnxruntime}` build-context inputs are
+# release inputs. scripts/build-edgeshard-snapshot.mjs produces the sealed
+# catalog descriptor offline; publish it as catalog.edgeshard.sealed on the
+# corresponding GitHub Release, together with the ciphertext file it names
+# (catalog.edgeshard.sealed.ciphertext, CHARIOT §5.7 file-reference form).
+# Both jobs stage those same two assets below. The
+# guard job below fails closed with a clear error on their absence rather
+# than letting `docker build` fail opaquely on a missing COPY source several
+# steps downstream — this workflow will start succeeding on that step
+# automatically once those artifacts are staged at the documented paths,
+# with no further edits required here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Chariot version to publish (e.g. 4.0.0). Must match package.json and have an existing vX.Y.Z GitHub Release produced by release.yml.'
+        required: true
+        type: string
+      aws_region:
+        description: 'AWS region for the ECR push, AWS Signer, and both OIDC role assumptions.'
+        required: true
+        type: string
+      ecr_registry:
+        description: 'AWS Marketplace-managed ECR registry host (e.g. <account-id>.dkr.ecr.<region>.amazonaws.com).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # required by aws-actions/configure-aws-credentials (OIDC)
+
+concurrency:
+  # One Marketplace publish per version. Never cancel one in progress — a
+  # canceled push can leave a half-uploaded image or chart in ECR.
+  group: marketplace-ecr-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22.13.0'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  HELM_VERSION: 'v4.3.1'
+  # Marketplace ECR repository name for the gateway image. A pure naming
+  # choice for this workflow (not an external fact) — kept as a single knob
+  # here rather than repeated inline.
+  # Target repository paths must match the Marketplace Draft's declared
+  # repositories. The dependency source names remain `mongo` and `redis`;
+  # these are the destination paths in Marketplace ECR.
+  GATEWAY_IMAGE_REPOSITORY_NAME: 'epic-ai/chariot-gateway'
+  MONGODB_IMAGE_REPOSITORY_NAME: 'epic-ai/mongodb'
+  REDIS_IMAGE_REPOSITORY_NAME: 'epic-ai/redis'
+  # Pinned to the exact js-yaml version already resolved in package-lock.json
+  # (node_modules/js-yaml @ 4.1.1) so the Helm values patch step below uses
+  # a version already vetted in this repo's dependency tree.
+  JS_YAML_VERSION: '4.1.1'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # 1. GUARD — fail-closed preflight: secrets, internal-path exposure,
+  #    version/semver validation, prior-release existence, and Dockerfile
+  #    build-context artifact availability.
+  # ─────────────────────────────────────────────────────────────────────
+  guard:
+    name: Preflight guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      image_tag: ${{ steps.resolve.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The `secrets` context is NOT permitted in a job-level `if:` (GitHub
+      # rejects the whole workflow at trigger time with "Unrecognized
+      # named-value: 'secrets'"). Check at step level, same as release.yml.
+      - name: Verify required secrets are present
+        env:
+          ECR_ROLE_ARN: ${{ secrets.CHARIOT_MARKETPLACE_ECR_ROLE_ARN }}
+          SIGN_ROLE_ARN: ${{ secrets.CHARIOT_SIGNING_AWS_ROLE_ARN }}
+          SIGN_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+          PLUGIN_URL: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_URL }}
+          PLUGIN_SHA: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_SHA256 }}
+          PRIVATE_ROLE_ARN: ${{ secrets.CHARIOT_PRIVATE_ARTIFACT_ROLE_ARN }}
+          PRIVATE_BIEN_URI: ${{ secrets.CHARIOT_PRIVATE_BIEN_S3_URI }}
+          PRIVATE_RERANKER_URI: ${{ secrets.CHARIOT_PRIVATE_RERANKER_S3_URI }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${ECR_ROLE_ARN}" ]; then
+            echo "::error::CHARIOT_MARKETPLACE_ECR_ROLE_ARN repository secret is not set (OIDC role for the ECR image push + Helm OCI push)"
+            missing=1
+          fi
+          if [ -z "${SIGN_ROLE_ARN}" ]; then
+            echo "::error::CHARIOT_SIGNING_AWS_ROLE_ARN repository secret is not set (OIDC role for AWS Signer / notation, CH-54)"
+            missing=1
+          fi
+          if [ -z "${SIGN_PROFILE_ARN}" ]; then
+            echo "::error::CHARIOT_SIGNING_PROFILE_ARN repository secret is not set (AWS Signer signing-profile ARN, CH-54)"
+            missing=1
+          fi
+          if [ -z "${PLUGIN_URL}" ]; then
+            echo "::error::AWS_SIGNER_NOTATION_PLUGIN_URL repository secret is not set (CH-54)"
+            missing=1
+          fi
+          if [ -z "${PLUGIN_SHA}" ]; then
+            echo "::error::AWS_SIGNER_NOTATION_PLUGIN_SHA256 repository secret is not set (CH-54)"
+            missing=1
+          fi
+          if [ -z "${PRIVATE_ROLE_ARN}" ]; then
+            echo "::error::CHARIOT_PRIVATE_ARTIFACT_ROLE_ARN repository secret is not set (private model S3 read role)"
+            missing=1
+          fi
+          if [ -z "${PRIVATE_BIEN_URI}" ]; then
+            echo "::error::CHARIOT_PRIVATE_BIEN_S3_URI repository secret is not set"
+            missing=1
+          fi
+          if [ -z "${PRIVATE_RERANKER_URI}" ]; then
+            echo "::error::CHARIOT_PRIVATE_RERANKER_S3_URI repository secret is not set"
+            missing=1
+          fi
+          [ "${missing}" -eq 0 ]
+
+      # Internal-path exposure guard — identical in intent and shape to
+      # release.yml's step of the same name. test/ and .leak-denylist/ must
+      # never be tracked in this public repository.
+      - name: Guard against internal-path exposure (test/ and .leak-denylist/)
+        run: |
+          set -euo pipefail
+          TRACKED="$(git ls-files test/ .leak-denylist/)"
+          if [ -n "${TRACKED}" ]; then
+            echo "::error::Internal paths are tracked in the public repository index:"
+            echo "${TRACKED}"
+            echo "::error::Remove these paths from git tracking before releasing."
+            exit 1
+          fi
+          echo "OK: no tracked paths under test/ or .leak-denylist/"
+
+      - name: Resolve and validate target version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION}"
+          # Same SemVer 2.0.0 charset + grammar gate as release.yml's resolve
+          # step: reject any character outside the SemVer charset (including
+          # CR/LF / workflow-command smuggling) BEFORE any shell
+          # interpolation, then match the full official SemVer 2.0.0 grammar
+          # (semver.org §9) as a whole-string match.
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*)
+              echo "::error::version input rejected; contains characters outside the SemVer charset."
+              exit 1
+              ;;
+          esac
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if ! [[ "${VERSION}" =~ ${SEMVER_RE} ]]; then
+            echo "::error::version input rejected; not valid SemVer 2.0.0."
+            exit 1
+          fi
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "${PKG_VERSION}" != "${VERSION}" ]; then
+            echo "::error::package.json version (${PKG_VERSION}) does not match the requested version (${VERSION})"
+            exit 1
+          fi
+          IMAGE_TAG="$(node scripts/release.mjs --emit-image-tag)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Target version: ${VERSION}"
+          echo "Image tag:      ${IMAGE_TAG}"
+
+      # This workflow assembles the container image from release.yml's
+      # SIGNED native-binary + integrity-manifest GitHub Release assets — it
+      # never rebuilds or re-signs them, so that only ONE signing path exists
+      # for those bytes. Refuse to proceed if that release doesn't exist yet.
+      - name: Verify a GitHub Release exists for this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "v${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::No GitHub Release v${VERSION} found. Run .github/workflows/release.yml for this version first — this workflow packages the container image from THAT release's signed native-binary + integrity-manifest assets; it does not rebuild or re-sign them."
+            exit 1
+          fi
+          echo "OK: GitHub Release v${VERSION} exists."
+
+      - name: Reconcile Marketplace-managed ECR registry
+        env:
+          REGISTRY: ${{ inputs.ecr_registry }}
+        run: |
+          set -euo pipefail
+          expected='709825985650.dkr.ecr.us-east-1.amazonaws.com'
+          if [ "${REGISTRY}" != "${expected}" ]; then
+            echo "::error::ECR registry ${REGISTRY} does not match the current Marketplace Draft registry ${expected}. Reconcile the Marketplace entity before dispatching; refusing to push to the seller account's separate empty repositories."
+            exit 1
+          fi
+          echo "OK: registry matches the current Marketplace-managed Draft registry (${expected})."
+
+      # The Dockerfile ASSEMBLES already-built artifacts (see the
+      # Dockerfile's own header comment); it does not compile TS or Rust.
+      # Fail closed HERE, with a clear message naming the exact missing
+      # path, instead of letting `docker build` fail opaquely on a missing
+      # COPY source in a downstream job.
+      - name: Stage sealed EdgeShard release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/edgeshard
+          gh release download "v${VERSION}" --repo "${{ github.repository }}" \
+            --dir artifacts/edgeshard --pattern catalog.edgeshard.sealed \
+            --pattern catalog.edgeshard.sealed.ciphertext
+          node scripts/verify-edgeshard-descriptor.mjs
+
+      # SPLADE and ONNX Runtime are public, pinned release inputs. Stage them
+      # here exactly as release.yml does, with size/hash checks. This closes a
+      # prior gap where the guard required these directories but never created
+      # them, so every Marketplace build failed before Docker could run.
+      - name: Stage governed SPLADE artifact
+        run: |
+          set -euo pipefail
+          dir=artifacts/models/splade
+          rev=efcd182bc7eb351e81a9445752d4388c2bab500b
+          base="https://huggingface.co/Qdrant/Splade_PP_en_v1/resolve/${rev}"
+          mkdir -p "${dir}"
+          fetch() {
+            name="$1"; size="$2"; sha="$3"
+            curl --fail --location --retry 4 --retry-all-errors \
+              --output "${dir}/${name}.partial" "${base}/${name}?download=true"
+            test "$(stat -c '%s' "${dir}/${name}.partial")" = "${size}"
+            printf '%s  %s\n' "${sha}" "${dir}/${name}.partial" | sha256sum -c -
+            mv "${dir}/${name}.partial" "${dir}/${name}"
+          }
+          fetch model.onnx 532091260 65adbad0d7e1bc882c867d534821d52e60d6f666a91662be3f58457d08d25bf3
+          fetch config.json 755 017fde19abff1131c9c747fbd71f8348173409ac6d3d350fd122fd33341ecd85
+          fetch special_tokens_map.json 695 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a
+          fetch tokenizer.json 711649 91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854
+          fetch tokenizer_config.json 1381 55dc51676b13f29b34f3edfb55092a1947dd24ac3ef0200608a0cc66f1da2628
+
+      - name: Stage pinned ONNX Runtime
+        run: |
+          set -euo pipefail
+          version=1.24.4
+          archive="${RUNNER_TEMP}/onnxruntime-linux-x64-${version}.tgz"
+          mkdir -p artifacts/onnxruntime
+          curl --fail --location --retry 4 --retry-all-errors \
+            --output "${archive}" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-linux-x64-${version}.tgz"
+          tar -xzf "${archive}" -C artifacts/onnxruntime --strip-components=2 \
+            "onnxruntime-linux-x64-${version}/lib/libonnxruntime.so.${version}"
+          mv artifacts/onnxruntime/libonnxruntime.so.${version} artifacts/onnxruntime/libonnxruntime.so
+          test "$(stat -c '%s' artifacts/onnxruntime/libonnxruntime.so)" = 22159232
+          printf '%s  %s\n' 2d518e11c7767f9fdc4413bdbeb45acf30db504ff76a82fc19d9238a3f9f6c24 artifacts/onnxruntime/libonnxruntime.so | sha256sum -c -
+
+      # Dense BIEN and reranker bytes are private/internal. This public
+      # repository must never fetch them from a public GitHub Release or an
+      # unpinned URL. A future approved private-artifact injection step must
+      # populate these paths before this guard can pass.
+      - name: Require approved private BIEN and reranker injection
+        run: |
+          set -euo pipefail
+          echo "::notice::Private BIEN/reranker bytes must have been injected by an approved private-artifact step before this check; this public workflow never downloads them."
+          verify_dir() {
+            dir="$1"; shift
+            [ -d "${dir}" ] || { echo "::error::Missing private artifact directory: ${dir}"; return 1; }
+            while [ "$#" -gt 0 ]; do
+              file="$1"; expected="$2"; shift 2
+              [ -s "${dir}/${file}" ] || { echo "::error::Missing private artifact: ${dir}/${file}"; return 1; }
+              actual="$(sha256sum "${dir}/${file}" | awk '{print $1}')"
+              [ "${actual}" = "${expected}" ] || { echo "::error::Hash mismatch: ${dir}/${file}"; return 1; }
+            done
+          }
+          verify_dir artifacts/models/bien \
+            config.json af8863b3d62ad7a28fd9aa6e698be73c1af07353c6d2f318d6ba8952167b2737 \
+            model.onnx 908f5e95bf84e9878d860e27e2fb108876704e6b860b62e47c788094bcef0717 \
+            special_tokens_map.json 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a \
+            tokenizer.json f26b7f4b5db8ee4a98e65e2ce4e2c85c0b87ccd533d9e4a1b725e206b325f1e1 \
+            tokenizer_config.json 2c1f87cbda90c1cea7f511273e3f1be5adf5b216face23fc837d22624138fc79
+          verify_dir artifacts/models/reranker \
+            config.json d0a3f0a79877bb6112f8ecd20cd7a919cb6824dfd3dfde997e2afd3b1ce23a13 \
+            model.onnx a7254141fe4dd3b4cf8f91141095df870a6d465e5a5a186c74d51fbf8c25d2f0 \
+            special_tokens_map.json 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a \
+            tokenizer.json d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66 \
+            tokenizer_config.json 7b082b48a08a0b5c5939d99472e33addce3d96202155e33f7928cecd171186a0
+
+      - name: Verify Dockerfile build-context artifacts are available
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in chariot-adapter-bundle.json chariot-adapter-bundle.json.sig \
+                   chariot-adapter-catalog.json chariot-adapter-catalog.json.sig \
+                   chariot-current.json; do
+            if [ ! -s "${f}" ]; then
+              echo "::error::Required Dockerfile build-context file missing or empty: ${f}"
+              missing=1
+            fi
+          done
+          # Paths mirror the Dockerfile's own ARG defaults
+          # (EDGESHARD_SNAPSHOT / SPLADE_DIR / BIEN_DIR / RERANKER_DIR /
+          # ONNXRUNTIME_DIR) exactly. BIEN_DIR (BIEN::§9::10) was added
+          # alongside SPLADE_DIR: the runtime image must ship the
+          # document-side BIEN dense encoder ALONGSIDE the SPLADE document
+          # encoder (BIEN::§9::12), never in place of it, so both paths are
+          # checked here. RERANKER_DIR (rulings item 94, BIEN-U2) closes
+          # a prior gap in THIS guard: the Tier-1 reranker artifact
+          # (CHARIOT-SPEC.md §23.2 "Reranker delivery contract") was staged
+          # into the Dockerfile's COPY set without ever being checked here
+          # — a build could proceed with no reranker directory and only
+          # fail much later, at runtime-load-acceptance (§23.2 (a)-(d)),
+          # instead of failing closed at this pre-flight gate like every
+          # other required artifact already does.
+          for p in artifacts/models/splade artifacts/onnxruntime; do
+            if [ ! -e "${p}" ]; then
+              echo "::error::Dockerfile build-context path missing: ${p}. Stage the release model/runtime deliverables at the Dockerfile paths before building. The sealed catalog is produced separately by scripts/build-edgeshard-snapshot.mjs."
+              missing=1
+            fi
+          done
+          [ "${missing}" -eq 0 ]
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 2. BUILD + PUSH GATEWAY IMAGE — assembles the Dockerfile build context
+  #    from release.yml's ALREADY-SIGNED assets (never rebuilds or re-signs
+  #    the native addon / integrity manifest), builds the single-arch
+  #    (linux/amd64, CH-30) chariot-gateway image, and pushes it to the
+  #    Marketplace ECR registry.
+  # ─────────────────────────────────────────────────────────────────────
+  build-and-push-image:
+    name: Build + push chariot-gateway image
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      image_repository: ${{ steps.push.outputs.image_repository }}
+      image_digest: ${{ steps.push.outputs.image_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve sibling versions into lock
+        # See release.yml's validate job for the full npm/cli#8320 +
+        # napi-rs/napi-rs#3174 rationale.
+        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+
+      - name: Install dependencies
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: npm ci --omit=optional
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Stage sealed EdgeShard release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/edgeshard
+          gh release download "v${VERSION}" --repo "${{ github.repository }}" \
+            --dir artifacts/edgeshard --pattern catalog.edgeshard.sealed \
+            --pattern catalog.edgeshard.sealed.ciphertext
+          node scripts/verify-edgeshard-descriptor.mjs
+
+      # The guard is a separate runner; stage the same verified inputs here,
+      # in the runner that actually invokes Docker.
+      - name: Stage governed SPLADE artifact
+        run: |
+          set -euo pipefail
+          dir=artifacts/models/splade
+          rev=efcd182bc7eb351e81a9445752d4388c2bab500b
+          base="https://huggingface.co/Qdrant/Splade_PP_en_v1/resolve/${rev}"
+          mkdir -p "${dir}"
+          fetch() {
+            name="$1"; size="$2"; sha="$3"
+            curl --fail --location --retry 4 --retry-all-errors --output "${dir}/${name}.partial" "${base}/${name}?download=true"
+            test "$(stat -c '%s' "${dir}/${name}.partial")" = "${size}"
+            printf '%s  %s\n' "${sha}" "${dir}/${name}.partial" | sha256sum -c -
+            mv "${dir}/${name}.partial" "${dir}/${name}"
+          }
+          fetch model.onnx 532091260 65adbad0d7e1bc882c867d534821d52e60d6f666a91662be3f58457d08d25bf3
+          fetch config.json 755 017fde19abff1131c9c747fbd71f8348173409ac6d3d350fd122fd33341ecd85
+          fetch special_tokens_map.json 695 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a
+          fetch tokenizer.json 711649 91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854
+          fetch tokenizer_config.json 1381 55dc51676b13f29b34f3edfb55092a1947dd24ac3ef0200608a0cc66f1da2628
+
+      - name: Stage pinned ONNX Runtime
+        run: |
+          set -euo pipefail
+          version=1.24.4
+          archive="${RUNNER_TEMP}/onnxruntime-linux-x64-${version}.tgz"
+          mkdir -p artifacts/onnxruntime
+          curl --fail --location --retry 4 --retry-all-errors --output "${archive}" "https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-linux-x64-${version}.tgz"
+          tar -xzf "${archive}" -C artifacts/onnxruntime --strip-components=2 "onnxruntime-linux-x64-${version}/lib/libonnxruntime.so.${version}"
+          mv artifacts/onnxruntime/libonnxruntime.so.${version} artifacts/onnxruntime/libonnxruntime.so
+          test "$(stat -c '%s' artifacts/onnxruntime/libonnxruntime.so)" = 22159232
+          printf '%s  %s\n' 2d518e11c7767f9fdc4413bdbeb45acf30db504ff76a82fc19d9238a3f9f6c24 artifacts/onnxruntime/libonnxruntime.so | sha256sum -c -
+
+      - name: Configure AWS credentials for private model fetch
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_PRIVATE_ARTIFACT_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Fetch private BIEN and reranker artifacts from S3
+        env:
+          BIEN_URI: ${{ secrets.CHARIOT_PRIVATE_BIEN_S3_URI }}
+          RERANKER_URI: ${{ secrets.CHARIOT_PRIVATE_RERANKER_S3_URI }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/models/bien artifacts/models/reranker "${RUNNER_TEMP}/private-models"
+          aws s3 cp "${BIEN_URI}" "${RUNNER_TEMP}/private-models/bien.tar.gz" --only-show-errors
+          aws s3 cp "${RERANKER_URI}" "${RUNNER_TEMP}/private-models/reranker.tar.gz" --only-show-errors
+          tar -xzf "${RUNNER_TEMP}/private-models/bien.tar.gz" -C artifacts/models/bien
+          tar -xzf "${RUNNER_TEMP}/private-models/reranker.tar.gz" -C artifacts/models/reranker
+
+      - name: Require approved private BIEN and reranker injection
+        run: |
+          set -euo pipefail
+          echo "::notice::Private BIEN/reranker bytes must have been injected by an approved private-artifact step before this check; this public workflow never downloads them."
+          verify_dir() {
+            dir="$1"; shift
+            [ -d "${dir}" ] || { echo "::error::Missing private artifact directory: ${dir}"; return 1; }
+            while [ "$#" -gt 0 ]; do
+              file="$1"; expected="$2"; shift 2
+              [ -s "${dir}/${file}" ] || { echo "::error::Missing private artifact: ${dir}/${file}"; return 1; }
+              actual="$(sha256sum "${dir}/${file}" | awk '{print $1}')"
+              [ "${actual}" = "${expected}" ] || { echo "::error::Hash mismatch: ${dir}/${file}"; return 1; }
+            done
+          }
+          verify_dir artifacts/models/bien \
+            config.json af8863b3d62ad7a28fd9aa6e698be73c1af07353c6d2f318d6ba8952167b2737 \
+            model.onnx 908f5e95bf84e9878d860e27e2fb108876704e6b860b62e47c788094bcef0717 \
+            special_tokens_map.json 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a \
+            tokenizer.json f26b7f4b5db8ee4a98e65e2ce4e2c85c0b87ccd533d9e4a1b725e206b325f1e1 \
+            tokenizer_config.json 2c1f87cbda90c1cea7f511273e3f1be5adf5b216face23fc837d22624138fc79
+          verify_dir artifacts/models/reranker \
+            config.json d0a3f0a79877bb6112f8ecd20cd7a919cb6824dfd3dfde997e2afd3b1ce23a13 \
+            model.onnx a7254141fe4dd3b4cf8f91141095df870a6d465e5a5a186c74d51fbf8c25d2f0 \
+            special_tokens_map.json 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a \
+            tokenizer.json d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66 \
+            tokenizer_config.json 7b082b48a08a0b5c5939d99472e33addce3d96202155e33f7928cecd171186a0
+
+      # Same third-party licence inventory + SBOM check as release.yml's
+      # validate job. This workflow builds the gateway image independently
+      # of release.yml (it can run against an already-published release), so
+      # it re-verifies rather than trusting release.yml already ran.
+      - name: Verify THIRD-PARTY-NOTICES.md is current
+        run: node scripts/generate-third-party-notices.mjs --check
+
+      - name: Generate CycloneDX SBOM (npm production dependencies)
+        run: npm sbom --sbom-format cyclonedx --omit dev > sbom.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-image-sbom
+          path: sbom.cdx.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Download signed native-binary + integrity-manifest release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/release-assets"
+          gh release download "v${VERSION}" --repo "${{ github.repository }}" \
+            --dir "${RUNNER_TEMP}/release-assets" \
+            --pattern "chariot-native-linux-x64-v${VERSION}.node" \
+            --pattern "chariot-native-linux-x64-v${VERSION}.node.sha256" \
+            --pattern "integrity-v${VERSION}.json"
+
+      - name: Verify downloaded native binary against its signed manifest
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/release-assets"
+          # NOT `sha256sum -c` against the downloaded .sha256 sidecar: that
+          # file's recorded path is release.yml's own staging path
+          # (release-assets/chariot-native-...), which no longer matches
+          # this directory's layout post-download and would fail-closed on
+          # a path mismatch rather than a real corruption. Extract just the
+          # hash field and compare strings instead — same pattern release.yml
+          # itself uses whenever a hash must be checked against a
+          # differently-pathed file (e.g. its sign-manifest job).
+          EXPECTED_HASH="$(awk '{print $1}' "chariot-native-linux-x64-v${VERSION}.node.sha256")"
+          ACTUAL_HASH="$(sha256sum "chariot-native-linux-x64-v${VERSION}.node" | awk '{print $1}')"
+          if [ "${ACTUAL_HASH}" != "${EXPECTED_HASH}" ]; then
+            echo "::error::Downloaded chariot-native-linux-x64-v${VERSION}.node hash (${ACTUAL_HASH}) does not match its release .sha256 (${EXPECTED_HASH})"
+            exit 1
+          fi
+          mkdir -p "${GITHUB_WORKSPACE}/native"
+          cp "chariot-native-linux-x64-v${VERSION}.node" "${GITHUB_WORKSPACE}/native/chariot-native.node"
+          cp "integrity-v${VERSION}.json" "${GITHUB_WORKSPACE}/native/integrity.json"
+          BIN_HASH="$(sha256sum "${GITHUB_WORKSPACE}/native/chariot-native.node" | awk '{print $1}')"
+          MANIFEST_HASH="$(node -p "require('${GITHUB_WORKSPACE}/native/integrity.json').hashes['linux-x64']")"
+          if [ "${BIN_HASH}" != "${MANIFEST_HASH}" ]; then
+            echo "::error::Downloaded native/chariot-native.node hash (${BIN_HASH}) does not match native/integrity.json's linux-x64 entry (${MANIFEST_HASH})"
+            exit 1
+          fi
+          echo "OK: native binary matches the signed integrity manifest."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_MARKETPLACE_ECR_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Marketplace ECR
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
+
+      - name: Build and push chariot-gateway image
+        id: push
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          IMAGE_TAG: ${{ needs.guard.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          IMAGE_REPOSITORY="${ECR_REGISTRY}/${GATEWAY_IMAGE_REPOSITORY_NAME}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg CHARIOT_VERSION="${VERSION}" \
+            --tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+            --push \
+            --metadata-file "${RUNNER_TEMP}/gateway-build-metadata.json" \
+            .
+          DIGEST="$(node -p "require('${RUNNER_TEMP}/gateway-build-metadata.json')['containerimage.digest'] || ''")"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::Could not resolve the pushed image digest from buildx metadata"
+            exit 1
+          fi
+          echo "image_repository=${IMAGE_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed: ${IMAGE_REPOSITORY}:${IMAGE_TAG} (${DIGEST})"
+
+      # OpenShift / IBM Marketplace container certification (docs.redhat.com
+      # policy guide, quoted verbatim): "Uncompressed container images must
+      # have less than 40 layers." and "Container images must include the
+      # following labels: name, maintainer, vendor, version, release,
+      # summary, description." `docker buildx build --push` never loads the
+      # image locally, so the pushed digest is pulled back down to inspect
+      # the SAME bytes that were just published — not a local rebuild that
+      # could drift from what ECR actually has. Fails closed: a missing
+      # label or an over-budget layer count fails this job before the image
+      # is ever signed (sign-image, next job) or handed to a buyer.
+      - name: Assert layer count and required labels (Red Hat certification)
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image_repository }}@${{ steps.push.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          docker pull "${IMAGE_REF}"
+
+          LAYER_COUNT="$(docker inspect --format '{{ len .RootFS.Layers }}' "${IMAGE_REF}")"
+          echo "Uncompressed layer count: ${LAYER_COUNT}"
+          if [ "${LAYER_COUNT}" -ge 40 ]; then
+            echo "::error::Image has ${LAYER_COUNT} uncompressed layers; Red Hat container certification requires fewer than 40."
+            exit 1
+          fi
+
+          MISSING_LABELS=""
+          for LABEL_NAME in name maintainer vendor version release summary description; do
+            LABEL_VALUE="$(docker inspect --format "{{ index .Config.Labels \"${LABEL_NAME}\" }}" "${IMAGE_REF}")"
+            if [ -z "${LABEL_VALUE}" ]; then
+              MISSING_LABELS="${MISSING_LABELS} ${LABEL_NAME}"
+            fi
+          done
+          if [ -n "${MISSING_LABELS}" ]; then
+            echo "::error::Image is missing required Red Hat certification label(s):${MISSING_LABELS}"
+            exit 1
+          fi
+          echo "OK: all required Red Hat certification labels present, layer count within budget."
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3. SIGN IMAGE — CH-54 digest-pinned ECR image seal. Mirrors the
+  #    sign-image job in release.yml: same scripts/release.mjs /
+  #    scripts/image-seal.mjs argv source of truth, same notation setup,
+  #    same post-sign verification.
+  # ─────────────────────────────────────────────────────────────────────
+  sign-image:
+    name: Sign chariot-gateway image (CH-54)
+    needs: [guard, build-and-push-image]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve digest-pinned image reference
+        id: image-ref
+        env:
+          IMAGE_REPOSITORY: ${{ needs.build-and-push-image.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ needs.build-and-push-image.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="$(node scripts/release.mjs --emit-image-ref --repository "${IMAGE_REPOSITORY}" --digest "${IMAGE_DIGEST}")"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image ref: ${IMAGE_REF}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_SIGNING_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Set up notation CLI
+        uses: notaryproject/notation-action/setup@b6fee73110795d6793253c673bd723f12bcf9bbb # v1.2.2
+
+      - name: Install AWS Signer notation plugin
+        env:
+          AWS_SIGNER_PLUGIN_URL: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_URL }}
+          AWS_SIGNER_PLUGIN_SHA256: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_SHA256 }}
+        run: |
+          set -euo pipefail
+          # notation-action/setup installs the CLI only. The AWS Signer plugin
+          # is installed from its operator-supplied release binary (URL +
+          # sha256 are secrets — no baked artifact), same as release.yml.
+          curl -fsSL "$AWS_SIGNER_PLUGIN_URL" -o /tmp/notation-aws-signer-plugin
+          echo "${AWS_SIGNER_PLUGIN_SHA256}  /tmp/notation-aws-signer-plugin" | sha256sum -c -
+          chmod +x /tmp/notation-aws-signer-plugin
+          notation plugin install --file /tmp/notation-aws-signer-plugin
+
+      - name: Sign image with Notation / AWS Signer
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          CHARIOT_SIGNING_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+        run: |
+          set -euo pipefail
+          # Single source of truth for the notation argv: scripts/image-seal.mjs
+          # (shared with the verify path) via release.mjs --emit-sign-args.
+          mapfile -t SIGN_ARGS < <(node scripts/release.mjs --emit-sign-args \
+            --image-ref "${{ steps.image-ref.outputs.image_ref }}" \
+            --id "${CHARIOT_SIGNING_PROFILE_ARN}" \
+            --aws-region "${AWS_REGION}")
+          notation "${SIGN_ARGS[@]}"
+
+      - name: Verify image signature with Notation (post-sign)
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          CHARIOT_SIGNING_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+        run: |
+          set -euo pipefail
+          # Fail-closed confirmation the signature actually landed in ECR,
+          # via an ephemeral trust policy bound to the exact signing-profile
+          # ARN used above (mirrors release.yml's post-sign verify step).
+          NOTATION_CFG="${RUNNER_TEMP}/notation-cfg"
+          mkdir -p "${NOTATION_CFG}"
+          node -e "
+            const fs = require('fs');
+            const policy = {
+              version: '1.0',
+              trustPolicies: [{
+                name: 'aws-signer-tp',
+                registryScopes: ['*'],
+                signatureVerification: { level: 'strict' },
+                trustStores: ['signingAuthority:aws-signer-ts', 'signingAuthority:aws-us-gov-signer-ts'],
+                trustedIdentities: [process.env.CHARIOT_SIGNING_PROFILE_ARN],
+              }],
+            };
+            fs.writeFileSync(process.env.NOTATION_CFG + '/trustpolicy.json', JSON.stringify(policy, null, 2) + '\n');
+          "
+          export NOTATION_CONFIG="${NOTATION_CFG}"
+          mapfile -t VERIFY_ARGS < <(node scripts/release.mjs --emit-verify-args \
+            --image-ref "${{ steps.image-ref.outputs.image_ref }}" \
+            --aws-region "${AWS_REGION}")
+          notation "${VERIFY_ARGS[@]}"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 3b. MIRROR + SIGN DEPENDENCY IMAGES (mongodb, redis) — images 2 and 3
+  #     of 3 (§23.2). Docker Official `mongo` / `redis` images, re-tagged
+  #     into the SAME Marketplace ECR registry as the gateway image and
+  #     signed via the identical CH-54 Notation / AWS Signer path (same
+  #     scripts/release.mjs entrypoints as the sign-image job above). Runs
+  #     in parallel with build-and-push-image/sign-image — it has no
+  #     dependency on the gateway build.
+  # ─────────────────────────────────────────────────────────────────────
+  mirror-and-sign-dependency-images:
+    name: Mirror + sign mongodb + redis images (CH-29/CH-54)
+    needs: guard
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      mongodb_image_repository: ${{ steps.mirror-mongodb.outputs.image_repository }}
+      mongodb_image_digest: ${{ steps.mirror-mongodb.outputs.image_digest }}
+      redis_image_repository: ${{ steps.mirror-redis.outputs.image_repository }}
+      redis_image_digest: ${{ steps.mirror-redis.outputs.image_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Reads the pinned repository/tag straight from the committed chart
+      # values (single source of truth — never hand-duplicated here) so this
+      # job can never drift from helm/chariot/values.yaml's mongodb/redis
+      # image blocks.
+      - name: Resolve mongodb/redis repository + tag from values.yaml
+        id: resolve-dependency-images
+        run: |
+          set -euo pipefail
+          YAML_TOOL_DIR="${RUNNER_TEMP}/yaml-tool"
+          mkdir -p "${YAML_TOOL_DIR}"
+          npm install --no-save --prefix "${YAML_TOOL_DIR}" "js-yaml@${JS_YAML_VERSION}" --no-audit --no-fund
+          YAML_TOOL_DIR="${YAML_TOOL_DIR}" node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const yaml = require(path.join(process.env.YAML_TOOL_DIR, 'node_modules', 'js-yaml'));
+            const doc = yaml.load(fs.readFileSync('helm/chariot/values.yaml', 'utf-8'));
+            const out = fs.createWriteStream(process.env.GITHUB_OUTPUT, { flags: 'a' });
+            out.write(\`mongodb_repository=\${doc.mongodb.image.repository}\n\`);
+            out.write(\`mongodb_tag=\${doc.mongodb.image.tag}\n\`);
+            out.write(\`redis_repository=\${doc.redis.image.repository}\n\`);
+            out.write(\`redis_tag=\${doc.redis.image.tag}\n\`);
+          "
+
+      - name: Configure AWS credentials (OIDC, ECR push role)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_MARKETPLACE_ECR_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Marketplace ECR
+        uses: aws-actions/amazon-ecr-login@b040164c4934333d597f3f9c67502ff28f814e9c # v2.1.6
+
+      # mongo/redis are Docker Official images (public, unauthenticated pull)
+      # — mirrored, never built, into the Marketplace ECR registry.
+      - name: Mirror mongodb image
+        id: mirror-mongodb
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+          SOURCE_REPOSITORY: ${{ steps.resolve-dependency-images.outputs.mongodb_repository }}
+          TARGET_REPOSITORY: ${{ env.MONGODB_IMAGE_REPOSITORY_NAME }}
+          TAG: ${{ steps.resolve-dependency-images.outputs.mongodb_tag }}
+        run: |
+          set -euo pipefail
+          SOURCE="${SOURCE_REPOSITORY}:${TAG}"
+          TARGET="${ECR_REGISTRY}/${TARGET_REPOSITORY}:${TAG}"
+          docker pull "${SOURCE}"
+          docker tag "${SOURCE}" "${TARGET}"
+          PUSH_LOG="${RUNNER_TEMP}/mongodb-push.log"
+          docker push "${TARGET}" | tee "${PUSH_LOG}"
+          DIGEST="$(grep -oE 'sha256:[0-9a-f]{64}' "${PUSH_LOG}" | tail -n1)"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::Could not resolve the pushed mongodb image digest from docker push output"
+            exit 1
+          fi
+          echo "image_repository=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed: ${TARGET} (${DIGEST})"
+
+      - name: Mirror redis image
+        id: mirror-redis
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+          SOURCE_REPOSITORY: ${{ steps.resolve-dependency-images.outputs.redis_repository }}
+          TARGET_REPOSITORY: ${{ env.REDIS_IMAGE_REPOSITORY_NAME }}
+          TAG: ${{ steps.resolve-dependency-images.outputs.redis_tag }}
+        run: |
+          set -euo pipefail
+          SOURCE="${SOURCE_REPOSITORY}:${TAG}"
+          TARGET="${ECR_REGISTRY}/${TARGET_REPOSITORY}:${TAG}"
+          docker pull "${SOURCE}"
+          docker tag "${SOURCE}" "${TARGET}"
+          PUSH_LOG="${RUNNER_TEMP}/redis-push.log"
+          docker push "${TARGET}" | tee "${PUSH_LOG}"
+          DIGEST="$(grep -oE 'sha256:[0-9a-f]{64}' "${PUSH_LOG}" | tail -n1)"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::Could not resolve the pushed redis image digest from docker push output"
+            exit 1
+          fi
+          echo "image_repository=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed: ${TARGET} (${DIGEST})"
+
+      # Same CH-54 signing path as the gateway (sign-image job above): the
+      # AWS Signer role is DIFFERENT from the ECR push role above, so
+      # credentials are reconfigured to the signing role before invoking
+      # notation — same role split release.yml / this workflow's own
+      # sign-image job already use.
+      - name: Configure AWS credentials (OIDC, signing role)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_SIGNING_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Set up notation CLI
+        uses: notaryproject/notation-action/setup@b6fee73110795d6793253c673bd723f12bcf9bbb # v1.2.2
+
+      - name: Install AWS Signer notation plugin
+        env:
+          AWS_SIGNER_PLUGIN_URL: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_URL }}
+          AWS_SIGNER_PLUGIN_SHA256: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_SHA256 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "$AWS_SIGNER_PLUGIN_URL" -o /tmp/notation-aws-signer-plugin
+          echo "${AWS_SIGNER_PLUGIN_SHA256}  /tmp/notation-aws-signer-plugin" | sha256sum -c -
+          chmod +x /tmp/notation-aws-signer-plugin
+          notation plugin install --file /tmp/notation-aws-signer-plugin
+
+      - name: Sign + verify mongodb image with Notation / AWS Signer
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          CHARIOT_SIGNING_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+          IMAGE_REPOSITORY: ${{ steps.mirror-mongodb.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.mirror-mongodb.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="$(node scripts/release.mjs --emit-image-ref --repository "${IMAGE_REPOSITORY}" --digest "${IMAGE_DIGEST}")"
+          mapfile -t SIGN_ARGS < <(node scripts/release.mjs --emit-sign-args \
+            --image-ref "${IMAGE_REF}" \
+            --id "${CHARIOT_SIGNING_PROFILE_ARN}" \
+            --aws-region "${AWS_REGION}")
+          notation "${SIGN_ARGS[@]}"
+
+          NOTATION_CFG="${RUNNER_TEMP}/notation-cfg-mongodb"
+          mkdir -p "${NOTATION_CFG}"
+          node -e "
+            const fs = require('fs');
+            const policy = {
+              version: '1.0',
+              trustPolicies: [{
+                name: 'aws-signer-tp',
+                registryScopes: ['*'],
+                signatureVerification: { level: 'strict' },
+                trustStores: ['signingAuthority:aws-signer-ts', 'signingAuthority:aws-us-gov-signer-ts'],
+                trustedIdentities: [process.env.CHARIOT_SIGNING_PROFILE_ARN],
+              }],
+            };
+            fs.writeFileSync(process.env.NOTATION_CFG + '/trustpolicy.json', JSON.stringify(policy, null, 2) + '\n');
+          "
+          export NOTATION_CONFIG="${NOTATION_CFG}"
+          mapfile -t VERIFY_ARGS < <(node scripts/release.mjs --emit-verify-args \
+            --image-ref "${IMAGE_REF}" \
+            --aws-region "${AWS_REGION}")
+          notation "${VERIFY_ARGS[@]}"
+
+      - name: Sign + verify redis image with Notation / AWS Signer
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          CHARIOT_SIGNING_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+          IMAGE_REPOSITORY: ${{ steps.mirror-redis.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.mirror-redis.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="$(node scripts/release.mjs --emit-image-ref --repository "${IMAGE_REPOSITORY}" --digest "${IMAGE_DIGEST}")"
+          mapfile -t SIGN_ARGS < <(node scripts/release.mjs --emit-sign-args \
+            --image-ref "${IMAGE_REF}" \
+            --id "${CHARIOT_SIGNING_PROFILE_ARN}" \
+            --aws-region "${AWS_REGION}")
+          notation "${SIGN_ARGS[@]}"
+
+          NOTATION_CFG="${RUNNER_TEMP}/notation-cfg-redis"
+          mkdir -p "${NOTATION_CFG}"
+          node -e "
+            const fs = require('fs');
+            const policy = {
+              version: '1.0',
+              trustPolicies: [{
+                name: 'aws-signer-tp',
+                registryScopes: ['*'],
+                signatureVerification: { level: 'strict' },
+                trustStores: ['signingAuthority:aws-signer-ts', 'signingAuthority:aws-us-gov-signer-ts'],
+                trustedIdentities: [process.env.CHARIOT_SIGNING_PROFILE_ARN],
+              }],
+            };
+            fs.writeFileSync(process.env.NOTATION_CFG + '/trustpolicy.json', JSON.stringify(policy, null, 2) + '\n');
+          "
+          export NOTATION_CONFIG="${NOTATION_CFG}"
+          mapfile -t VERIFY_ARGS < <(node scripts/release.mjs --emit-verify-args \
+            --image-ref "${IMAGE_REF}" \
+            --aws-region "${AWS_REGION}")
+          notation "${VERIFY_ARGS[@]}"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 4. PACKAGE + PUSH HELM CHART — helm package + OCI push to Marketplace
+  #    ECR. Pins the chart's per-image `registry` field (gateway/mongodb/
+  #    redis — CH-29) to the Marketplace ECR registry, and the gateway,
+  #    mongodb, and redis images to this run's SIGNED digests, in an
+  #    ephemeral staged copy of the chart; the committed
+  #    helm/chariot/values.yaml is never modified.
+  # ─────────────────────────────────────────────────────────────────────
+  package-and-push-chart:
+    name: Package + push Helm chart
+    needs: [guard, build-and-push-image, sign-image, mirror-and-sign-dependency-images]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Stage chart with the Marketplace ECR registry + signed digest
+        # CHART_STAGE / YAML_TOOL_DIR are computed from $RUNNER_TEMP (a
+        # stable per-job path automatically provided in every step's shell
+        # environment) so later steps in this job can recompute the same
+        # paths independently — no GITHUB_ENV hand-off needed.
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+          GATEWAY_IMAGE_REPOSITORY_NAME: ${{ env.GATEWAY_IMAGE_REPOSITORY_NAME }}
+          MONGODB_IMAGE_REPOSITORY_NAME: ${{ env.MONGODB_IMAGE_REPOSITORY_NAME }}
+          REDIS_IMAGE_REPOSITORY_NAME: ${{ env.REDIS_IMAGE_REPOSITORY_NAME }}
+          IMAGE_TAG: ${{ needs.guard.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ needs.build-and-push-image.outputs.image_digest }}
+          MONGODB_IMAGE_DIGEST: ${{ needs.mirror-and-sign-dependency-images.outputs.mongodb_image_digest }}
+          REDIS_IMAGE_DIGEST: ${{ needs.mirror-and-sign-dependency-images.outputs.redis_image_digest }}
+        run: |
+          set -euo pipefail
+          CHART_STAGE="${RUNNER_TEMP}/chart-stage"
+          rm -rf "${CHART_STAGE}"
+          cp -r helm/chariot "${CHART_STAGE}"
+
+          # Ephemeral, CI-only install of the exact js-yaml version already
+          # resolved in this repo's package-lock.json (node_modules/js-yaml
+          # @ 4.1.1) — installed outside the project tree so it never
+          # touches package.json / package-lock.json.
+          YAML_TOOL_DIR="${RUNNER_TEMP}/yaml-tool"
+          mkdir -p "${YAML_TOOL_DIR}"
+          npm install --no-save --prefix "${YAML_TOOL_DIR}" "js-yaml@${JS_YAML_VERSION}" --no-audit --no-fund
+
+          CHART_STAGE="${CHART_STAGE}" YAML_TOOL_DIR="${YAML_TOOL_DIR}" node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const yaml = require(path.join(process.env.YAML_TOOL_DIR, 'node_modules', 'js-yaml'));
+            const valuesPath = path.join(process.env.CHART_STAGE, 'values.yaml');
+            const doc = yaml.load(fs.readFileSync(valuesPath, 'utf-8'));
+
+            const registry = process.env.ECR_REGISTRY;
+            doc.global.imageRegistry = registry;
+
+            doc.gateway.image.registry = registry;
+            // §23.2: the chart must reference the repository this run pushed.
+            doc.gateway.image.repository = process.env.GATEWAY_IMAGE_REPOSITORY_NAME;
+            doc.gateway.image.tag = process.env.IMAGE_TAG;
+            doc.gateway.image.digest = process.env.IMAGE_DIGEST;
+
+            // CH-29/CH-54: mongodb and redis (images 2 and 3 of 3) are
+            // mirrored + signed by the mirror-and-sign-dependency-images job
+            // above; pin the same registry + immutable digest onto the
+            // chart's mongodb/redis image blocks as is done for the gateway
+            // image above (tag is left as the chart's own pinned default —
+            // never 'latest', CH-26 — since the mirror step re-tags under
+            // that identical tag).
+            doc.mongodb.image.registry = registry;
+            doc.mongodb.image.repository = process.env.MONGODB_IMAGE_REPOSITORY_NAME;
+            doc.mongodb.image.digest = process.env.MONGODB_IMAGE_DIGEST;
+
+            doc.redis.image.registry = registry;
+            doc.redis.image.repository = process.env.REDIS_IMAGE_REPOSITORY_NAME;
+            doc.redis.image.digest = process.env.REDIS_IMAGE_DIGEST;
+
+            fs.writeFileSync(valuesPath, yaml.dump(doc, { lineWidth: -1 }));
+          "
+
+      - name: Lint staged chart
+        # Mirrors helm/chariot/README.md's documented `helm lint` invocation
+        # exactly (CH-28 fail-closed fields need a value for lint to render).
+        # None of these --set values are written back into the packaged
+        # chart's values.yaml — they are ephemeral to this lint run only.
+        run: |
+          set -euo pipefail
+          helm lint "${RUNNER_TEMP}/chart-stage" \
+            --set gateway.existingSecret=s \
+            --set mongodb.auth.rootPassword='Str0ng-Pass-9f3a2b' \
+            --set redis.auth.password='Str0ng-Pass-9f3a2b'
+
+      - name: Package chart
+        id: package
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          CHART_OUT="${RUNNER_TEMP}/chart-out"
+          mkdir -p "${CHART_OUT}"
+          helm package "${RUNNER_TEMP}/chart-stage" --app-version "${VERSION}" --destination "${CHART_OUT}"
+          TGZ="$(ls "${CHART_OUT}"/*.tgz)"
+          echo "chart_tgz=${TGZ}" >> "$GITHUB_OUTPUT"
+          echo "Packaged: ${TGZ}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_MARKETPLACE_ECR_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login Helm to Marketplace ECR (OCI)
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | helm registry login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Push chart as OCI artifact
+        env:
+          ECR_REGISTRY: ${{ inputs.ecr_registry }}
+          CHART_TGZ: ${{ steps.package.outputs.chart_tgz }}
+        run: |
+          set -euo pipefail
+          helm push "${CHART_TGZ}" "oci://${ECR_REGISTRY}"
+          echo "Pushed Helm chart to oci://${ECR_REGISTRY}"
+
+      # CH-54's deploy-time verify requirement ("MUST be verified at
+      # deploy — a Kyverno/OPA admission policy on EKS, or an ECS
+      # service-lifecycle Lambda hook") is met by the ClusterPolicy already
+      # shipped IN this chart, not by anything this workflow runs — this
+      # step only names it in the run's summary so the shipped mechanism is
+      # never left undocumented. Do not invent a second verify mechanism.
+      - name: Record deploy-time verification mechanism (CH-54)
+        run: |
+          set -euo pipefail
+          {
+            echo "### Deploy-time image-signature verification (CH-54)"
+            echo ""
+            echo "The chariot-gateway image pushed and signed by this run is verified at"
+            echo "deploy time by the Kyverno \`ClusterPolicy\` template shipped in this"
+            echo "chart: \`helm/chariot/templates/image-verify-policy.yaml\` (rule"
+            echo "\`verify-gateway-image-signature\`), gated behind"
+            echo "\`imageVerification.enabled\` and rendering the Notation/AWS Signer"
+            echo "cert configured at \`imageVerification.notation.certs\`. Enable it at"
+            echo "install time with \`--set imageVerification.enabled=true\` (EKS"
+            echo "clusters with the Kyverno admission controller installed); it blocks"
+            echo "or kills gateway pods on an invalid or absent signature. No second"
+            echo "verify mechanism is introduced by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"

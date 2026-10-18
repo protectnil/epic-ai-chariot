@@ -42,7 +42,7 @@ export class USGSWaterMCPServer extends MCPAdapterBase {
       name: 'usgswater',
       displayName: 'USGS Water (NWIS)',
       version: '1.0.0',
-      category: 'environment' as const,
+      category: 'science' as const,
       keywords: [
         'usgs', 'water', 'streamflow', 'discharge', 'gage height',
         'river', 'stream', 'hydrology', 'nwis', 'national water',

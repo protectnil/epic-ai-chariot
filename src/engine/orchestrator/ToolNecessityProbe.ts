@@ -54,6 +54,10 @@
  * Built on the Epic AI® Intelligence Platform
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
+import { createLogger } from '../logger.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('engine.tool-necessity-probe');
 
 let warnedUnsupported = false;
 
@@ -91,7 +95,7 @@ export class ToolNecessityProbe {
     if (hiddenStates === undefined) {
       if (!warnedUnsupported) {
         warnedUnsupported = true;
-        console.warn('[chariot] PROBE&PREFILL probe_unsupported: hidden states unavailable on this LLM path (cloud-LLM or Ollama). decide() will no-op.');
+        moduleLog.warn('[chariot] PROBE&PREFILL probe_unsupported: hidden states unavailable on this LLM path (cloud-LLM or Ollama). decide() will no-op.');
       }
       return { decision: 'unsupported' };
     }
@@ -99,7 +103,7 @@ export class ToolNecessityProbe {
     if (xs.length !== this.weights.length) {
       if (!warnedUnsupported) {
         warnedUnsupported = true;
-        console.warn(`[chariot] PROBE&PREFILL probe_unsupported: hiddenStates length ${xs.length} does not match trained weight length ${this.weights.length}.`);
+        moduleLog.warn(`[chariot] PROBE&PREFILL probe_unsupported: hiddenStates length ${xs.length} does not match trained weight length ${this.weights.length}.`);
       }
       return { decision: 'unsupported' };
     }

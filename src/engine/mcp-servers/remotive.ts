@@ -28,7 +28,7 @@ export class RemotiveMCPServer extends MCPAdapterBase {
       name: 'remotive',
       displayName: 'Remotive Remote Jobs',
       version: '1.0.0',
-      category: 'jobs',
+      category: 'hr',
       keywords: [
         'remotive', 'remote jobs', 'remote work', 'job board', 'jobs',
         'careers', 'hiring', 'remote employment', 'job search',

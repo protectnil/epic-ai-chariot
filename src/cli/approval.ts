@@ -481,9 +481,15 @@ function computeAuditHash(prevHash: string, body: { seq: number; ts: string; eve
 //   - If we read from a non-zero offset, the bytes before the first
 //     '\n' belong to a partial line that started earlier — drop it.
 //   - Empty trailing line (from JSON.stringify(record)+'\n') is filtered.
-//   - On any IO / parse failure we return null. Returning null means
-//     the next append will start a NEW chain at seq=1; this matches
-//     the prior swallow-and-restart semantic and is NOT a regression.
+//   - Zero-day fix (corrupt-tail chain fork): failures are now a
+//     DISCRIMINATED result, not a collapsed null. Only 'absent' (ENOENT)
+//     and 'empty' (0-byte file) legitimately start a new chain at seq=1.
+//     Any read/parse/shape failure on a NON-EMPTY file (truncated final
+//     line from power loss / disk-full, corruption, tamper) returns
+//     'corrupt' and appendApprovalAudit REFUSES to append — silently
+//     restarting at seq=1/GENESIS would fork a second chain in the same
+//     file, permanently breaking verifyApprovalAudit while the
+//     approve/revoke presented as success.
 //   - UTF-8 boundary safety: all current record field values are ASCII
 //     (ISO-8601 ts, 64-char hex hashes, slug adapter_ids, fixed event
 //     strings, ASCII numbers). If a future schema admits non-ASCII
@@ -496,34 +502,50 @@ function computeAuditHash(prevHash: string, body: { seq: number; ts: string; eve
 //     is NOT derived from this function's return — a 0-byte file still
 //     pre-exists but readLastAuditEntry returns null. The caller checks
 //     existsSync directly to close that security gap (Q6-1).
-function readLastAuditEntry(): { seq: number; hash: string } | null {
+type AuditTailResult =
+  | { kind: 'absent' }
+  | { kind: 'empty' }
+  | { kind: 'entry'; seq: number; hash: string }
+  | { kind: 'corrupt'; reason: string };
+
+function readLastAuditEntry(): AuditTailResult {
   let fd: number | null = null;
   try {
     fd = openSync(APPROVAL_AUDIT_FILE, 'r');
-  } catch {
-    return null;
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') return { kind: 'absent' };
+    return { kind: 'corrupt', reason: `open failed: ${err.message}` };
   }
   try {
     const size = fstatSync(fd).size;
-    if (size === 0) return null;
+    if (size === 0) return { kind: 'empty' };
     const readLen = size < APPROVAL_AUDIT_TAIL_BYTES ? size : APPROVAL_AUDIT_TAIL_BYTES;
     const offset = size - readLen;
     const buf = Buffer.alloc(readLen);
     const bytesRead = readSync(fd, buf, 0, readLen, offset);
-    if (bytesRead <= 0) return null;
+    if (bytesRead <= 0) return { kind: 'corrupt', reason: 'tail read returned no bytes for a non-empty file' };
     let text = buf.subarray(0, bytesRead).toString('utf-8');
     if (offset > 0) {
       const firstNl = text.indexOf('\n');
-      if (firstNl < 0) return null;
+      if (firstNl < 0) return { kind: 'corrupt', reason: `no record boundary in the final ${APPROVAL_AUDIT_TAIL_BYTES}-byte window — oversized or corrupt tail` };
       text = text.slice(firstNl + 1);
     }
     const lines = text.split('\n').filter((l) => l.length > 0);
-    if (lines.length === 0) return null;
-    const last = JSON.parse(lines[lines.length - 1]) as ApprovalAuditRecord;
-    if (typeof last.seq !== 'number' || typeof last.hash !== 'string') return null;
-    return { seq: last.seq, hash: last.hash };
-  } catch {
-    return null;
+    if (lines.length === 0) return { kind: 'corrupt', reason: 'non-empty file contains no complete record line in the tail window' };
+    let last: ApprovalAuditRecord;
+    try {
+      last = JSON.parse(lines[lines.length - 1]) as ApprovalAuditRecord;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { kind: 'corrupt', reason: `final record is not valid JSON (truncated append from power loss / disk-full?): ${msg}` };
+    }
+    if (typeof last.seq !== 'number' || typeof last.hash !== 'string') {
+      return { kind: 'corrupt', reason: 'final record is missing seq/hash fields' };
+    }
+    return { kind: 'entry', seq: last.seq, hash: last.hash };
+  } catch (e) {
+    return { kind: 'corrupt', reason: e instanceof Error ? e.message : String(e) };
   } finally {
     try { closeSync(fd); } catch { /* fd already closed or invalid */ }
   }
@@ -553,7 +575,21 @@ export function appendApprovalAudit(
   // returns null from readLastAuditEntry — still triggers the chmod
   // tightening on its first written record.
   const preExisted = existsSync(APPROVAL_AUDIT_FILE);
-  const last = readLastAuditEntry();
+  const tail = readLastAuditEntry();
+  // Zero-day fix: only a legitimately absent or 0-byte log starts a new
+  // chain at seq=1/GENESIS. A corrupt/unreadable tail on a non-empty log
+  // FAILS CLOSED — appending would silently fork a second chain in the same
+  // file (verifyApprovalAudit then throws forever) while the approve/revoke
+  // presented as success. Fail loudly instead so the operator repairs or
+  // restores the tamper-evidence log before any new trust event is recorded.
+  if (tail.kind === 'corrupt') {
+    throw new Error(
+      `approval-audit: cannot read chain tail of ${APPROVAL_AUDIT_FILE} (${tail.reason}) — ` +
+      'refusing to append and fork a second chain at seq=1. ' +
+      'Restore the log from backup or investigate tampering (verifyApprovalAudit), then retry.',
+    );
+  }
+  const last = tail.kind === 'entry' ? tail : null;
   const seq = (last?.seq ?? 0) + 1;
   const ts = new Date().toISOString();
   const prevHash = last?.hash ?? GENESIS_HASH;

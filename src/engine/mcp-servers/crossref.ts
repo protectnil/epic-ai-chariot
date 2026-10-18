@@ -114,7 +114,7 @@ export class CrossrefMCPServer extends MCPAdapterBase {
       name: 'crossref',
       displayName: 'Crossref',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'crossref', 'academic', 'papers', 'doi', 'scholarly', 'publications',
         'journals', 'citations', 'metadata', 'research', 'science', 'bibliography',

@@ -1,5 +1,5 @@
 /**
- * @epicai/chariot — Update-availability notification (bug-tracker-ref)
+ * @epicai/chariot — Update-availability notification
  *
  * A customer on an outdated (or broken) version is never told a newer
  * release exists; this closes that gap for interactive CLI commands.

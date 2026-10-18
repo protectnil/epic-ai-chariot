@@ -1,0 +1,94 @@
+{{- /* CH-28 fail-closed: the gateway's sensitive env MUST come from an
+       operator-supplied Secret. No default, no blank (mirrors
+       src/iam/bootstrap.ts requireEnv). Abort the render if it is unset. */ -}}
+{{- if not .Values.gateway.existingSecret -}}
+{{- fail "CH-28 fail-closed: gateway.existingSecret is required. Create a K8s Secret with ENTERPRISE_JWT_SECRET, ENTERPRISE_MASTER_KEY, MONGODB_URI, REDIS_URL and set gateway.existingSecret to its name. The chart never defaults these." -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chariot.fullname" . }}
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "chariot.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chariot.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll pods when non-secret config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "chariot.serviceAccountName" . }}
+      # Deny-by-default at the pod level too, covering operator-supplied SAs
+      # (serviceAccount.create=false). IRSA's aws-iam-token projection is
+      # unaffected by this flag.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "chariot.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "chariot.gatewayImage" . }}
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          envFrom:
+            # Non-secret config (license provider, paths, port).
+            - configMapRef:
+                name: {{ include "chariot.fullname" . }}-config
+            # CH-28: operator-supplied secrets (JWT, master key, Mongo/Redis URIs).
+            - secretRef:
+                name: {{ .Values.gateway.existingSecret }}
+          {{- with .Values.gateway.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.gateway.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.gateway.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          volumeMounts:
+            # CH-30: the only writable paths under readOnlyRootFilesystem.
+            - name: data
+              mountPath: /var/lib/chariot
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-data" (include "chariot.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

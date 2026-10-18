@@ -30,11 +30,13 @@ export const DEFAULT_POOL_CONFIG: AdaptivePoolConfig = {
   globalMaxConnections: 500,
   perTenantBaseConnections: 20,
   perTenantMaxConnections: 50,
-  burstMultiplier: 2.5,
-  burstWindowMs: 30_000,
+  // §7.3::3 compiled-in defaults: burstMultiplier=2.0, burstWindowMs=60000,
+  // scaleUpThresholdMs=250, scaleDownIdleMs=300000.
+  burstMultiplier: 2.0,
+  burstWindowMs: 60_000,
   evictionPolicy: 'lru',
-  scaleUpThresholdMs: 200,
-  scaleDownIdleMs: 120_000,
+  scaleUpThresholdMs: 250,
+  scaleDownIdleMs: 300_000,
 };
 
 export interface PoolStats {
@@ -68,6 +70,13 @@ export class AdaptivePool {
   private readonly connections = new Map<string, PoolEntry>();
   private readonly tenantCounts = new Map<string, number>();
   private readonly burstTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * §7.3::2 — rolling per-tenant connection-wait samples backing the
+   * `p95(connectionWait) > scaleUpThresholdMs` scale-up trigger. Retained for
+   * exactly one `burstWindowMs`, so the p95 reflects current pressure and a
+   * long-past spike cannot keep a tenant in burst forever.
+   */
+  private readonly connectionWaitSamples = new Map<string, Array<{ at: number; durationMs: number }>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config?: Partial<AdaptivePoolConfig>) {
@@ -94,12 +103,18 @@ export class AdaptivePool {
     factory: () => Promise<MCPAdapter>,
   ): Promise<MCPAdapter> {
     const k = this.key(tenantId, adapterName);
+    // §7.3::2 — wall-clock wait this caller experienced to obtain a connection.
+    // Sampled on BOTH paths: a pool under pressure spends its time in eviction
+    // and factory construction, and measuring only the slow path would bias the
+    // p95 upward and burst a pool that is actually healthy.
+    const waitStart = Date.now();
 
     // Already connected — return existing
     const existing = this.connections.get(k);
     if (existing) {
       existing.lastUsedAt = Date.now();
       existing.useCount++;
+      this.recordConnectionWait(tenantId, Date.now() - waitStart);
       return existing.adapter;
     }
 
@@ -137,8 +152,40 @@ export class AdaptivePool {
     this.connections.set(k, entry);
     this.tenantCounts.set(tenantId, (this.tenantCounts.get(tenantId) ?? 0) + 1);
 
+    this.recordConnectionWait(tenantId, Date.now() - waitStart);
     log.debug('connection acquired', { tenantId, adapterName, globalActive: this.connections.size });
     return adapter;
+  }
+
+  /**
+   * §7.3::2 — append a connection-wait sample and drop everything older than
+   * one burst window.
+   */
+  private recordConnectionWait(tenantId: string, durationMs: number): void {
+    const now = Date.now();
+    const samples = this.connectionWaitSamples.get(tenantId) ?? [];
+    samples.push({ at: now, durationMs });
+
+    const cutoff = now - this.config.burstWindowMs;
+    while (samples.length > 0 && samples[0].at < cutoff) {
+      samples.shift();
+    }
+
+    this.connectionWaitSamples.set(tenantId, samples);
+  }
+
+  /**
+   * §7.3::2 — p95 of the in-window connection waits for a tenant. Returns 0
+   * when there is no traffic, so an idle tenant never trips the scale-up
+   * threshold.
+   */
+  connectionWaitP95(tenantId: string): number {
+    const samples = this.connectionWaitSamples.get(tenantId) ?? [];
+    if (samples.length === 0) return 0;
+
+    const values = samples.map((s) => s.durationMs).sort((a, b) => a - b);
+    const index = Math.min(values.length - 1, Math.ceil(values.length * 0.95) - 1);
+    return values[Math.max(0, index)];
   }
 
   /**
@@ -308,6 +355,24 @@ export class AdaptivePool {
   private startCleanup(): void {
     this.cleanupTimer = setInterval(() => {
       const now = Date.now();
+
+      // §7.3::2 — scale UP on p95(connectionWait) > scaleUpThresholdMs, before
+      // the idle scale-down below. Scaling up means entering burst: the tenant
+      // ceiling rises from perTenantBaseConnections to
+      // min(base * burstMultiplier, perTenantMaxConnections) for one
+      // burstWindowMs (enableBurst re-arms its own expiry timer).
+      for (const tenantId of this.tenantCounts.keys()) {
+        const p95 = this.connectionWaitP95(tenantId);
+        if (p95 > this.config.scaleUpThresholdMs) {
+          this.enableBurst(tenantId);
+          log.debug('pool scaled up on connection-wait p95', {
+            tenantId,
+            p95ConnectionWaitMs: p95,
+            thresholdMs: this.config.scaleUpThresholdMs,
+          });
+        }
+      }
+
       const toRemove: string[] = [];
 
       for (const [key, entry] of this.connections) {
@@ -325,6 +390,9 @@ export class AdaptivePool {
         const count = (this.tenantCounts.get(entry.tenantId) ?? 1) - 1;
         if (count <= 0) {
           this.tenantCounts.delete(entry.tenantId);
+          // §7.3::2 — the tenant has no connections left; drop its wait-sample
+          // window so an idle tenant's samples cannot accumulate unbounded.
+          this.connectionWaitSamples.delete(entry.tenantId);
         } else {
           this.tenantCounts.set(entry.tenantId, count);
         }

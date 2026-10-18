@@ -40,7 +40,7 @@ export class O2CzSociodemoMCPServer extends MCPAdapterBase {
       name: 'o2-cz-sociodemo',
       displayName: 'O2 CZ Socio-demo API',
       version: '1.0.0',
-      category: 'analytics',
+      category: 'data',
       keywords: [
         'o2', 'o2-cz', 'czech', 'czech republic', 'sociodemo', 'socio-demo',
         'demographics', 'age', 'gender', 'location', 'presence',

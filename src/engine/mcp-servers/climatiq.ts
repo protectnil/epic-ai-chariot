@@ -42,7 +42,7 @@ export class ClimatiqMCPServer extends MCPAdapterBase {
       displayName: 'Climatiq Carbon Footprint',
       version: '1.0.0',
       type: 'rest' as const,
-      category: 'environment',
+      category: 'science',
       keywords: [
         'climatiq', 'carbon', 'carbon footprint', 'emissions', 'co2', 'co2e',
         'greenhouse gas', 'ghg', 'climate', 'sustainability', 'emission factors',

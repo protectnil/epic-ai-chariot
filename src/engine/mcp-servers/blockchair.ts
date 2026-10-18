@@ -48,7 +48,7 @@ export class BlockchairMCPServer extends MCPAdapterBase {
       name: 'blockchair',
       displayName: 'Blockchair — Multi-Chain Block Explorer',
       version: '1.0.0',
-      category: 'crypto',
+      category: 'blockchain',
       keywords: [
         'blockchair', 'blockchain', 'bitcoin', 'ethereum', 'crypto',
         'block explorer', 'transaction', 'address', 'block', 'chain stats',

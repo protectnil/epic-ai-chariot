@@ -35,7 +35,7 @@ export class QuotableMCPServer extends MCPAdapterBase {
       name: 'quotable',
       displayName: 'Quotable',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'quotes', 'quotable', 'random quote', 'inspirational', 'authors',
         'wisdom', 'tags', 'search quotes', 'motivational', 'sayings',

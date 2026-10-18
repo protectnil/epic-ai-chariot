@@ -25,8 +25,34 @@ export interface AnomalySignal {
   toolName: string;
   /** True for tool calls that mutate / delete / write. */
   destructive: boolean;
+  /**
+   * True when the acting token/principal's GRANTED scope for this call was
+   * read-only. Required (not optional/inferred) — a scope-violation rule
+   * needs to distinguish "read-only actor ran a destructive call" (a single-
+   * event security violation) from "write-scoped actor ran a destructive
+   * call" (expected). Callers MUST supply the actual granted-scope value
+   * from the authorization decision; never default/guess it.
+   */
+  grantedReadOnly: boolean;
+  /** Client source IP for the call, when known. Optional — not all
+   * transports capture it (e.g. in-process/local dispatch). */
+  sourceIp?: string;
   /** Optional structured detail (no inference; pass-through). */
   detail?: Record<string, unknown>;
+  /**
+   * §8.9::11 — request-scoped principal identity carried from the
+   * authenticated boundary through dispatch. Absent on the unauthenticated
+   * OSS/local path (no roles asserted). Rules requiring role- or
+   * attribute-sensitive behavior read it here; none of the current built-in
+   * rules consumes it yet, so it is carried and audited, not load-bearing.
+   */
+  tenantContext?: {
+    tenantId: string;
+    principalId: string;
+    roles: string[];
+    tier: 'free' | 'pro' | 'enterprise';
+    attributes: Record<string, string>;
+  };
 }
 
 export type AnomalySeverity = 'info' | 'warning' | 'urgent' | 'critical';

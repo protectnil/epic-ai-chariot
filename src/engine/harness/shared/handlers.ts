@@ -5,11 +5,13 @@
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
-import { SLEEP_MAX } from '../types.js';
 import { SEED, SeededRandom } from './seed.js';
+import { createShadowRecords, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, type ShadowRecord } from './fixtures.js';
 import type { HarnessProfile } from '../types.js';
 
-const MALFORMED_VARIANTS: unknown[] = [
+// CHARIOT::§8.11::2::error-handling — deterministic malformed/partial/redaction/
+// injection payload variants (CHARIOT-SPEC.md:824).
+const ERROR_HANDLING_VARIANTS: unknown[] = [
   // Variant 0: missing required fields
   { partial: true, data: { id: null, status: undefined } },
   // Variant 1: wrong types
@@ -32,16 +34,29 @@ const MALFORMED_VARIANTS: unknown[] = [
 ];
 
 export interface HandlerState {
-  counter: number;
   profile: HarnessProfile;
+  /** Shadow store — never the real vendor's data. Reseeded deterministically on start()/reset(). */
+  records: Map<string, ShadowRecord>;
+  /** Monotonic id source for write-shadow creates, deterministic per handler-state lifetime. */
+  nextRecordSeq: number;
 }
 
+// CHARIOT::§8.11::2 — shadow store is reseeded from the seed-1337 mulberry32
+// fixture generator on every createHandlerState()/resetHandlerState() call so
+// each profile run (and each test) starts from identical deterministic data.
 export function createHandlerState(profile: HarnessProfile): HandlerState {
-  return { counter: 0, profile };
+  const seeded = createShadowRecords();
+  return {
+    profile,
+    records: new Map(seeded.map(r => [r.id, r])),
+    nextRecordSeq: seeded.length,
+  };
 }
 
 export function resetHandlerState(state: HandlerState): void {
-  state.counter = 0;
+  const seeded = createShadowRecords();
+  state.records = new Map(seeded.map(r => [r.id, r]));
+  state.nextRecordSeq = seeded.length;
 }
 
 export interface HandlerResult {
@@ -55,74 +70,101 @@ export async function handleTool(
   state: HandlerState,
 ): Promise<HandlerResult> {
   switch (name) {
-    case 'echo':
-      return { content: { message: args.message }, isError: false };
-
-    case 'sleep': {
-      const ms = Math.min(Number(args.ms) || 0, SLEEP_MAX);
-      await new Promise(resolve => setTimeout(resolve, ms));
-      return { content: { slept: ms }, isError: false };
+    // CHARIOT::§8.11::2::1 — "list"
+    case 'list': {
+      const all = [...state.records.values()];
+      const offset = Math.max(0, Number(args.offset) || 0);
+      const limitArg = typeof args.limit === 'number' ? args.limit : LIST_DEFAULT_LIMIT;
+      const limit = Math.min(Math.max(1, limitArg), LIST_MAX_LIMIT);
+      const page = all.slice(offset, offset + limit);
+      const hasMore = offset + limit < all.length;
+      return {
+        content: { data: page, pagination: { offset, limit, total: all.length, hasMore } },
+        isError: false,
+      };
     }
 
-    case 'fail':
+    // CHARIOT::§8.11::2::2 — "search"
+    case 'search': {
+      const query = typeof args.query === 'string' ? args.query : '';
+      const lowered = query.toLowerCase();
+      const matches = [...state.records.values()].filter(
+        r => r.title.toLowerCase().includes(lowered) || r.severity.toLowerCase() === lowered,
+      );
+      return { content: { data: matches, matched: matches.length }, isError: false };
+    }
+
+    // CHARIOT::§8.11::2::3 — "read"
+    case 'read': {
+      const id = typeof args.id === 'string' ? args.id : '';
+      const record = state.records.get(id);
+      if (!record) {
+        return { content: { code: 'NOT_FOUND', message: `No record with id ${id}` }, isError: true };
+      }
+      return { content: record, isError: false };
+    }
+
+    // CHARIOT::§8.11::2::4 — "write-shadow" (writes only the harness's own
+    // shadow store, never a real vendor resource)
+    case 'write-shadow': {
+      const fields = (args.fields && typeof args.fields === 'object' ? args.fields : {}) as Partial<ShadowRecord>;
+      const id = typeof args.id === 'string' ? args.id : `SHADOW-${state.nextRecordSeq++}`;
+      const existing = state.records.get(id);
+      const record: ShadowRecord = {
+        id,
+        severity: fields.severity ?? existing?.severity ?? 'medium',
+        title: fields.title ?? existing?.title ?? `Shadow record ${id}`,
+        cvss: typeof fields.cvss === 'number' ? fields.cvss : existing?.cvss ?? 0,
+      };
+      state.records.set(id, record);
+      return { content: { created: !existing, record }, isError: false };
+    }
+
+    // CHARIOT::§8.11::2::5 — "delete-shadow" (deletes only the harness's own
+    // shadow store, never a real vendor resource)
+    case 'delete-shadow': {
+      const id = typeof args.id === 'string' ? args.id : '';
+      const existed = state.records.delete(id);
+      if (!existed) {
+        return { content: { code: 'NOT_FOUND', message: `No record with id ${id}` }, isError: true };
+      }
+      return { content: { deleted: true, id }, isError: false };
+    }
+
+    // CHARIOT::§8.11::2::6 — "error-handling"
+    case 'error-handling': {
+      const rng = new SeededRandom(SEED);
+      const variant = typeof args.variant === 'number'
+        ? Math.max(0, Math.min(args.variant, ERROR_HANDLING_VARIANTS.length - 1))
+        : rng.nextInt(0, ERROR_HANDLING_VARIANTS.length - 1);
+      return { content: ERROR_HANDLING_VARIANTS[variant], isError: false };
+    }
+
+    // CHARIOT::§8.11::2::7 — "auth-failure": deterministic structured
+    // authentication-failure result, independent of the transport's own
+    // (real) auth gate, so callers can exercise auth-failure handling on a
+    // successfully-authenticated connection.
+    case 'auth-failure':
       return {
         content: {
-          code: 'HARNESS_FAIL',
-          message: typeof args.reason === 'string' ? args.reason : 'Intentional harness failure',
+          code: 'AUTH_FAILURE',
+          message: 'Simulated authentication failure',
           timestamp: new Date().toISOString(),
         },
         isError: true,
       };
 
-    case 'malformed': {
-      const rng = new SeededRandom(SEED);
-      const variant = typeof args.variant === 'number'
-        ? Math.max(0, Math.min(args.variant, MALFORMED_VARIANTS.length - 1))
-        : rng.nextInt(0, MALFORMED_VARIANTS.length - 1);
-      return { content: MALFORMED_VARIANTS[variant], isError: false };
-    }
-
-    case 'approval_target':
+    // CHARIOT::§8.11::2::8 — "rate-limit": deterministic structured
+    // rate-limit-exceeded result with a fixed retry-after, so callers can
+    // exercise backoff/retry handling deterministically.
+    case 'rate-limit':
       return {
         content: {
-          action: args.action,
-          approved: true,
-          executedAt: new Date().toISOString(),
+          code: 'RATE_LIMIT_EXCEEDED',
+          message: 'Simulated rate limit exceeded',
+          retryAfter: 1,
         },
-        isError: false,
-      };
-
-    case 'multi_step': {
-      const step = Number(args.step) || 1;
-      if (step === 1) {
-        return {
-          content: {
-            nextTool: 'echo',
-            nextArgs: { message: 'follow-up from multi_step' },
-            step: 1,
-            done: false,
-          },
-          isError: false,
-        };
-      }
-      return {
-        content: { step, done: true, summary: 'Multi-step sequence complete' },
-        isError: false,
-      };
-    }
-
-    case 'stateful_counter':
-      state.counter++;
-      return { content: { count: state.counter }, isError: false };
-
-    case 'ping':
-      return {
-        content: {
-          status: 'ok',
-          backend: state.profile,
-          timestamp: new Date().toISOString(),
-        },
-        isError: false,
+        isError: true,
       };
 
     default:

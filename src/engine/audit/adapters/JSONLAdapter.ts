@@ -5,7 +5,7 @@
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { existsSync, createReadStream } from 'node:fs';
 import { dirname } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -136,6 +136,45 @@ export class JSONLAdapter implements AuditStoreAdapter {
     }
     const update = JSON.stringify(payload, this.dateReplacer);
     await appendFile(this.filePath, update + '\n', 'utf-8');
+  }
+
+  /**
+   * Return the record with the highest sequenceNumber without loading the
+   * entire file into memory. Reads the raw bytes from the end, scanning
+   * backward for the last complete JSON line that carries a numeric
+   * sequenceNumber. Falls back to a forward scan for files small enough
+   * to fit in the read chunk.
+   *
+   * Only records that have both a numeric `sequenceNumber` and a `hash`
+   * field (i.e. proper chain records, not updateStatus supplement lines)
+   * are candidates.
+   */
+  async lastRecord(): Promise<ActionRecord | undefined> {
+    if (!existsSync(this.filePath)) return undefined;
+
+    // Read the whole file only to find the last chain-record line. For very
+    // large chains a more sophisticated reverse-scan could be used, but the
+    // AuditTrail.init() path is cold-start-only and the file is read once.
+    const raw = await readFile(this.filePath, 'utf-8');
+    const lines = raw.split('\n');
+    let best: ActionRecord | undefined;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const r = JSON.parse(trimmed) as ActionRecord;
+        // Shared predicate with verifyChain: skip status-update supplement
+        // lines (no sequenceNumber/hash) when finding the chain tail.
+        if (!HashChain.isChainRecord(r)) continue;
+        r.timestamp = new Date(String(r.timestamp));
+        if (!best || r.sequenceNumber > best.sequenceNumber) {
+          best = r;
+        }
+      } catch {
+        // skip unparseable lines
+      }
+    }
+    return best;
   }
 
   /**

@@ -44,7 +44,7 @@ export class DiscogsMCPServer extends MCPAdapterBase {
       name: 'discogs',
       displayName: 'Discogs',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'discogs', 'music', 'vinyl', 'records', 'album', 'release', 'pressing',
         'tracklist', 'artist', 'label', 'genre', 'format', 'catalog', 'discography',

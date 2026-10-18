@@ -74,6 +74,16 @@ export const MAX_OVERRIDE_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const MIN_JUSTIFICATION_LENGTH = 20;
 
+/**
+ * Maximum tolerated skew between a caller-supplied `issuedAt`
+ * and the server clock. `issuedAt` exists for testability and
+ * request-time stamping, NOT for scheduling: a future-dated
+ * issuedAt would shift `expiresAt = issuedAt + durationMs`
+ * arbitrarily far forward and bypass MAX_OVERRIDE_DURATION_MS
+ * entirely, so anything beyond small clock skew is rejected.
+ */
+export const MAX_ISSUED_AT_SKEW_MS = 5 * 60 * 1000;
+
 // ─── Store ──────────────────────────────────────────────────────────────
 
 /**
@@ -100,8 +110,15 @@ export class TenantDemotionOverrideStore {
 
   /**
    * Issue a new override. Throws if the duration exceeds
-   * the ceiling or the justification is too short. Always
-   * appends to the history; never mutates prior records.
+   * the ceiling, the justification is too short, or the
+   * supplied `issuedAt` deviates from the server clock by
+   * more than MAX_ISSUED_AT_SKEW_MS (a future-dated
+   * issuedAt would extend the effective override window
+   * past the MAX_OVERRIDE_DURATION_MS ceiling). Appends to
+   * the history and revokes any currently-active override
+   * for the same (tenant, adapter) pair (supersede-on-
+   * reissue) so at most one record is active per pair;
+   * superseded records remain in the history for audit.
    */
   issue(inputs: IssueOverrideInputs): TenantDemotionOverride {
     if (inputs.durationMs <= 0) {
@@ -112,6 +129,20 @@ export class TenantDemotionOverrideStore {
         `override duration exceeds ceiling (${MAX_OVERRIDE_DURATION_MS}ms)`,
       );
     }
+    const issuedAtMs = inputs.issuedAt.getTime();
+    if (!Number.isFinite(issuedAtMs)) {
+      throw new Error('override issuedAt must be a valid Date');
+    }
+    // Anchor the lifecycle to the server clock: expiresAt is
+    // derived from issuedAt, so an unchecked future issuedAt
+    // silently bypasses the duration ceiling (spec §10.10).
+    if (Math.abs(issuedAtMs - Date.now()) > MAX_ISSUED_AT_SKEW_MS) {
+      throw new Error(
+        'override issuedAt must be the current time ' +
+          `(±${MAX_ISSUED_AT_SKEW_MS}ms); future/past-dated overrides ` +
+          'would bypass the duration ceiling',
+      );
+    }
     const justification = (inputs.justification ?? '').trim();
     if (justification.length < MIN_JUSTIFICATION_LENGTH) {
       throw new Error(
@@ -119,12 +150,21 @@ export class TenantDemotionOverrideStore {
       );
     }
     const canonical = canonicalName(inputs.adapterName);
+    // Supersede-on-reissue: guarantee at most one ACTIVE record
+    // per (tenant, adapter) pair so a later revoke() cannot leave
+    // an older concurrent record live. History is preserved.
+    this.revoke(
+      inputs.tenantId,
+      canonical,
+      `superseded-by-reissue:${inputs.issuedBy}`,
+      inputs.issuedAt,
+    );
     const record: TenantDemotionOverride = {
       tenantId: inputs.tenantId,
       adapterName: canonical,
       issuedBy: inputs.issuedBy,
       issuedAt: inputs.issuedAt,
-      expiresAt: new Date(inputs.issuedAt.getTime() + inputs.durationMs),
+      expiresAt: new Date(issuedAtMs + inputs.durationMs),
       justification,
       revokedAt: null,
     };
@@ -153,6 +193,9 @@ export class TenantDemotionOverrideStore {
       if (record.adapterName !== canonical) continue;
       if (record.revokedAt) continue;
       if (record.expiresAt.getTime() <= now.getTime()) continue;
+      // Defense in depth: a record is never active before its
+      // own issuedAt (a future-dated record must not exempt now).
+      if (record.issuedAt.getTime() > now.getTime()) continue;
       return record;
     }
     return null;
@@ -167,22 +210,27 @@ export class TenantDemotionOverrideStore {
   }
 
   /**
-   * Revoke the currently-active override for a (tenant,
-   * adapter) pair. Idempotent — if no active (unrevoked,
-   * unexpired) override exists, it's a no-op. A newer
-   * record that is already expired or already revoked is
-   * SKIPPED: revoke() walks the history looking for the
-   * most recent record that is still active and stamps
-   * that one. Older entries remain historical and are
-   * never mutated.
+   * Revoke ALL currently-active overrides for a (tenant,
+   * adapter) pair. Revocation means "no active override
+   * remains" — if the history contains multiple concurrent
+   * active records (e.g. legacy data predating supersede-
+   * on-reissue), every one of them is stamped; stamping
+   * only the newest would leave an older record silently
+   * exempting the adapter. Idempotent — if no active
+   * (unrevoked, unexpired) override exists, it's a no-op.
+   * Already-expired or already-revoked records are never
+   * mutated.
+   *
+   * @returns the number of records revoked (0 = no-op).
    */
   revoke(
     tenantId: string,
     adapterName: string,
     revokedBy: string,
     revokedAt: Date,
-  ): void {
+  ): number {
     const canonical = canonicalName(adapterName);
+    let revokedCount = 0;
     for (let i = this.history.length - 1; i >= 0; i--) {
       const record = this.history[i];
       if (!record) continue;
@@ -194,8 +242,9 @@ export class TenantDemotionOverrideStore {
       }
       record.revokedAt = revokedAt;
       record.revokedBy = revokedBy;
-      return;
+      revokedCount++;
     }
+    return revokedCount;
   }
 
   /**
@@ -230,6 +279,8 @@ export class TenantDemotionOverrideStore {
       if (seen.has(record.adapterName)) continue;
       if (record.revokedAt) continue;
       if (record.expiresAt.getTime() <= now.getTime()) continue;
+      // Defense in depth: not yet active before its own issuedAt.
+      if (record.issuedAt.getTime() > now.getTime()) continue;
       // Only mark as "seen" once we've confirmed this
       // record is actually active. Otherwise an older
       // active record for the same adapter would be

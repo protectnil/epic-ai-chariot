@@ -28,7 +28,7 @@ export class DblpMCPServer extends MCPAdapterBase {
       name: 'dblp',
       displayName: 'DBLP Computer Science Bibliography',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'dblp', 'computer science', 'bibliography', 'publications', 'papers',
         'authors', 'venues', 'conferences', 'journals', 'academic', 'research',

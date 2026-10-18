@@ -64,7 +64,7 @@ export class HttpCatMCPServer extends MCPAdapterBase {
       name: 'httpcat',
       displayName: 'HTTP Cat',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'http', 'cat', 'cats', 'status code', 'http status', 'error code',
         'http error', 'meme', 'image', 'fun', '404', '500',

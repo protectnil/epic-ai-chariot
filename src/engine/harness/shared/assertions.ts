@@ -8,14 +8,18 @@
 import type { HarnessBackend, AssertionResult } from '../types.js';
 import { CANONICAL_TOOL_NAMES } from './toolDefs.js';
 import {
-  ECHO_PAYLOAD, ECHO_EXPECTED,
-  SLEEP_PAYLOAD, SLEEP_EXPECTED,
-  SLEEP_OVER_MAX_PAYLOAD, SLEEP_OVER_MAX_EXPECTED,
-  FAIL_PAYLOAD, FAIL_EXPECTED_CODE,
-  MALFORMED_PAYLOAD_INJECTION,
-  APPROVAL_PAYLOAD,
-  MULTI_STEP_PAYLOAD_1, MULTI_STEP_PAYLOAD_2,
-  PING_EXPECTED_STATUS,
+  LIST_DEFAULT_LIMIT,
+  SEARCH_PAYLOAD_MATCH,
+  SEARCH_PAYLOAD_SEVERITY,
+  SEARCH_PAYLOAD_NO_MATCH,
+  READ_PAYLOAD_MISSING,
+  WRITE_SHADOW_PAYLOAD_CREATE,
+  WRITE_SHADOW_PAYLOAD_UPDATE_FIELDS,
+  DELETE_SHADOW_PAYLOAD_MISSING,
+  ERROR_HANDLING_PAYLOAD_REDACTION,
+  ERROR_HANDLING_PAYLOAD_INJECTION,
+  AUTH_FAILURE_EXPECTED_CODE,
+  RATE_LIMIT_EXPECTED_CODE,
 } from './fixtures.js';
 
 type AssertFn = (backend: HarnessBackend) => Promise<void>;
@@ -40,9 +44,11 @@ function assertTruthy(value: unknown, message: string): void {
 }
 
 const TESTS: TestCase[] = [
-  // Tool discovery
+  // Tool discovery — CHARIOT::§8.11::2 (CHARIOT-SPEC.md:824): registered tool
+  // names must equal exactly {list, search, read, write-shadow,
+  // delete-shadow, error-handling, auth-failure, rate-limit}, no more no less.
   {
-    name: 'listTools returns all 8 canonical tools',
+    name: 'listTools returns exactly the 8 canonical tools',
     fn: async (b) => {
       const tools = await b.listTools();
       const names = tools.map(t => t.name).sort();
@@ -60,157 +66,191 @@ const TESTS: TestCase[] = [
     },
   },
 
-  // Echo
+  // list
   {
-    name: 'echo returns input unchanged',
+    name: 'list returns a page of shadow records with pagination metadata',
     fn: async (b) => {
-      const result = await b.callTool('echo', ECHO_PAYLOAD);
-      assertEqual(result.isError, false, 'echo isError');
-      assertEqual(result.content, ECHO_EXPECTED, 'echo content');
+      const result = await b.callTool('list', {});
+      assertEqual(result.isError, false, 'list isError');
+      const content = result.content as { data: unknown[]; pagination: { offset: number; limit: number; total: number } };
+      assertEqual(content.data.length, LIST_DEFAULT_LIMIT, 'list default page size');
+      assertEqual(content.pagination.offset, 0, 'list default offset');
+      assertTruthy(content.pagination.total >= LIST_DEFAULT_LIMIT, 'list total records');
+    },
+  },
+  {
+    name: 'list respects offset/limit',
+    fn: async (b) => {
+      const result = await b.callTool('list', { offset: 2, limit: 3 });
+      assertEqual(result.isError, false, 'list-paged isError');
+      const content = result.content as { data: Array<{ id: string }>; pagination: { offset: number; limit: number } };
+      assertEqual(content.data.length, 3, 'list-paged page size');
+      assertEqual(content.pagination.offset, 2, 'list-paged offset echoed');
     },
   },
 
-  // Sleep
+  // search
   {
-    name: 'sleep delays for the specified duration',
+    name: 'search matches by title substring',
     fn: async (b) => {
-      const result = await b.callTool('sleep', SLEEP_PAYLOAD);
-      assertEqual(result.isError, false, 'sleep isError');
-      assertEqual(result.content, SLEEP_EXPECTED, 'sleep content');
-      if (result.durationMs < 50) {
-        throw new Error(`sleep duration too short: ${result.durationMs}ms (expected >= 50ms for 100ms sleep)`);
-      }
+      const result = await b.callTool('search', SEARCH_PAYLOAD_MATCH);
+      assertEqual(result.isError, false, 'search isError');
+      const content = result.content as { data: Array<{ title: string }>; matched: number };
+      assertTruthy(content.matched > 0, 'search has matches');
+      assertTruthy(content.data.every(r => r.title.includes('Vulnerability 1')), 'search results match query');
     },
   },
   {
-    name: 'sleep clamps to max 5000ms',
+    name: 'search matches by exact severity',
     fn: async (b) => {
-      const result = await b.callTool('sleep', SLEEP_OVER_MAX_PAYLOAD);
-      assertEqual(result.isError, false, 'sleep-over-max isError');
-      assertEqual(result.content, SLEEP_OVER_MAX_EXPECTED, 'sleep-over-max content');
+      const result = await b.callTool('search', SEARCH_PAYLOAD_SEVERITY);
+      assertEqual(result.isError, false, 'search-severity isError');
+      const content = result.content as { data: Array<{ severity: string }> };
+      assertTruthy(content.data.every(r => r.severity === 'critical'), 'search-severity results match');
     },
   },
-
-  // Fail
   {
-    name: 'fail returns structured error',
+    name: 'search returns empty for no match',
     fn: async (b) => {
-      const result = await b.callTool('fail', FAIL_PAYLOAD);
-      assertEqual(result.isError, true, 'fail isError');
-      const content = result.content as Record<string, unknown>;
-      assertEqual(content.code, FAIL_EXPECTED_CODE, 'fail error code');
-      assertTruthy(content.message, 'fail has message');
-      assertTruthy(content.timestamp, 'fail has timestamp');
+      const result = await b.callTool('search', SEARCH_PAYLOAD_NO_MATCH);
+      assertEqual(result.isError, false, 'search-no-match isError');
+      const content = result.content as { data: unknown[]; matched: number };
+      assertEqual(content.matched, 0, 'search-no-match matched count');
+      assertEqual(content.data.length, 0, 'search-no-match data empty');
     },
   },
 
-  // Malformed
+  // read
   {
-    name: 'malformed returns parseable but invalid data',
+    name: 'read returns a single record by id',
     fn: async (b) => {
-      const result = await b.callTool('malformed', { variant: 0 });
-      assertEqual(result.isError, false, 'malformed isError');
-      const content = result.content as Record<string, unknown>;
-      assertEqual(content.partial, true, 'malformed has partial flag');
+      const list = await b.callTool('list', { limit: 1 });
+      const first = (list.content as { data: Array<{ id: string }> }).data[0];
+      const result = await b.callTool('read', { id: first.id });
+      assertEqual(result.isError, false, 'read isError');
+      const content = result.content as { id: string };
+      assertEqual(content.id, first.id, 'read returns requested record');
     },
   },
   {
-    name: 'malformed variant 2 includes sensitive keys for redaction testing',
+    name: 'read returns NOT_FOUND for missing id',
     fn: async (b) => {
-      const result = await b.callTool('malformed', MALFORMED_PAYLOAD_INJECTION);
-      assertEqual(result.isError, false, 'malformed-redaction isError');
+      const result = await b.callTool('read', READ_PAYLOAD_MISSING);
+      assertEqual(result.isError, true, 'read-missing isError');
       const content = result.content as Record<string, unknown>;
-      // Verify sensitive keys exist (for redaction testing upstream)
+      assertEqual(content.code, 'NOT_FOUND', 'read-missing error code');
+    },
+  },
+
+  // write-shadow
+  {
+    name: 'write-shadow creates a new record when no id given',
+    fn: async (b) => {
+      const result = await b.callTool('write-shadow', WRITE_SHADOW_PAYLOAD_CREATE);
+      assertEqual(result.isError, false, 'write-shadow-create isError');
+      const content = result.content as { created: boolean; record: { id: string; title: string } };
+      assertEqual(content.created, true, 'write-shadow-create created flag');
+      assertEqual(content.record.title, WRITE_SHADOW_PAYLOAD_CREATE.fields.title, 'write-shadow-create title');
+
+      // The written record must be visible via read (shadow store, not the real vendor).
+      const read = await b.callTool('read', { id: content.record.id });
+      assertEqual(read.isError, false, 'write-shadow-create readback isError');
+    },
+  },
+  {
+    name: 'write-shadow updates an existing record by id',
+    fn: async (b) => {
+      const list = await b.callTool('list', { limit: 1 });
+      const first = (list.content as { data: Array<{ id: string }> }).data[0];
+      const result = await b.callTool('write-shadow', { id: first.id, ...WRITE_SHADOW_PAYLOAD_UPDATE_FIELDS });
+      assertEqual(result.isError, false, 'write-shadow-update isError');
+      const content = result.content as { created: boolean; record: { id: string; title: string } };
+      assertEqual(content.created, false, 'write-shadow-update created flag');
+      assertEqual(content.record.title, WRITE_SHADOW_PAYLOAD_UPDATE_FIELDS.fields.title, 'write-shadow-update title');
+    },
+  },
+
+  // delete-shadow
+  {
+    name: 'delete-shadow removes an existing record',
+    fn: async (b) => {
+      const created = await b.callTool('write-shadow', WRITE_SHADOW_PAYLOAD_CREATE);
+      const id = (created.content as { record: { id: string } }).record.id;
+      const result = await b.callTool('delete-shadow', { id });
+      assertEqual(result.isError, false, 'delete-shadow isError');
+      const content = result.content as { deleted: boolean };
+      assertEqual(content.deleted, true, 'delete-shadow deleted flag');
+
+      const read = await b.callTool('read', { id });
+      assertEqual(read.isError, true, 'delete-shadow readback is NOT_FOUND');
+    },
+  },
+  {
+    name: 'delete-shadow returns NOT_FOUND for missing id',
+    fn: async (b) => {
+      const result = await b.callTool('delete-shadow', DELETE_SHADOW_PAYLOAD_MISSING);
+      assertEqual(result.isError, true, 'delete-shadow-missing isError');
+      const content = result.content as Record<string, unknown>;
+      assertEqual(content.code, 'NOT_FOUND', 'delete-shadow-missing error code');
+    },
+  },
+
+  // error-handling
+  {
+    name: 'error-handling returns parseable but invalid data',
+    fn: async (b) => {
+      const result = await b.callTool('error-handling', { variant: 0 });
+      assertEqual(result.isError, false, 'error-handling isError');
+      const content = result.content as Record<string, unknown>;
+      assertEqual(content.partial, true, 'error-handling has partial flag');
+    },
+  },
+  {
+    name: 'error-handling variant 2 includes sensitive keys for redaction testing',
+    fn: async (b) => {
+      const result = await b.callTool('error-handling', ERROR_HANDLING_PAYLOAD_REDACTION);
+      assertEqual(result.isError, false, 'error-handling-redaction isError');
+      const content = result.content as Record<string, unknown>;
       const creds = content.credentials as Record<string, unknown>;
-      assertTruthy(creds?.apiKey, 'malformed has apiKey for redaction testing');
-      // Verify nested structure
+      assertTruthy(creds?.apiKey, 'error-handling has apiKey for redaction testing');
       const nested = content.nested as Record<string, unknown>;
       const deep = nested?.deep as Record<string, unknown>;
-      assertTruthy(deep?.secret, 'malformed has nested secret for redaction testing');
-      // Verify array
-      assertTruthy(Array.isArray(content.tokens), 'malformed has tokens array');
+      assertTruthy(deep?.secret, 'error-handling has nested secret for redaction testing');
+      assertTruthy(Array.isArray(content.tokens), 'error-handling has tokens array');
     },
   },
   {
-    name: 'malformed variant 3 includes injection lines for sanitization testing',
+    name: 'error-handling variant 3 includes injection lines for sanitization testing',
     fn: async (b) => {
-      const result = await b.callTool('malformed', { variant: 3 });
-      assertEqual(result.isError, false, 'malformed-injection isError');
-      // Variant 3 is a multi-line string with injection lines
+      const result = await b.callTool('error-handling', ERROR_HANDLING_PAYLOAD_INJECTION);
+      assertEqual(result.isError, false, 'error-handling-injection isError');
       const content = typeof result.content === 'string' ? result.content : String(result.content);
-      assertTruthy(content.includes('ignore previous instructions'), 'malformed has injection line');
-      assertTruthy(content.includes('Normal tool output'), 'malformed has normal lines');
+      assertTruthy(content.includes('ignore previous instructions'), 'error-handling has injection line');
+      assertTruthy(content.includes('Normal tool output'), 'error-handling has normal lines');
     },
   },
 
-  // Approval target
+  // auth-failure
   {
-    name: 'approval_target returns action confirmation',
+    name: 'auth-failure returns a structured authentication-failure error',
     fn: async (b) => {
-      const result = await b.callTool('approval_target', APPROVAL_PAYLOAD);
-      assertEqual(result.isError, false, 'approval_target isError');
+      const result = await b.callTool('auth-failure', {});
+      assertEqual(result.isError, true, 'auth-failure isError');
       const content = result.content as Record<string, unknown>;
-      assertEqual(content.action, APPROVAL_PAYLOAD.action, 'approval_target action');
-      assertEqual(content.approved, true, 'approval_target approved');
+      assertEqual(content.code, AUTH_FAILURE_EXPECTED_CODE, 'auth-failure error code');
+      assertTruthy(content.message, 'auth-failure has message');
     },
   },
 
-  // Multi-step
+  // rate-limit
   {
-    name: 'multi_step step 1 returns follow-up instruction',
+    name: 'rate-limit returns a structured rate-limit-exceeded error with retryAfter',
     fn: async (b) => {
-      const result = await b.callTool('multi_step', MULTI_STEP_PAYLOAD_1);
-      assertEqual(result.isError, false, 'multi_step step 1 isError');
+      const result = await b.callTool('rate-limit', {});
+      assertEqual(result.isError, true, 'rate-limit isError');
       const content = result.content as Record<string, unknown>;
-      assertEqual(content.nextTool, 'echo', 'multi_step nextTool');
-      assertEqual(content.done, false, 'multi_step step 1 not done');
-      assertTruthy(content.nextArgs, 'multi_step has nextArgs');
-    },
-  },
-  {
-    name: 'multi_step step 2 returns completion',
-    fn: async (b) => {
-      const result = await b.callTool('multi_step', MULTI_STEP_PAYLOAD_2);
-      assertEqual(result.isError, false, 'multi_step step 2 isError');
-      const content = result.content as Record<string, unknown>;
-      assertEqual(content.done, true, 'multi_step step 2 done');
-      assertEqual(content.step, 2, 'multi_step step number');
-    },
-  },
-
-  // Stateful counter
-  {
-    name: 'stateful_counter increments per call',
-    fn: async (b) => {
-      await b.reset();
-      const r1 = await b.callTool('stateful_counter', {});
-      const r2 = await b.callTool('stateful_counter', {});
-      const r3 = await b.callTool('stateful_counter', {});
-      assertEqual((r1.content as Record<string, unknown>).count, 1, 'counter call 1');
-      assertEqual((r2.content as Record<string, unknown>).count, 2, 'counter call 2');
-      assertEqual((r3.content as Record<string, unknown>).count, 3, 'counter call 3');
-    },
-  },
-  {
-    name: 'stateful_counter resets correctly',
-    fn: async (b) => {
-      await b.callTool('stateful_counter', {});
-      await b.reset();
-      const result = await b.callTool('stateful_counter', {});
-      assertEqual((result.content as Record<string, unknown>).count, 1, 'counter after reset');
-    },
-  },
-
-  // Ping
-  {
-    name: 'ping returns healthy status with backend identity',
-    fn: async (b) => {
-      const result = await b.callTool('ping', {});
-      assertEqual(result.isError, false, 'ping isError');
-      const content = result.content as Record<string, unknown>;
-      assertEqual(content.status, PING_EXPECTED_STATUS, 'ping status');
-      assertEqual(content.backend, b.profile, 'ping backend identity');
-      assertTruthy(content.timestamp, 'ping has timestamp');
+      assertEqual(content.code, RATE_LIMIT_EXPECTED_CODE, 'rate-limit error code');
+      assertTruthy(typeof content.retryAfter === 'number', 'rate-limit has numeric retryAfter');
     },
   },
 ];

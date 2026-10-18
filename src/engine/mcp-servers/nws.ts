@@ -36,7 +36,7 @@ export class NWSMCPServer extends MCPAdapterBase {
       name: 'nws',
       displayName: 'NWS — US National Weather Service',
       version: '1.0.0',
-      category: 'weather' as const,
+      category: 'science' as const,
       keywords: [
         'nws', 'national weather service', 'weather', 'forecast', 'alerts',
         'warnings', 'watches', 'advisories', 'severe weather', 'tornado',

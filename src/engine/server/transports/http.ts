@@ -12,18 +12,78 @@
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
-import { createServer } from 'node:http';
-import type { IncomingMessage, RequestListener, Server } from 'node:http';
+import type { IncomingMessage, RequestListener, Server as HttpServer } from 'node:http';
+import type { Server as HttpsServer } from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { TransportHandle } from '../TransportHandle.js';
+import { createHttpServer, applySlowlorisGuards } from './tlsServer.js';
+import type { TlsConfig } from './tlsServer.js';
+
+/**
+ * Maximum accepted request-body size (bytes) for a body-reading route
+ * (`/mcp` here; the sibling REST transport imports this). Mirrors
+ * MAX_RESPONSE_BYTES (1 MiB) in toolHandlers.ts — comfortably larger than
+ * MAX_ARG_PAYLOAD_BYTES (64 KiB) plus JSON-RPC envelope, while blocking the
+ * unbounded-buffer OOM/swap-exhaustion DoS (CHARIOT §22.1). The
+ * body is stream-counted and rejected with 413 BEFORE the whole payload is
+ * buffered, never read-then-checked.
+ */
+export const MAX_REQUEST_BYTES = 1_048_576;
+
+/**
+ * Read the request body into a string, aborting as soon as the byte count
+ * exceeds `cap`. Returns `{ ok: false }` on overflow (caller answers 413);
+ * the stream is paused so TCP backpressure stalls the sender instead of the
+ * process buffering an unbounded payload. A declared Content-Length over the
+ * cap is rejected up front without reading a byte.
+ */
+function readCappedBody(
+  req: IncomingMessage,
+  cap: number,
+): Promise<{ ok: true; body: string } | { ok: false }> {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > cap) {
+      req.pause();
+      resolve({ ok: false });
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > cap) {
+        settled = true;
+        req.pause();
+        resolve({ ok: false });
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!settled) {
+        settled = true;
+        resolve({ ok: true, body: Buffer.concat(chunks).toString('utf8') });
+      }
+    });
+    req.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+  });
+}
 
 /**
  * Verified per-request session derived from the bearer JWT. Carries the
  * RBAC claims (allowedOperations, userId) and tenant alongside the session
  * id so the per-request McpServer can enforce per-operation RBAC and
  * tenant isolation instead of falling back to a process-wide localMode
- * trust grant (bug-tracker-ref). `auth` mirrors CallContext.auth's shape.
+ * trust grant. `auth` mirrors CallContext.auth's shape.
  */
 export interface ResolvedMcpSession {
   /** Stable per-request session id (JWT jti) for the LLM06 surface-state gate. */
@@ -31,7 +91,7 @@ export interface ResolvedMcpSession {
   /** Verified tenant from the token — per-request, never the process-env tenant on this path. */
   tenantId: string;
   /** RBAC grants carried by the verified session. */
-  auth: { allowedOperations?: Record<string, string[]>; userId: string };
+  auth: { allowedOperations?: Record<string, string[]>; userId: string; isAdmin?: boolean };
 }
 
 /**
@@ -44,7 +104,7 @@ export interface ResolvedMcpSession {
  * tools registered; the transport calls server.connect on it once, handles
  * the request, then closes the transport on response close.
  */
-export type McpServerFactory = (session: ResolvedMcpSession | undefined) => McpServer;
+export type McpServerFactory = (session: ResolvedMcpSession | undefined, req: IncomingMessage) => McpServer;
 
 /**
  * Async session resolver. The caller (typically setup.ts) wires this to
@@ -74,6 +134,11 @@ export interface BindHttpOptions {
    * session derivation (legacy shared-secret mode).
    */
   resolveSessionId?: SessionIdResolver;
+  /**
+   * Optional TLS/mTLS config. Absent (default): plain node:http, unchanged
+   * from pre-mTLS behavior. See tlsServer.ts for cert/key/ca semantics.
+   */
+  tlsConfig?: TlsConfig;
 }
 
 /**
@@ -108,7 +173,7 @@ export async function bindHttp(port: number, opts: BindHttpOptions): Promise<Tra
     );
   }
 
-  const httpServer: Server = createServer((req, res) => {
+  const httpServer: HttpServer | HttpsServer = createHttpServer((req, res) => {
     void (async () => {
       const url = req.url ?? '';
 
@@ -215,8 +280,41 @@ export async function bindHttp(port: number, opts: BindHttpOptions): Promise<Tra
       // RBAC + tenant isolation; undefined in shared-bearer mode →
       // single-tenant loopback (the shared secret IS the trust boundary),
       // wired localMode:true with the process tenant — NOT anonymous
-      // deny-by-default (bug-tracker-ref).
-      const perRequestServer = opts.createMcpServer(resolvedSession);
+      // deny-by-default.
+      // CHARIOT §22.1: bound the request body BEFORE constructing
+      // the per-request server/transport so an oversized POST is rejected
+      // with 413 and is never buffered whole. Only POST carries a body; GET
+      // (SSE) / DELETE fall through to the SDK unchanged. The capped body is
+      // handed to the SDK as a pre-parsed body so it does not re-read the
+      // (already-consumed) stream. A body that is not valid JSON is passed
+      // through as the raw string so the SDK still emits its canonical
+      // -32700 parse-error response.
+      let parsedBody: unknown;
+      if (method === 'POST') {
+        let capped: { ok: true; body: string } | { ok: false };
+        try {
+          capped = await readCappedBody(req, MAX_REQUEST_BYTES);
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_request', error_description: 'failed to read request body' }));
+          return;
+        }
+        if (!capped.ok) {
+          res.writeHead(413, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'payload_too_large',
+            error_description: `/mcp request body exceeds ${MAX_REQUEST_BYTES} bytes`,
+          }));
+          return;
+        }
+        try {
+          parsedBody = JSON.parse(capped.body);
+        } catch {
+          parsedBody = capped.body;
+        }
+      }
+
+      const perRequestServer = opts.createMcpServer(resolvedSession, req);
       const perRequestTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
@@ -226,7 +324,11 @@ export async function bindHttp(port: number, opts: BindHttpOptions): Promise<Tra
       });
       try {
         await perRequestServer.connect(perRequestTransport);
-        await perRequestTransport.handleRequest(req, res);
+        if (method === 'POST') {
+          await perRequestTransport.handleRequest(req, res, parsedBody);
+        } else {
+          await perRequestTransport.handleRequest(req, res);
+        }
       } catch {
         if (!res.headersSent) {
           res.writeHead(500);
@@ -234,12 +336,10 @@ export async function bindHttp(port: number, opts: BindHttpOptions): Promise<Tra
         }
       }
     })();
-  });
+  }, opts.tlsConfig);
 
   // Defend against Slowloris-class attacks (slow-header, slow-body).
-  httpServer.headersTimeout = 10_000;
-  httpServer.requestTimeout = 30_000;
-  httpServer.keepAliveTimeout = 5_000;
+  applySlowlorisGuards(httpServer);
 
   const boundPort = await new Promise<number>((resolve, reject) => {
     httpServer.listen(port, () => {

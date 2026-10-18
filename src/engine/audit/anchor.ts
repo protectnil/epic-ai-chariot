@@ -29,8 +29,11 @@
  *   handler, not the per-record append loop. Putting it in the hot
  *   path would make every audit write block on TSA reachability.
  *
- * Persistence contract:
- *   <packageRoot>/audit/anchors/<chain-id>-<epoch>.tsr
+ * Persistence contract (CHARIOT::§9.8.2::5, CHARIOT::§9.8.2::6):
+ *   <anchor-store-dir>/anchor-<ISO8601-timestamp>-<shortHash>.tsr
+ *   - anchor-store-dir is CHARIOT_ANCHOR_STORE_PATH if set, else
+ *     <packageRoot>/audit/anchors/ (== ~/.epic-ai/audit/anchors/ by default).
+ *   - shortHash is the first 12 hex chars of the anchored chain-head hash.
  *   - Raw `TimeStampResp` DER bytes from the TSA. No re-encoding.
  *   - Mode 0o644 on the file, 0o755 on the directory.
  *   - One file per anchoring event. NEVER overwrite.
@@ -91,11 +94,42 @@ export interface AnchorVerifyResult {
   tsaTime?: Date;
   reason?: string;
   code?: string;
+  /**
+   * True when the .tsr parsed as a well-formed RFC-3161 token whose TSTInfo
+   * messageImprint equals the expected head hash, but NO cryptographic
+   * signature verification was performed (no pinned TSA cert supplied).
+   * This is NOT a verified anchor — an active forger controls the .tsr bytes
+   * and can synthesize a structurally-consistent token — so `valid` stays
+   * false. Callers may surface it as "structurally consistent, unverified".
+   */
+  structurallyConsistent?: boolean;
 }
 
 const ID_CONTENT_TYPE = '1.2.840.113549.1.9.3';
 const ID_CT_TST_INFO = '1.2.840.113549.1.9.16.1.4';
 const SHA256_OID = '2.16.840.1.101.3.4.2.1';
+const SHA384_OID = '2.16.840.1.101.3.4.2.2';
+const SHA512_OID = '2.16.840.1.101.3.4.2.3';
+
+/**
+ * CH-46 — TSA digest-agnostic verify. The CMS SignerInfo digestAlgorithm is
+ * the TSA's own choice, NOT something Chariot dictates: §9.8.2 line 829 "MUST
+ * NOT dictate a specific TSA". Freetsa signs with SHA-512; DigiCert/Sectigo
+ * commonly SHA-256/384. Hard-pinning SHA-256 here false-rejected every
+ * SHA-384/512 TSA token. Map the OID the token actually carries to the
+ * node:crypto hash name and use THAT for the messageDigest recompute and the
+ * RSA/ECDSA signature verify. An OID outside this set is rejected with a clear
+ * reason rather than silently treated as SHA-256.
+ *
+ * NOTE: this is distinct from the TSTInfo messageImprint hashAlgorithm (the
+ * hash OVER the chain head), which stays SHA-256 because buildTimeStampReq
+ * always sends a 32-byte SHA-256 head imprint — the TSA echoes it back.
+ */
+const CMS_DIGEST_OID_TO_HASH: Readonly<Record<string, 'sha256' | 'sha384' | 'sha512'>> = {
+  [SHA256_OID]: 'sha256',
+  [SHA384_OID]: 'sha384',
+  [SHA512_OID]: 'sha512',
+};
 
 function parseDerNode(buf: Buffer, offset = 0): { tag: number; len: number; value: Buffer; end: number } {
   const tag = buf[offset];
@@ -227,10 +261,6 @@ function parseTstInfo(tstInfoDer: Buffer): { hashAlgorithm: string; hashedMessag
   };
 }
 
-function parseCertPublicKey(certPem: string) {
-  return new X509Certificate(certPem).publicKey;
-}
-
 /**
  * Manually parse an RFC-5652 SignedData TLV body and verify the
  * SignerInfo signature against a pinned TSA public key.
@@ -241,7 +271,7 @@ function parseCertPublicKey(certPem: string) {
  */
 function verifySignedDataCms(
   signedDataValue: Buffer,
-  pubKey: ReturnType<typeof parseCertPublicKey>,
+  pubKey: X509Certificate['publicKey'],
 ): { ok: true; tstInfoDer: Buffer; eContent: Buffer } | { ok: false; reason: string } {
   // SignedData ::= SEQUENCE { version, digestAlgorithms SET,
   //   encapContentInfo, certificates [0] IMPLICIT optional,
@@ -305,8 +335,14 @@ function verifySignedDataCms(
   if (digAlgKids.length === 0 || digAlgKids[0].tag !== 0x06) {
     return { ok: false, reason: 'digestAlgorithm OID missing' };
   }
-  if (decodeOidValue(digAlgKids[0].value) !== SHA256_OID) {
-    return { ok: false, reason: 'digestAlgorithm is not SHA-256' };
+  // CH-46: accept whichever SHA-2 digest the TSA actually used.
+  const digestOid = decodeOidValue(digAlgKids[0].value);
+  const cmsHashName = CMS_DIGEST_OID_TO_HASH[digestOid];
+  if (!cmsHashName) {
+    return {
+      ok: false,
+      reason: `digestAlgorithm OID ${digestOid} is not a supported SHA-2 digest (sha256/384/512)`,
+    };
   }
 
   // signedAttrs is the [0] IMPLICIT (tag 0xa0). May be absent — then we
@@ -347,9 +383,11 @@ function verifySignedDataCms(
   if (contentTypeOid !== ID_CT_TST_INFO) {
     return { ok: false, reason: `signedAttrs contentType is ${contentTypeOid}, not TSTInfo` };
   }
-  const expectedDigest = createHash('sha256').update(tstInfoDer).digest();
+  // CH-46: recompute the messageDigest with the digest the TSA declared, not
+  // a hard-pinned SHA-256.
+  const expectedDigest = createHash(cmsHashName).update(tstInfoDer).digest();
   if (!messageDigest.equals(expectedDigest)) {
-    return { ok: false, reason: 'signedAttrs messageDigest does not match SHA-256(TSTInfo)' };
+    return { ok: false, reason: `signedAttrs messageDigest does not match ${cmsHashName}(TSTInfo)` };
   }
 
   // signatureAlgorithm + signature follow signedAttrs.
@@ -386,8 +424,10 @@ function verifySignedDataCms(
     if (sigAlgOid === '1.3.101.112' || sigAlgOid === '1.3.101.113') {
       verifyOk = verifySignature(null, signedAttrsDer, pubKey, signature);
     } else {
-      // RSA-PKCS1 and ECDSA both accept the digest name 'sha256' in node:crypto.verify.
-      verifyOk = verifySignature('sha256', signedAttrsDer, pubKey, signature);
+      // CH-46: RSA-PKCS1 and ECDSA verify over the digest the TSA signed with
+      // (sha256/384/512). Passing a hard-pinned 'sha256' here false-rejected
+      // SHA-512 TSAs (e.g. Freetsa) whose SignerInfo digest is SHA-512.
+      verifyOk = verifySignature(cmsHashName, signedAttrsDer, pubKey, signature);
     }
   } catch (e) {
     return { ok: false, reason: `verify threw: ${(e as Error).message}` };
@@ -468,9 +508,26 @@ export function buildTimeStampReq(
 
 // ── Persistence helper ─────────────────────────────────────────────────────
 
-function persistTsr(packageRoot: string, chainId: string, epoch: number, tsr: Buffer): string {
-  const dir = join(packageRoot, 'audit', 'anchors');
-  return atomicWriteNew(dir, `${chainId}-${epoch}.tsr`, tsr);
+/**
+ * Resolve the anchor store directory. CHARIOT_ANCHOR_STORE_PATH is the
+ * operator override; unset defaults to `<packageRoot>/audit/anchors/`
+ * (== `~/.epic-ai/audit/anchors/` when packageRoot is the default
+ * resolveEpicAiDir()).
+ * // CHARIOT::§9.8.2::5
+ */
+function resolveAnchorStoreDir(packageRoot: string): string {
+  return process.env.CHARIOT_ANCHOR_STORE_PATH ?? join(packageRoot, 'audit', 'anchors');
+}
+
+// CHARIOT::§9.8.2::5, CHARIOT::§9.8.2::6 — anchor store path is operator-
+// configurable via CHARIOT_ANCHOR_STORE_PATH, and each anchor file is named
+// anchor-{ISO8601-timestamp}-{shortHash}.tsr (shortHash = first 12 hex chars
+// of the anchored chain-head hash, matching the audit.ts hash-preview
+// convention).
+function persistTsr(packageRoot: string, headHashHex: string, epoch: number, tsr: Buffer): string {
+  const dir = resolveAnchorStoreDir(packageRoot);
+  const filename = `anchor-${new Date(epoch).toISOString()}-${headHashHex.slice(0, 12)}.tsr`;
+  return atomicWriteNew(dir, filename, tsr);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -498,6 +555,7 @@ export async function anchorChainHead(opts: {
   tsaUrl?: string;             // overrides CHARIOT_TSA_URL
   fetchImpl?: typeof fetch;    // injected for tests
   nowMs?: () => number;        // injected for tests
+  timeoutMs?: number;          // CH-47 — TSA POST timeout. Default 20_000.
 }): Promise<AnchoredAttestation> {
   const tsaUrl = opts.tsaUrl ?? process.env.CHARIOT_TSA_URL;
   if (!tsaUrl) {
@@ -511,17 +569,42 @@ export async function anchorChainHead(opts: {
   }
   const { der, nonce } = buildTimeStampReq(opts.headHash);
   const f = opts.fetchImpl ?? fetch;
-  const resp = await f(tsaUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/timestamp-query' },
-    body: der,
-  });
+  // CH-47: bound the TSA POST with an AbortController (mirrors
+  // src/license/renew-client.ts ~20s). A black-holed or non-responsive TSA
+  // must fail typed rather than hang the operator's `chariot audit anchor`
+  // (or anchor cron) indefinitely. The CHARIOT_TSA_TIMEOUT_MS env override
+  // lets operators tune for a slow internal/air-gapped TSA.
+  const envTimeout = parseInt(process.env.CHARIOT_TSA_TIMEOUT_MS ?? '', 10);
+  const timeoutMs = opts.timeoutMs
+    ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 20_000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let resp: Awaited<ReturnType<typeof fetch>>;
+  try {
+    resp = await f(tsaUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/timestamp-query' },
+      body: der,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // AbortError → typed timeout failure; any other network error is
+    // surfaced unchanged so the operator can decide to retry / switch TSA.
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error(
+        `anchorChainHead: TSA ${tsaUrl} did not respond within ${timeoutMs}ms (timed out)`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!resp.ok) {
     throw new Error(`anchorChainHead: TSA ${tsaUrl} returned HTTP ${resp.status}`);
   }
   const tsr = Buffer.from(await resp.arrayBuffer());
   const epoch = (opts.nowMs ?? Date.now)();
-  const tsrPath = persistTsr(opts.packageRoot, opts.chainId, epoch, tsr);
+  const tsrPath = persistTsr(opts.packageRoot, opts.headHash.toString('hex'), epoch, tsr);
   return {
     chainId: opts.chainId,
     headHash: opts.headHash.toString('hex'),
@@ -600,7 +683,20 @@ export function verifyAnchor(
       }
 
       // 3. Verify the SignedData / SignerInfo against the pinned cert.
-      const certPublicKey = parseCertPublicKey(tsaCertPem);
+      // RFC-3161 §2.3: the TSA signing cert MUST carry the id-kp-timeStamping
+      // extended key usage. Enforce it so a pinned TLS/code-signing cert whose
+      // key can be coaxed into signing a well-formed TSTInfo (cross-protocol
+      // oracle / multi-purpose key) is rejected rather than trusted.
+      const tsaCert = new X509Certificate(tsaCertPem);
+      const eku = tsaCert.keyUsage; // node:crypto returns the extended-key-usage OIDs
+      if (!eku || !eku.includes('1.3.6.1.5.5.7.3.8')) {
+        return {
+          valid: false,
+          reason: 'pinned TSA cert lacks id-kp-timeStamping EKU (1.3.6.1.5.5.7.3.8)',
+          code: CHARIOT_ERROR_CODES.ANCHOR_VERIFY_FAILED,
+        };
+      }
+      const certPublicKey = tsaCert.publicKey;
       const verify = verifySignedDataCms(token.signedDataDer, certPublicKey);
       if (!verify.ok) {
         return {
@@ -628,6 +724,19 @@ export function verifyAnchor(
         };
       }
 
+      // The timestamp MUST fall within the pinned TSA cert's validity window;
+      // a genTime outside notBefore/notAfter is not a valid timestamp under
+      // that cert (RFC-3161).
+      const notBefore = new Date(tsaCert.validFrom);
+      const notAfter = new Date(tsaCert.validTo);
+      if (tstInfo.genTime < notBefore || tstInfo.genTime > notAfter) {
+        return {
+          valid: false,
+          reason: 'TSTInfo genTime is outside the pinned TSA cert validity window',
+          code: CHARIOT_ERROR_CODES.ANCHOR_VERIFY_FAILED,
+        };
+      }
+
       return { valid: true, tsaTime: tstInfo.genTime };
     } catch (err) {
       return {
@@ -638,13 +747,69 @@ export function verifyAnchor(
     }
   }
 
-  if (tsr.length < 4 || tsr[0] !== 0x30) {
-    return { valid: false, reason: 'TimeStampResp does not start with SEQUENCE tag' };
+  // No-cert path: parse the TSR structure to extract and compare the
+  // TSTInfo messageImprint hashedMessage rather than doing a byte-containment
+  // check. Containment is insufficient — any file that happens to contain the
+  // 32 target bytes passes, including crafted decoys. We parse enough of the
+  // DER to reach the TSTInfo hashedMessage, giving structural + value assurance
+  // without a signature check (signature verification requires the TSA cert).
+  try {
+    const resp = parseTimeStampResp(tsr);
+    if (resp.status !== 0 && resp.status !== 1) {
+      return { valid: false, reason: `TimeStampResp status is ${resp.status}, not granted (0) or grantedWithMods (1)` };
+    }
+    if (!resp.timeStampToken) {
+      return { valid: false, reason: 'TimeStampResp is missing a timeStampToken' };
+    }
+    const tokenSeqLen = encodeDerLength(resp.timeStampToken.length);
+    const tokenWrapped = Buffer.concat([Buffer.from([0x30]), tokenSeqLen, resp.timeStampToken]);
+    const token = parseTimeStampToken(tokenWrapped);
+    if (token.contentType !== '1.2.840.113549.1.7.2') {
+      return { valid: false, reason: `timeStampToken contentType is ${token.contentType}, not signedData` };
+    }
+    // Extract TSTInfo from the SignedData encapContentInfo without verifying the
+    // signature (requires cert). We parse far enough to reach the messageImprint.
+    const sdRoot = parseDerNode(token.signedDataDer);
+    if (sdRoot.tag !== 0x30) {
+      return { valid: false, reason: 'SignedData is not a SEQUENCE' };
+    }
+    const sdKids = readSequenceChildren(sdRoot.value);
+    if (sdKids.length < 3) {
+      return { valid: false, reason: 'SignedData has too few fields' };
+    }
+    const encapInfo = sdKids[2];
+    if (encapInfo.tag !== 0x30) {
+      return { valid: false, reason: 'encapContentInfo is not a SEQUENCE' };
+    }
+    const eKids = readSequenceChildren(encapInfo.value);
+    if (eKids.length < 2 || eKids[1].tag !== 0xa0) {
+      return { valid: false, reason: 'encapContentInfo missing eContent' };
+    }
+    const eContentInner = parseDerNode(eKids[1].value);
+    if (eContentInner.tag !== 0x04) {
+      return { valid: false, reason: 'eContent inner is not OCTET STRING' };
+    }
+    const tstInfo = parseTstInfo(Buffer.from(eContentInner.value));
+    if (!tstInfo.hashedMessage.equals(expectedHeadHash)) {
+      return { valid: false, reason: 'TSTInfo messageImprint does not match expected head hash' };
+    }
+    // FAIL-CLOSED: the structural + messageImprint check passed, but WITHOUT a
+    // pinned TSA cert we cannot verify the CMS signature. The attacker controls
+    // the .tsr bytes and can hand-forge a well-formed token whose messageImprint
+    // is any value they choose, so this proves nothing about authenticity.
+    // Never report valid:true here — surface the structural result separately.
+    return {
+      valid: false,
+      structurallyConsistent: true,
+      tsaTime: tstInfo.genTime,
+      reason:
+        'cannot cryptographically verify external anchor without a pinned TSA certificate; ' +
+        're-run with --cert <tsaCertPem>. The .tsr is structurally consistent but unverified.',
+      code: CHARIOT_ERROR_CODES.ANCHOR_VERIFY_FAILED,
+    };
+  } catch (err) {
+    return { valid: false, reason: err instanceof Error ? err.message : String(err) };
   }
-  if (tsr.indexOf(expectedHeadHash) < 0) {
-    return { valid: false, reason: 'TimeStampResp does not embed the expected head hash' };
-  }
-  return { valid: true };
 }
 
 /**

@@ -31,7 +31,7 @@ export class OpenMeteoMCPServer extends MCPAdapterBase {
       name: 'open-meteo',
       displayName: 'Open-Meteo Weather',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'weather', 'forecast', 'temperature', 'precipitation', 'wind',
         'humidity', 'climate', 'historical', 'geocoding', 'air quality',

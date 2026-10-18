@@ -19,7 +19,7 @@ Chariot federates a curated set of MCP-capable adapters, governs which adapters 
 
 **Key properties:**
 
-- **Zero outbound by default.** In air-gapped mode, no data leaves the customer's network. In connected mode, the only outbound destination is `https://epic-ai.io/api/license/renew` (license renewal every 6 hours). No telemetry, no analytics, no inference proxying through Epic AI® infrastructure.
+- **Zero outbound by default.** In air-gapped mode, no data leaves the customer's network. In connected mode, the only Epic AI®-operated outbound destination is the license host: `https://license.epic-ai.io/renew` (license renewal every 6 hours) and, only if the tenant has opted in to operational telemetry and separately selected automatic transport, `https://license.epic-ai.io/api/license/telemetry` carrying nine non-sensitive metadata fields (never queries, arguments, results or credentials). Telemetry is off by default. No analytics, no inference proxying through Epic AI® infrastructure.
 - **Self-hosted.** No Chariot-hosted control plane. Customer query data, audit records, and credential vault contents never leave the customer's network perimeter.
 - **Invisible at runtime.** Customers interact with Chariot through their existing AI client. There is no Chariot-branded UI other than the CLI.
 
@@ -34,15 +34,15 @@ A Chariot installation has two cooperating layers:
 - **TypeScript engine** (Node.js): orchestrator, federation manager, retrieval, tiered-autonomy governance, IAM, observability, and CLI.
 - **Compiled Rust binary** (NAPI native module): Ed25519 license validator, AES-256-GCM credential vault with HKDF-SHA256 per-tenant key derivation, RBAC enforcement primitives, OpenAPI/Express internal-API discovery scanners, and integrity manifest verifier.
 
-Both layers ship in a single npm install. The Rust binary ships as four optional-dep sibling packages (`@epicai/chariot-bin-linux-x64-gnu`, `@epicai/chariot-bin-darwin-arm64`, `@epicai/chariot-bin-darwin-x64`, `@epicai/chariot-bin-win32-x64-msvc`); npm selects the correct platform binary.
+Both layers ship in a single npm install. The Rust binary ships as five optional-dep sibling packages (`@epicai/chariot-bin-linux-x64-gnu`, `@epicai/chariot-bin-linux-arm64-gnu`, `@epicai/chariot-bin-darwin-arm64`, `@epicai/chariot-bin-darwin-x64`, `@epicai/chariot-bin-win32-x64-msvc`); npm selects the correct platform binary.
 
 ### 2.2 Deployment topologies
 
 | Topology | Outbound | License renewal | Telemetry |
 |---|---|---|---|
-| Public-LLM connected | LLM provider + `epic-ai.io/api/license/renew` | Automatic, every 6 hours | None outbound to Epic AI® |
-| Hybrid (on-prem LLM, connected license) | `epic-ai.io/api/license/renew` only | Automatic, every 6 hours | None |
-| Air-gapped | None | Manual signed-file transfer | None |
+| Public-LLM connected | LLM provider + `license.epic-ai.io/renew` (+ opt-in telemetry path) | Automatic, every 6 hours | None by default; opt-in automatic upload of nine non-sensitive fields to the license host only |
+| Hybrid (on-prem LLM, connected license) | `license.epic-ai.io/renew` only (+ opt-in telemetry path) | Automatic, every 6 hours | None by default; opt-in automatic upload of nine non-sensitive fields to the license host only |
+| Air-gapped | None | Manual signed-file transfer | None automatic; opt-in local store and customer-initiated signed export only |
 
 ### 2.3 Process model
 
@@ -376,7 +376,7 @@ The following error categories are emitted by Chariot's observability layer and 
 | `license.expired` | JWT `exp` passed; grace window has not started | Renew the license before expiry. |
 | `license.grace_entered` | JWT `exp` passed; within 14-day grace window | Renew immediately. All features active during grace. |
 | `license.degraded` | Grace window expired or signature invalid | Renew the license. Chariot falls back to single-user free-tier features. |
-| `license.renew_failed` | Renewal endpoint unreachable or HMAC proof rejected | Check network access to `https://epic-ai.io/api/license/renew`. In air-gapped mode, install a new signed license file manually. |
+| `license.renew_failed` | Renewal endpoint unreachable or HMAC proof rejected | Check network access to `https://license.epic-ai.io/renew`. In air-gapped mode, install a new signed license file manually. |
 
 ### 9.3 Audit errors
 
@@ -447,11 +447,15 @@ The three tools registered for the AI client are:
 
 | Tool | Args | Purpose |
 |---|---|---|
-| `chariot_query` | `query: string`, `detail: 'full'|'summary'`, `discover: boolean` | Natural-language search over configured adapters or (with `discover: true`) the full bundled catalog |
+| `chariot_query` | `query: string` (maximum 1,024 characters), `detail: 'full'|'summary'`, `discover: boolean` | Natural-language search over configured adapters or (with `discover: true`) the full bundled catalog; longer requests are summarized while preserving concrete errors, metrics, and time windows |
 | `chariot_call` | `adapter: string`, `tool: string`, `args: Record<string, unknown>` | Execute a tool on a specific adapter |
 | `chariot_list` | `category?: string`, `search?: string` | Browse available adapters by category or keyword |
 
 `getTenantId` is process-configured; it is never read from tool arguments (security invariant). Administrative operations (audit queries, RBAC mapping management, force-logout, tenant settings) are accessed via the HTTP admin surface at `/enterprise/{tenantId}/admin/` — not via MCP tools.
+
+**Credentials entered outside the chat.** The AI client is the user interface, so a credential value never travels through the conversation or the model. On the single-user local transport (stdio and shared-bearer loopback), when `chariot_call` targets an adapter whose required credential keys are present in neither the credential store nor the process environment, Chariot starts a one-shot private page bound to `127.0.0.1` on an ephemeral port (256-bit single-use token path, 10-minute expiry, Host and Origin checks, no external resources). Submitted values are validated in full, then written to the local credential store; they are never returned to the model, placed in a tool result or logged. Where the MCP client declares URL-mode elicitation, Chariot sends the page URL with `elicitInput({ mode: 'url' })`; otherwise `chariot_call` returns `credentials_pending` carrying `privatePageUrl`. A declined prompt returns `credentials_declined`. On multi-tenant HTTP no private page is started and the existing `credentials_pending` result is unchanged. No MCP tool is added.
+
+**Server instructions.** The MCP server returns model-neutral `instructions` on `initialize` (stdio and streamable HTTP). They name only the three tools, tell the AI to keep `chariot_query` queries at or below 1,024 characters and summarize longer requests while preserving concrete errors, metrics, and time windows, and direct the AI never to ask the user to type or paste a password, token or API key into the chat.
 
 ---
 

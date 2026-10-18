@@ -5,6 +5,10 @@
  */
 
 import type { ProbeEntry } from '../observability/LinearProbeReadout.js';
+// Type-only import (erased at compile, no runtime cycle) so FederationConfig
+// can carry an optional egress-policy section that FederationManager uses to
+// construct and wire the AccessPolicyEngine into the ConnectionPool.
+import type { EgressRule, PolicyEffect } from '../trust/types.js';
 
 // =============================================================================
 // LLM Provider Types
@@ -42,6 +46,17 @@ export interface LLMResponse {
    * StreamEvents before federation.callTool. 
    */
   hiddenState?: Float32Array | number[];
+  /**
+   * CHARIOT::§8.12::4/::5 — optional real token usage for this call, when
+   * the LLMFunction implementation can report it (most cloud-LLM /
+   * OpenAI-compatible APIs return this in the response body). No field
+   * previously existed on LLMResponse to carry it at all — the Orchestrator
+   * had no access to real token counts from either generator call site.
+   * Absent: RunTelemetryCollector/TokenTracker fall back to
+   * TokenTracker.estimateTokens() (the class's own existing ~4-chars/token
+   * estimator) rather than recording zero.
+   */
+  usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
 }
 
 export type LLMFunction = (params: {
@@ -128,6 +143,22 @@ export interface FederationConfig {
   servers: ServerConnection[];
   retryPolicy?: RetryPolicy;
   healthCheckIntervalMs?: number;
+  /**
+   * Optional egress policy. When present, FederationManager constructs an
+   * AccessPolicyEngine from these rules and wires it into the ConnectionPool
+   * so `evaluateEgress()` enforces them (default-deny) on every network
+   * dispatch instead of the open-source allow-all default.
+   *
+   * `enforce: true` locks the pool into enterprise mode
+   * (`requirePolicyEngineWired`): if the engine is ever absent, egress
+   * evaluation returns a synthetic DENY rather than silently allowing —
+   * so a bootstrap that forgets to supply rules fails closed.
+   */
+  egressPolicy?: {
+    rules?: EgressRule[];
+    defaultEffect?: PolicyEffect;
+    enforce?: boolean;
+  };
 }
 
 export type ToolTier = 'orchestrated' | 'direct';
@@ -138,6 +169,22 @@ export interface Tool {
   parameters: Record<string, unknown>;
   server: string;
   tier: ToolTier;
+  /**
+   * MCP tool annotations as declared by the adapter/server (e.g.
+   * `readOnlyHint`). These are adapter-supplied hints, NOT a security
+   * guarantee by themselves — consumers that gate automated dispatch on
+   * them (e.g. the Correlator's read-only tool selection) must treat a
+   * missing/false hint as NOT read-only and fail closed.
+   *
+   * `requiresMfa` (CHARIOT::§8.2::3) marks a tool whose dispatch requires
+   * the turn's generator to be bound to a fresh MFA assertion (see
+   * Orchestrator.ts's MFA-tied-generator invariant). No catalog-level
+   * per-tool MFA flag exists elsewhere in this schema — this is the single
+   * source of truth for "is this tool MFA-required," mirroring how
+   * `readOnlyHint`/`destructiveHint` are the existing per-tool annotation
+   * precedent (§19::13). Missing/false means NOT MFA-required.
+   */
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; requiresMfa?: boolean; [key: string]: unknown };
 }
 
 /**
@@ -176,6 +223,25 @@ export const DEFAULT_FAILURE_POLICY: FailurePolicy = {
 };
 
 /**
+ * AS::§2.5::5 — ADAPTER-STANDARD-MAY-2026.md:460: "**Non-idempotent
+ * (declared):** The tool's `inputSchema` MUST carry
+ * `x-chariot-idempotent: false`. The dispatcher MUST NOT retry;
+ * failures surface as a single attempt." Every trigger is forced to
+ * 'stop' so fetchWithRetryTelemetry's applyPolicy() short-circuits on
+ * the very first failure instead of retrying — this is threaded onto
+ * the per-call RetryTelemetryStore by FederationManager.callTool
+ * whenever the dispatched tool's OWN inputSchema declares
+ * `x-chariot-idempotent: false`, overriding any adapter-level
+ * FailurePolicy (which cannot see per-tool idempotency).
+ */
+export const NO_RETRY_FAILURE_POLICY: FailurePolicy = {
+  onTimeout: 'stop',
+  onRateLimit: 'stop',
+  on5xx: 'stop',
+  maxRetries: 0,
+};
+
+/**
  * error classification (Adaline mode 2: 60% of LLM-agent errors
  * are rate-limit class). Distinct from CallOutcome: outcome says "did the
  * call complete," errorClass says "what kind of failure." Absent on success.
@@ -195,6 +261,22 @@ export type ErrorClass =
   | 'policy_violation'
   | 'unauthorized'
   | 'vendor_5xx'
+  // CHARIOT::§7.2::3 — a recognized-but-unimplemented federation transport
+  // (currently only 'sse') was dispatched. Distinct from 'invalid_arguments'
+  // (a per-tool schema rejection) because the transport itself, not the
+  // tool's arguments, is what makes the call unservable.
+  | 'transport_not_supported'
+  // CHARIOT::§7.2::3 (follow-on) — the adapter's `mcp.transport` value IS
+  // one of the two implemented transports (`stdio`, `streamable-http`), but
+  // the catalog/tool-surface record is missing the field that transport
+  // requires to dispatch (stdio: `command`, or a valid docker
+  // image+digest pin; streamable-http: `url`/`serverUrl`). Distinct from
+  // `transport_not_supported` because the transport ITSELF is implemented
+  // and would dispatch given a complete record — the record's shape, not
+  // the transport choice, is what makes this specific call unservable.
+  // Also distinct from `invalid_arguments`, which is a per-tool-call
+  // schema rejection, not an adapter-definition defect.
+  | 'adapter_config_invalid'
   | 'unknown';
 
 export interface ToolResult {
@@ -255,6 +337,16 @@ export interface ActionContext {
   userId?: string;
   timestamp: Date;
   priorActions: ActionRecord[];
+  /**
+   * MCP annotation indicating that the tool is read-only.
+   * `false` is an explicit write signal; `undefined` means unknown.
+   */
+  readOnlyHint?: boolean;
+
+  /**
+   * MCP annotation indicating that the tool is destructive.
+   */
+  destructiveHint?: boolean;
 }
 
 export interface AutonomyPolicy {
@@ -264,7 +356,10 @@ export interface AutonomyPolicy {
   priority?: number;
 }
 
-export type ApprovalState = 'pending' | 'approved' | 'denied' | 'expired';
+// CHARIOT::§7.6::4 — 'cancelled' added so ApprovalQueue can mark items
+// pointing at a revoked adapter as cancelled (distinct from an explicit
+// operator 'denied' decision).
+export type ApprovalState = 'pending' | 'approved' | 'denied' | 'expired' | 'cancelled';
 
 export interface PendingApproval {
   id: string;
@@ -317,6 +412,13 @@ export interface MemoryEntry {
 
 export interface StoredMemory extends MemoryEntry {
   id: string;
+  /**
+   * §8.5::1 — owning tenant. Memory is scoped by (tenantId, userId); userId
+   * alone is NOT unique across tenants (IAM identity is tenant-scoped), so a
+   * user-only scope lets two tenants sharing a userId read, overwrite and
+   * invalidate each other's memory (the cross-tenant memory isolation fix).
+   */
+  tenantId: string;
   userId: string;
   createdAt: Date;
   accessCount: number;
@@ -377,7 +479,7 @@ export interface MemoryStoreAdapter {
    * high-importance cap is reached and the effective importance is 'high', save
    * rejects with a structured error.
    */
-  save(userId: string, entry: MemoryEntry, actor?: MemoryActor): Promise<StoredMemory>;
+  save(tenantId: string, userId: string, entry: MemoryEntry, actor?: MemoryActor): Promise<StoredMemory>;
 
   /**
    * Retrieve stored memories — **read-only**.
@@ -387,10 +489,18 @@ export interface MemoryStoreAdapter {
    * Importance promotion MUST be performed via promoteImportance() — never
    * implicitly inside recall().
    */
-  recall(userId: string, options: RecallOptions): Promise<StoredMemory[]>;
+  recall(tenantId: string, userId: string, options: RecallOptions): Promise<StoredMemory[]>;
 
-  context(userId: string): Promise<ContextSummary>;
-  delete(userId: string, memoryId: string): Promise<void>;
+  context(tenantId: string, userId: string): Promise<ContextSummary>;
+
+  /**
+   * Soft-delete a memory by ID — truthful outcome required (CH-31 —
+   * CHARIOT::§23.2::44-45; ::134 names `forget` as a covered surface).
+   * Returns true only if a live (non-deleted) entry with this id existed for
+   * this userId and was just soft-deleted. Returns false if the id does not
+   * exist, belongs to a different userId, or was already soft-deleted.
+   */
+  delete(tenantId: string, userId: string, memoryId: string): Promise<boolean>;
 
   /**
    * Increment accessCount and set lastAccessed for the given memoryId.
@@ -398,7 +508,7 @@ export interface MemoryStoreAdapter {
    *
  * This is the ONLY path that may mutate access metadata.
    */
-  recordAccess(memoryId: string): Promise<void>;
+  recordAccess(tenantId: string, memoryId: string): Promise<void>;
 
   /**
    * Explicitly promote (or demote) the importance tier of a stored memory.
@@ -410,13 +520,13 @@ export interface MemoryStoreAdapter {
    *
    * No-op if the entry does not exist or is soft-deleted.
    */
-  promoteImportance(memoryId: string, newImportance: MemoryImportance): Promise<void>;
+  promoteImportance(tenantId: string, memoryId: string, newImportance: MemoryImportance): Promise<void>;
 
   /**
    * Return current capacity metrics for a given userId scope.
    * nearCap is true when entries >= 90% of cap.
    */
-  getCapacityStatus(userId: string): Promise<CapacityStatus>;
+  getCapacityStatus(tenantId: string, userId: string): Promise<CapacityStatus>;
 }
 
 export interface MemoryConfig {
@@ -455,10 +565,29 @@ export interface PersonaConfig {
 
 export interface ConversationContext {
   userId: string;
-  sessionId: string;
+  /**
+   * CHARIOT::§8.4::3 — per-run identifier: the StepTracer traceId when one
+   * is wired (`Orchestrator.deps.stepEmitter`), otherwise a fresh UUID
+   * minted for this call. Chariot has no session subsystem — there is no
+   * producer anywhere in the engine for a persistent, cross-turn session
+   * identity — so this is NOT a session id and must not be read as one.
+   * See CHARIOT-SPEC.md:700-702 (§8.4) and §8.5 (:733-743).
+   */
+  runId: string;
   messageHistory: LLMMessage[];
   retrievedMemories: StoredMemory[];
   activeTools: string[];
+  /**
+   * CHARIOT::§8.4::4 — "The Tier-1-selected tools are serialized into the
+   * prompt as JSON schema blocks." (CHARIOT-SPEC.md:703). Optional,
+   * additive companion to `activeTools` (names only, carries no schema):
+   * when present, `SystemPromptBuilder.buildToolContext` emits one fenced
+   * JSON schema block per entry instead of the plain name list. Absent —
+   * or an entry whose name is not also present in `activeTools` — falls
+   * back to the name-only rendering, so this is backward compatible with
+   * every existing caller that only ever populated `activeTools`.
+   */
+  activeToolSchemas?: LLMToolDefinition[];
 }
 
 // =============================================================================
@@ -475,7 +604,14 @@ export type StepKind =
   | 'dlp-sanitize'
   | 'retrieval'
   | 'synthesis'
-  | 'refusal';
+  | 'refusal'
+  /**
+   * §8.2::5 — merging a tool result back into conversation state. The other
+   * loop phases already have a kind (`retrieval` = pre-filter,
+   * `orchestrator-plan` = prompt build/planner, `synthesis` = generator call,
+   * `tool-call` = dispatch); only the merge phase had none.
+   */
+  | 'result-merge';
 
 /**
  * MAST failure mode taxonomy — Cemri et al., arXiv:2503.13657 (March 2025).
@@ -537,9 +673,30 @@ export interface ActionRecord {
   durationMs: number;
   hash: string;
 
-  // step-level attribution — participates in SHA-256 hash chain
-  // (HashChain.computeHash excludes only status/output/durationMs; these
-  //  immutable fields hash by default).
+  // Attribution — who/where. Optional/additive so pre-existing adapters and
+  // legacy rows (recorded before this field existed) remain valid; readers
+  // treat absence as 'unknown'. Participates in the SHA-256 hash chain like
+  // every other field (HashChain.computeHash hashes the whole record), so a
+  // post-hoc edit to either field is still tamper-evident.
+  userId?: string;    // the authenticated principal that initiated the action
+  sourceIp?: string;  // client IP the request originated from, when known
+
+  /**
+   * §8.9::11 — request-scoped TenantContext carried from the authenticated
+   * boundary into the pre-dispatch audit record. Optional/additive like the
+   * fields above; absent on the unauthenticated OSS/local path. Hashed with
+   * the rest of the record (HashChain.computeHash hashes every field), so a
+   * post-hoc edit to the recorded roles/attributes is tamper-evident.
+   */
+  tenantId?: string;
+  principalId?: string;
+  roles?: string[];
+  tenantTier?: 'free' | 'pro' | 'enterprise';
+  attributes?: Record<string, string>;
+
+  // step-level attribution — participates in SHA-256 hash chain.
+  // HashChain.computeHash now covers ALL fields (including status/output/durationMs)
+  // so post-hoc edits to any field are detected by verifyChain.
   traceId?: string;          // UUID v4 shared across all records in one run
   parentStepId?: string;     // UUID of the parent step (null if root step)
   stepKind?: StepKind;       // which step category produced this record
@@ -602,6 +759,13 @@ export interface AuditStoreAdapter {
      */
     opts?: { failureMode?: FailureMode; retryCount?: number; retryReasons?: string[]; outcome?: CallOutcome; errorClass?: ErrorClass },
   ): Promise<void>;
+  /**
+   * Return the record with the highest sequenceNumber without loading the
+   * entire chain into memory. Used by AuditTrail.init() to resume a chain
+   * across restarts. Optional — when not implemented init() falls back to
+   * query({}) + reduce (correct but O(n) memory).
+   */
+  lastRecord?(): Promise<ActionRecord | undefined>;
 }
 
 export interface AuditConfig {
@@ -972,6 +1136,29 @@ export interface RunResult {
   actionsPending: number;
   persona: string;
   durationMs: number;
+  /**
+   * CHARIOT::§8.12::4 — the per-run RunTelemetrySnapshot (tokenIn/tokenOut/
+   * latencyMs/toolCalls/auditRecords + the underlying event/log detail),
+   * retrievable from the run result per the W34-4b ruling. `import type`
+   * only — RunTelemetry.ts itself type-imports FROM this file
+   * (StreamEvent/RunTiming), so this is a type-only cycle, erased at
+   * compile time, not a runtime one.
+   *
+   * OPTIONAL (verification round 2 finding): RunResult has a SECOND real
+   * constructor besides Orchestrator.run() — JSONResponse.collect(stream,
+   * persona) (src/engine/transport/JSONResponse.ts), a generic transport
+   * utility over an untyped `AsyncGenerator<StreamEvent>` from ANY caller,
+   * not necessarily Orchestrator.execute()'s
+   * `AsyncGenerator<StreamEvent, RunTelemetrySnapshot, unknown>` — a plain
+   * `for await` there cannot recover a generator's return value, and there
+   * is no legitimate snapshot to synthesize for a stream that may not even
+   * be Orchestrator's. Making this required would force JSONResponse to
+   * either fabricate an empty/zero snapshot (dishonest — "ABSENT ≠ FALSE")
+   * or reach into generator internals it has no contract to depend on.
+   * Absent here honestly means "not collected by this constructor," not
+   * "zero activity."
+   */
+  telemetry?: import('../observability/RunTelemetry.js').RunTelemetrySnapshot;
 }
 
 // =============================================================================
@@ -1029,6 +1216,30 @@ export interface ObservabilityEmitterContract {
   emitProbeDecision(payload: { decision: 'tool-needed' | 'no-tool' | 'unsupported'; probability?: number; threshold: number }): void;
  // emitted once when ActivationSteerer modifies a hidden state.
   emitSteeringApplied(payload: { modelName: string; layer: number; category: string; weight: number }): void;
+  // CHARIOT::§7.6::5 — emitted once per successful runtime adapter
+  // revocation ("WHEN an adapter is revoked at runtime the system SHALL
+  // emit an audit record under event type federation.adapter.revoked").
+  // Optional so implementations that don't surface this signal can omit it.
+  emitAdapterRevoked?(payload: {
+    adapterId: string;
+    reason: string;
+    revokedAt: string;
+    cancelledApprovalCount: number;
+  }): void;
+}
+
+/**
+ * CHARIOT::§8.12::1 — "ObservabilityEmitter.ts — the event bus inside the
+ * engine. The orchestrator, federation, autonomy, and resilience layers all
+ * emit through it." Minimal structural contract (mirrors
+ * `ObservabilityEmitterContract`'s own "avoid a hard import cycle" pattern
+ * above) so `src/engine/autonomy/` and `src/engine/resilience/` files can
+ * accept an optional emitter without importing the concrete
+ * `ObservabilityEmitter` class from `src/engine/observability/`. The
+ * concrete class's `info()` method satisfies this structurally.
+ */
+export interface ObservabilityInfoSink {
+  info(message: string, data?: Record<string, unknown>, layer?: string): void;
 }
 
 // =============================================================================
@@ -1054,13 +1265,31 @@ export interface EpicAIAutonomyAccessor {
 export interface EpicAIAgent {
   start(): Promise<void>;
   stop(): Promise<void>;
-  run(query: string): Promise<RunResult>;
-  stream(query: string): AsyncGenerator<StreamEvent>;
+  /** `sessionId` (CHARIOT::§8.2::3) — see Orchestrator.ts's execute() doc comment for why this exists and its current wiring status. */
+  run(query: string, userId?: string, sourceIp?: string, sessionId?: string): Promise<RunResult>;
+  stream(query: string, userId?: string, sourceIp?: string, sessionId?: string): AsyncGenerator<StreamEvent>;
   approve(actionId: string, opts: { approver: string }): Promise<ActionDecision>;
   deny(actionId: string, opts: { approver: string; reason: string }): Promise<ActionDecision>;
+  /**
+   * CHARIOT::§7.5::1 — "exposes a reload() for runtime adapter unload."
+   * Re-reads the registry (and re-applies the catalog revocation gate)
+   * and reconciles the live federation: adapters no longer present (or
+   * newly filtered/revoked) are unloaded, adapters newly present are
+   * connected. Requires the agent to already be started.
+   */
+  reloadAdapters(): Promise<void>;
   readonly audit: EpicAIAuditAccessor;
   readonly federation: EpicAIFederationAccessor;
   readonly autonomy: EpicAIAutonomyAccessor;
+  /**
+   * CHARIOT::§16.3::1 (rulings item 91(3)) — structurally satisfies
+   * ChariotMetrics' `TokenUsageByAdapterSource` seam
+   * (src/observability/metrics.ts) by method-name match alone. See
+   * EpicAIAgentImpl.getTokenUsageByAdapter()'s doc comment for the W34-4b
+   * finding that no code path in this repo currently constructs both an
+   * EpicAI agent and a ChariotMetrics instance in the same process.
+   */
+  getTokenUsageByAdapter(): Record<string, { tokens: number; costUsd: number }>;
 }
 
 /**
@@ -1090,6 +1319,14 @@ export type ChariotErrorCode =
   | 'ANCHOR_VERIFY_FAILED'
   | 'LENGTH_ATTESTATION_FAILED'
   | 'CHAIN_TRUNCATION_DETECTED'
+  | 'CHAIN_INTEGRITY_VIOLATION'
+  | 'CHAIN_UNATTESTED_SUFFIX'
+  | 'ATTESTATION_SIGNATURE_INVALID'
+  | 'ATTESTATION_VERIFY_KEY_MISSING'
+  | 'AUDIT_WRITE_FAILED'
+  | 'NO_LENGTH_ATTESTATIONS'
+  | 'AUDIT_VERIFY_KEY_NOT_CONFIGURED'
+  | 'AUDIT_VERIFY_KEY_INVALID'
   | 'CLAIM_VALIDATION_ARG_MISSING';
 
 export const CHARIOT_ERROR_CODES = {
@@ -1113,6 +1350,14 @@ export const CHARIOT_ERROR_CODES = {
   ANCHOR_VERIFY_FAILED: 'ANCHOR_VERIFY_FAILED',
   LENGTH_ATTESTATION_FAILED: 'LENGTH_ATTESTATION_FAILED',
   CHAIN_TRUNCATION_DETECTED: 'CHAIN_TRUNCATION_DETECTED',
+  CHAIN_INTEGRITY_VIOLATION: 'CHAIN_INTEGRITY_VIOLATION',
+  CHAIN_UNATTESTED_SUFFIX: 'CHAIN_UNATTESTED_SUFFIX',
+  ATTESTATION_SIGNATURE_INVALID: 'ATTESTATION_SIGNATURE_INVALID',
+  ATTESTATION_VERIFY_KEY_MISSING: 'ATTESTATION_VERIFY_KEY_MISSING',
+  AUDIT_WRITE_FAILED: 'AUDIT_WRITE_FAILED',
+  NO_LENGTH_ATTESTATIONS: 'NO_LENGTH_ATTESTATIONS',
+  AUDIT_VERIFY_KEY_NOT_CONFIGURED: 'AUDIT_VERIFY_KEY_NOT_CONFIGURED',
+  AUDIT_VERIFY_KEY_INVALID: 'AUDIT_VERIFY_KEY_INVALID',
   CLAIM_VALIDATION_ARG_MISSING: 'CLAIM_VALIDATION_ARG_MISSING',
 } as const satisfies Record<ChariotErrorCode, ChariotErrorCode>;
 

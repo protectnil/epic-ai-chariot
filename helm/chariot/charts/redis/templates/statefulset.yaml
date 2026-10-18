@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "chariot-redis.fullname" . }}
+  labels:
+    {{- include "chariot-redis.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "chariot-redis.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chariot-redis.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chariot-redis.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- /* CH-30 arbitrary-UID: on OpenShift the restricted-v2 SCC allocates
+             runAsUser/runAsGroup/fsGroup from the namespace range and mutates the
+             pod before validating, so these three MUST be absent. Off OpenShift
+             they MUST be present: this image declares no USER and runs as root,
+             so runAsNonRoot has nothing to assert against. `omit` is used rather
+             than a null override because Helm's subchart coalescing does not
+             delete a key set to null. */}}
+        {{- if .Values.openshift.arbitraryUid }}
+        {{- toYaml (omit .Values.podSecurityContext "runAsUser" "runAsGroup" "fsGroup") | nindent 8 }}
+        {{- else }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "chariot-redis.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- if .Values.openshift.arbitraryUid }}
+            {{- toYaml (omit .Values.securityContext "runAsUser") | nindent 12 }}
+            {{- else }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- end }}
+          # CH-28: password is required and sourced from the operator/generated
+          # Secret env (no credential baked into the chart). The password is
+          # written to a memory-backed config include instead of being passed on
+          # the server ARGV — argv is captured at execve time by auditd / Falco /
+          # EDR process telemetry, which would leak the secret into log pipelines.
+          command:
+            - "sh"
+            - "-c"
+            - 'umask 077; printf "requirepass %s\n" "$REDIS_PASSWORD" > /tmp/redis-auth.conf; exec redis-server /tmp/redis-auth.conf --appendonly yes --dir /data'
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "chariot-redis.secretName" . }}
+                  key: redis-password
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        # Memory-backed so the requirepass config include (written above) never
+        # touches disk.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        {{- if not .Values.persistence.enabled }}
+        # persistence disabled → ephemeral data volume so the /data mount is
+        # still satisfied without provisioning a PVC.
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+  {{- end }}

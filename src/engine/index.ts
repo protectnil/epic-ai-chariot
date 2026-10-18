@@ -23,6 +23,23 @@ export type { AdapterConnectionState } from './federation/ConnectionPool.js';
 export { ToolRegistry } from './federation/ToolRegistry.js';
 export { ToolPreFilter } from './federation/ToolPreFilter.js';
 export type { PreFilterOptions } from './federation/ToolPreFilter.js';
+export {
+  HybridRetriever,
+  RankFusion,
+  VectorIndexVerifier,
+  DEFAULT_K,
+} from './retrieval/index.js';
+export type {
+  HybridRetrieverConfig,
+  HybridRetrieverDeps,
+  RetrieverLogger,
+  RetrievalLeg,
+  RetrievalOutcome,
+  ScoredResult,
+  RetrievalContract,
+  BundleEnvelope,
+  BundleManifest,
+} from './retrieval/index.js';
 export { Correlator } from './federation/Correlator.js';
 export { MCPClientAdapter } from './federation/adapters/MCPClientAdapter.js';
 export type { MCPAdapter } from './federation/adapters/base.js';
@@ -46,6 +63,7 @@ export { SystemPromptBuilder } from './persona/SystemPromptBuilder.js';
 // Memory
 export { PersistentMemory } from './memory/PersistentMemory.js';
 export { InMemoryStore } from './memory/adapters/InMemoryStore.js';
+export { FileStore } from './memory/adapters/FileStore.js';
 export { RedisMongoAdapter } from './memory/adapters/RedisMongoAdapter.js';
 
 // Audit
@@ -95,8 +113,6 @@ export { PromptCache } from './resilience/PromptCache.js';
 // Federation V2
 export { AdapterCatalog } from './federation/AdapterCatalog.js';
 export type { AdapterCatalogEntry, AdapterCategory, CatalogSourceConfig } from './federation/AdapterCatalog.js';
-export { DomainClassifier } from './federation/DomainClassifier.js';
-export type { DomainClassifierConfig } from './federation/DomainClassifier.js';
 export { AdaptivePool } from './federation/AdaptivePool.js';
 export type { AdaptivePoolConfig, PoolStats } from './federation/AdaptivePool.js';
 export { EpicAIAdapter } from './federation/adapters/base.js';

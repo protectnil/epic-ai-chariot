@@ -1,0 +1,9 @@
+apiVersion: v2
+name: mongodb
+description: >-
+  Vendored MongoDB for Epic AI® Chariot (CH-28 fail-closed credentials, CH-30
+  non-root). Purpose-built for the Chariot umbrella chart — not a general-purpose
+  MongoDB distribution.
+type: application
+version: 0.1.0
+appVersion: "8.0.34"

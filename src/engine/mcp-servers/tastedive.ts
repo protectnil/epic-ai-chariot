@@ -51,7 +51,7 @@ export class TasteDiveMCPServer extends MCPAdapterBase {
       name: 'tastedive',
       displayName: 'TasteDive',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'tastedive', 'recommendations', 'similar', 'movies', 'music', 'books',
         'shows', 'games', 'podcasts', 'taste', 'cross-media', 'discovery',

@@ -20,7 +20,7 @@ export class ClevelandArtMCPServer extends MCPAdapterBase {
       name: 'clevelandart',
       displayName: 'Cleveland Museum of Art Open Access',
       version: '1.0.0',
-      category: 'arts',
+      category: 'design',
       keywords: [
         'cleveland', 'museum', 'art', 'open access', 'artworks', 'paintings',
         'sculpture', 'drawings', 'collections', 'exhibitions', 'artists',

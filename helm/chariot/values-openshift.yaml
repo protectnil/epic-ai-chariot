@@ -1,0 +1,73 @@
+# Epic AI® Chariot — OpenShift overlay (CH-30).
+#
+#   helm install chariot ./helm/chariot -f values-openshift.yaml -f <your-values>.yaml
+#
+# WHY THIS FILE EXISTS. OpenShift's default `restricted-v2` SCC uses the
+# MustRunAsRange strategy: it allocates the UID per namespace from the project's
+# `openshift.io/sa.scc.uid-range` annotation (ranges look like
+# 1000680000-1000689999) and the supplemental groups from
+# `.../supplemental-groups`, and it MUTATES the pod with those values before
+# validating it. A `runAsUser` pinned to 999 falls outside every realistic range,
+# so admission rejects the pod unless the buyer is granted `nonroot-v2` or
+# `anyuid` — a cluster-admin action, and a finding in Red Hat container
+# certification. Omitting the field lets the SCC do its job; `runAsNonRoot: true`
+# is still satisfied, by the UID the SCC injected.
+#
+# WHY IT IS NOT THE DEFAULT. The two vendored images are Docker Official images
+# that declare NO user and run as root — verified directly, not assumed:
+# `podman inspect` reports `Config.User` empty for both `mongo:7.0.14` and
+# `redis:7.4.1-bookworm`, and `podman run <image> id` reports `uid=0(root)` for
+# both. On vanilla Kubernetes (EKS is the primary target, §23.2::1) there is no
+# SCC to inject anything, so `runAsNonRoot: true` with no `runAsUser` leaves the
+# kubelet nothing to assert uid != 0 against and admission rejects the pod with
+# "container has runAsNonRoot and image will run as root". The default values.yaml
+# therefore pins 999 for both subcharts, and this overlay turns it off.
+#
+# WHY A FLAG AND NOT A null OVERRIDE. Helm's subchart coalescing does NOT delete a
+# key whose parent-level value is null — verified: `--set
+# mongodb.podSecurityContext.runAsUser=null` leaves `runAsUser: 999` in the
+# rendered pod spec and empties the container-level map instead. So each subchart
+# takes an explicit `openshift.arbitraryUid` boolean and its template `omit`s the
+# three fields when it is true. Booleans merge cleanly.
+#
+# THE GATEWAY IS NOT IN THIS FILE, deliberately. Its image is one we build, and
+# Dockerfile:152 declares `USER 1000:1000` numerically, so the kubelet can assert
+# uid != 0 on vanilla Kubernetes with nothing pinned. Its `runAsUser` is already
+# unset in the default values.yaml and is correct on both platforms. The three
+# workloads are NOT alike — do not harmonize them without re-inspecting the images.
+#
+# SAFE BECAUSE EVERY WRITTEN PATH IS A MOUNTED VOLUME. Under an injected UID a
+# process cannot write image-owned directories. Neither container needs to:
+# mongod writes /data/db (the `data` PVC) and /tmp (an emptyDir) —
+# charts/mongodb/templates/statefulset.yaml — and redis-server writes /data and
+# /tmp — charts/redis/templates/statefulset.yaml. Kubernetes applies fsGroup
+# ownership to both PVCs and emptyDirs, so whatever supplemental group the SCC
+# allocates can write them.
+#
+# Nothing else is weakened: runAsNonRoot, allowPrivilegeEscalation=false,
+# capabilities drop ALL and the seccomp profile are untouched in both subcharts.
+
+mongodb:
+  openshift:
+    arbitraryUid: true
+
+redis:
+  openshift:
+    arbitraryUid: true
+
+# ── CH-54 image verification on OpenShift ────────────────────────────────────
+# RHACS (Red Hat Advanced Cluster Security), not Kyverno, is the certified
+# deploy-time signature verifier for the OpenShift / IBM Marketplace channel —
+# see the imageVerification.engine comment in values.yaml and
+# templates/rhacs-signature-integration-note.yaml for what RHACS is and is not
+# Helm-managed. Switching the engine here means the Kyverno ClusterPolicy in
+# templates/image-verify-policy.yaml does NOT render on an
+# `-f values-openshift.yaml` install; the RHACS ConfigMap does instead.
+#
+# signatureIntegrationName/enforcementPolicyName are left for the operator to
+# set (the chart fails closed — chariot.assertImageVerifyFailClosed — if they
+# are empty and allowInsecureAdmissionMode is not explicitly set), since they
+# name resources created directly in the buyer's own RHACS Central, which this
+# repo has no access to and cannot pre-name on their behalf.
+imageVerification:
+  engine: rhacs

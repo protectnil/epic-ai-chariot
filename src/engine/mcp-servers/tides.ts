@@ -27,7 +27,7 @@ export class TidesMCPServer extends MCPAdapterBase {
       name: 'tides',
       displayName: 'NOAA Tides and Currents',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'tides', 'noaa', 'water level', 'tide predictions', 'currents',
         'coastal', 'ocean', 'mllw', 'hi lo', 'tide stations', 'nautical',

@@ -43,7 +43,7 @@ export class LotaDataMCPServer extends MCPAdapterBase {
       name: 'lotadata',
       displayName: 'LotaData',
       version: '1.0.0',
-      category: 'analytics',
+      category: 'data',
       keywords: [
         'lotadata', 'events', 'activities', 'places', 'venues', 'geocoded',
         'location', 'analytics', 'geo', 'local', 'discovery', 'category',

@@ -41,7 +41,7 @@ export class WaqiMCPServer extends MCPAdapterBase {
       name: 'waqi',
       displayName: 'WAQI — World Air Quality Index',
       version: '1.0.0',
-      category: 'environment',
+      category: 'science',
       keywords: [
         'waqi', 'air quality', 'aqi', 'pollution', 'pm2.5', 'pm10',
         'ozone', 'no2', 'so2', 'co', 'air pollution', 'monitoring station',

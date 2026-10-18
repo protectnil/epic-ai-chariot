@@ -24,8 +24,12 @@ import { getByTenantId } from '../services/tenant.js';
 import { getCollection } from '../db.js';
 import * as audit from '../services/audit.js';
 import type { EnterpriseUserDocument } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
 
-const router = Router();
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.session-routes');
+
+const router = Router({ mergeParams: true });
 
 /** GET /session -- Return the authenticated user's session information */
 router.get('/session', enterpriseAuthMiddleware(), (req: Request, res: Response): void => {
@@ -84,11 +88,11 @@ router.post(
         userAgent: req.headers['user-agent'] ?? 'unknown',
       }).catch((auditErr: unknown) => {
          
-        console.error('[iam/session] logout audit log failed', auditErr);
+        moduleLog.error('[iam/session] logout audit log failed', { error: auditErr instanceof Error ? auditErr.message : String(auditErr) });
       });
     } catch (err) {
        
-      console.error('[iam/session] logout failed', err);
+      moduleLog.error('[iam/session] logout failed', { error: err instanceof Error ? err.message : String(err) });
       res.status(500).json({ error: 'Failed to logout' });
     }
   },
@@ -222,11 +226,11 @@ router.post('/refresh', async (req: Request, res: Response): Promise<void> => {
       userAgent: req.headers['user-agent'] ?? 'unknown',
     }).catch((auditErr: unknown) => {
        
-      console.error('[iam/session] refresh audit log failed', auditErr);
+      moduleLog.error('[iam/session] refresh audit log failed', { error: auditErr instanceof Error ? auditErr.message : String(auditErr) });
     });
   } catch (err) {
      
-    console.error('[iam/session] refresh failed', err);
+    moduleLog.error('[iam/session] refresh failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(401).json({ error: 'Token refresh failed' });
   }
 });

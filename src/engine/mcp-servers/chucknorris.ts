@@ -37,7 +37,7 @@ export class ChuckNorrisMCPServer extends MCPAdapterBase {
       name: 'chucknorris',
       displayName: 'Chuck Norris Jokes',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'chuck norris', 'jokes', 'humor', 'comedy', 'fun',
         'random joke', 'categories', 'search jokes',

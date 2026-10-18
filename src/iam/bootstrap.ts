@@ -9,15 +9,26 @@
  * enterprise mode is not available and multi-user routes must not be mounted.
  */
 
-import { createClient, type RedisClientType } from 'redis';
+import type { RedisClientType } from 'redis';
 import { MongoClient, type Db } from 'mongodb';
 import { loadNativeBinding } from '../license/binding.js';
-import { validateLicense, type LicenseInfo } from '../license/loader.js';
+import { validateLicense, isEnterpriseEnvEnabled, type LicenseInfo } from '../license/loader.js';
+import { checkoutEntitlementAtBoot, checkInEntitlement } from '../license/license-manager.js';
 import { ensureEnterpriseIndexes } from './indexes.js';
 import { setMongoClient } from './db.js';
 import { setRedisClient as setRedisGlobal } from './redis.js';
-import { setRedisClient as setRedisSession } from './services/session.js';
+import { setRedisClient as setRedisSession, setSessionRedisDegraded, validateEnterpriseJwtSecret } from './services/session.js';
+// master-key reference: VALIDATION ONLY (format/presence check, no derivation or encrypt/decrypt call)
 import { validateMasterKey } from './crypto.js';
+import { createLogger } from '../engine/logger.js';
+import { resolveEnterpriseRedisClient } from './resolveEnterpriseRedis.js';
+// CHARIOT::§16.1 Operational (rulings item 91/105) — direct import,
+// matching this repo's established pattern.
+import { chariotEmitter } from '../observability/emitter.js';
+import { redactConnectionString } from './redactConnectionString.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.bootstrap');
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -26,7 +37,11 @@ export interface EnterpriseConfig {
   masterKey: string;
   mongoUri: string;
   mongoDb: string;
-  redisUrl: string;
+  // CHARIOT::§18.2::2 — Redis is optional in enterprise mode ("optionally
+  // uses Redis (in-process fallback if absent)"); `undefined` means the
+  // in-process shim is active rather than a real REDIS_URL.
+  redisUrl: string | undefined;
+  redisMode: 'external' | 'in-process-shim';
   license: LicenseInfo;
   nativeBinaryAvailable: boolean;
 }
@@ -36,6 +51,13 @@ export interface BootstrapResult {
   mongoClient: MongoClient;
   db: Db;
   redisClient: RedisClientType;
+  /**
+   * AWS License Manager consumption token (CH-24). Present only in License
+   * Manager mode; `undefined` on the offline Ed25519 path. Returned so an
+   * explicit caller can CheckIn at graceful shutdown; bootstrap also registers
+   * a best-effort signal-handler check-in.
+   */
+  licenseConsumptionToken?: string;
 }
 
 // ── Validation ────────────────────────────────────────────────────────────
@@ -63,6 +85,60 @@ function requireEnv(name: string, description: string): string {
 }
 
 /**
+ * CHARIOT::§20::4 — "ENTERPRISE_JWT_SECRET values shorter than 32 characters
+ * SHALL be rejected at startup." (CHARIOT-SPEC.md:1535: "values shorter than
+ * 32 chars are rejected"; :988: "the session module ... additionally rejects
+ * ... any value shorter than 32 characters.")
+ *
+ * requireEnv()'s generic floor above (16 chars) is shared with
+ * ENTERPRISE_MASTER_KEY, MONGODB_URI, and REDIS_URL — none of which carry a
+ * 32-char clause — so it cannot enforce the JWT-secret-specific floor on its
+ * own; a 16-31 char secret would pass requireEnv() and reach the mounted
+ * IAM routes. Delegates to session.ts's validateEnterpriseJwtSecret(),
+ * already boundary-tested at 31/32 chars in
+ * session.insecure-jwt-secret.test.ts, so bootstrap and the per-request
+ * signing path (session.ts getJwtSecret(), called on every issueToken()/
+ * verifyToken()) share one source of truth and can never diverge on the
+ * floor value.
+ *
+ * Exported (rather than inlined at the call site) so this integration seam
+ * is directly unit-testable: the rest of bootstrapEnterprise() additionally
+ * requires a loadable native binary plus reachable MongoDB/Redis, none of
+ * which this call depends on.
+ */
+export function enforceJwtSecretLengthFloor(): void {
+  validateEnterpriseJwtSecret();
+}
+
+/**
+ * CHARIOT::§18.3::1 — "IF the master key is missing in enterprise mode THEN
+ * the system SHALL fail-fast at startup (CH-19)." (CHARIOT-SPEC.md:1472)
+ *
+ * Wraps crypto.ts's validateMasterKey() (the single source of truth for
+ * "is ENTERPRISE_MASTER_KEY present/well-formed", already exercised by
+ * every credential-vault call site) with the "Enterprise startup failed:
+ * ..." message prefix requireEnv() uses above, so every enterprise-startup
+ * fail-fast path (bootstrapEnterprise() below AND `chariot serve --http`'s
+ * own enterprise bootstrap in engine/bin/setup.ts, which does not call
+ * bootstrapEnterprise()) reports this failure class identically.
+ *
+ * Exported/extracted (mirroring enforceJwtSecretLengthFloor() above) so
+ * this seam is directly unit-testable: it depends only on
+ * process.env.ENTERPRISE_MASTER_KEY, not on a loadable native binary or
+ * reachable MongoDB/Redis, none of which bootstrapEnterprise() as a whole
+ * can exercise in this sandbox (see bootstrap.jwt-secret-floor.test.ts).
+ */
+export function requireMasterKeyForEnterpriseStartup(): void {
+  try {
+    validateMasterKey();
+  } catch (err) {
+    throw new Error(
+      `Enterprise startup failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Recognize common insecure-default secrets that operators leave in
  * place after copy-paste setup. Compared case-insensitively. Extended
  * from the original 3-value list so a placeholder cannot
@@ -71,6 +147,39 @@ function requireEnv(name: string, description: string): string {
 function isWeakSecret(value: string): boolean {
   const v = value.trim().toLowerCase();
   return WEAK_SECRETS.has(v);
+}
+
+function buildBootstrapLicense(
+  checkout: Awaited<ReturnType<typeof checkoutEntitlementAtBoot>>,
+): LicenseInfo {
+  if (checkout.provider === 'offline-ed25519') {
+    return validateLicense();
+  }
+
+  const {
+    provider: _provider,
+    entitlementsAllowed: _entitlementsAllowed,
+    consumptionToken: _consumptionToken,
+    tier: _tier,
+    ...license
+  } = checkout;
+
+  return license;
+}
+
+function registerLicenseCheckInShutdown(consumptionToken: string): void {
+  const handleShutdown = (): void => {
+    void (async () => {
+      try {
+        await checkInEntitlement(consumptionToken);
+      } finally {
+        process.exit(0);
+      }
+    })();
+  };
+
+  process.once('SIGTERM', handleShutdown);
+  process.once('SIGINT', handleShutdown);
 }
 
 const WEAK_SECRETS: ReadonlySet<string> = new Set([
@@ -128,12 +237,24 @@ export async function bootstrapEnterprise(): Promise<BootstrapResult> {
     'Required for signing enterprise session tokens. ' +
     'Generate with: node -e "console.log(require(\'crypto\').randomBytes(64).toString(\'base64\'))"'
   );
+  // CHARIOT::§20::4
+  enforceJwtSecretLengthFloor();
 
   const masterKey = requireEnv(
     'ENTERPRISE_MASTER_KEY',
     'Required for AES-256-GCM credential vault encryption. ' +
     'Generate with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"'
   );
+  // CHARIOT::§18.3::1 — "Master key missing in enterprise mode | Fail-fast
+  // at startup (CH-19)." (CHARIOT-SPEC.md:1476) requireEnv() above already
+  // fails fast on unset/insecure-default/too-short, but only validateMasterKey()
+  // (crypto.ts) proves the value actually decodes to the required 32 AES-256
+  // bytes. That deeper check previously ran at step 5, AFTER the MongoDB
+  // dial below — a key that passed requireEnv()'s generic floor but failed
+  // 32-byte decoding would only surface post-connect, contacting Mongo on a
+  // doomed boot. Moved here, before any Mongo/Redis I/O, so "fail-fast at
+  // startup" holds for this failure class too.
+  validateMasterKey();
 
   // ── 3. MongoDB (item 9) ──────────────────────────────────────────────
 
@@ -143,7 +264,7 @@ export async function bootstrapEnterprise(): Promise<BootstrapResult> {
     'Example: mongodb://localhost:27017/'
   );
 
-  const mongoDb = process.env.MONGODB_DB || 'epicai';
+  const mongoDb = process.env.MONGODB_DB || 'chariot';
 
   let mongoClient!: MongoClient;
   let db!: Db;
@@ -154,9 +275,27 @@ export async function bootstrapEnterprise(): Promise<BootstrapResult> {
     // Verify connection by running a ping
     await db.command({ ping: 1 });
   } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    // CHARIOT::§16.1 Operational (CHARIOT-SPEC.md:1353, rulings item
+    // 91/105) — unlike Redis (which degrades gracefully), Mongo
+    // unreachable at boot is a hard fail-fast (no in-process fallback
+    // exists for the IAM store) — emitted BEFORE the throw so the
+    // customer-facing event still reaches any subscriber that was wired
+    // up earlier in the boot sequence, even though the process aborts
+    // enterprise startup immediately after.
+    chariotEmitter.send('mongo.unreachable', {
+      severity: 'urgent',
+      alertWorthy: true,
+      data: { mongoUri: redactConnectionString(mongoUri), reason, phase: 'boot' },
+    });
+    // rulings item 126 (W-IAM-REDACT) — the raw mongoUri (which may carry
+    // embedded userinfo) MUST NOT be interpolated into this message: it
+    // is a thrown Error, and an uncaught/logged Error.message is exactly
+    // the kind of sink the 3.1.1 leak incident named. Redact before
+    // interpolating, not after.
     throw new Error(
-      `Enterprise startup failed: MongoDB unavailable at ${mongoUri}. ` +
-      `Error: ${err instanceof Error ? err.message : String(err)}`
+      `Enterprise startup failed: MongoDB unavailable at ${redactConnectionString(mongoUri)}. ` +
+      `Error: ${reason}`
     );
   }
 
@@ -174,53 +313,56 @@ export async function bootstrapEnterprise(): Promise<BootstrapResult> {
   }
 
   // ── 4. Redis (items 7, 9) ────────────────────────────────────────────
-
-  const redisUrl = requireEnv(
-    'REDIS_URL',
-    'Required for enterprise session management and revocation. ' +
-    'Example: redis://localhost:6379'
+  //
+  // CHARIOT::§18.2::2 — "Enterprise mode ... optionally uses Redis
+  // (in-process fallback if absent)." (CHARIOT-SPEC.md:1467-1469) REDIS_URL
+  // is therefore read directly (never via requireEnv, which would fail-fast
+  // on an unset value) — unset/empty means "absent", not misconfigured.
+  //
+  // CHARIOT::§18.3::4 — resolveEnterpriseRedisClient() also degrades (never
+  // throws) when REDIS_URL is SET but unreachable at boot — see that
+  // module for the full clause quote and rationale. Shared with
+  // engine/bin/setup.ts's enterprise IAM bootstrap so the two
+  // enterprise-startup paths cannot diverge on Redis-absent/unreachable
+  // semantics, and so this decision is independently unit-testable without
+  // the native binary bootstrapEnterprise() as a whole requires.
+  const redisUrlRaw = process.env.REDIS_URL;
+  const redisUrl = redisUrlRaw && redisUrlRaw.trim() !== '' ? redisUrlRaw : undefined;
+  const { redisClient, redisMode, degraded: redisDegraded, reason: redisDegradedReason } = await resolveEnterpriseRedisClient(
+    redisUrl,
+    (message, data) => moduleLog.warn(`[iam/bootstrap] ${message}`, data),
   );
 
-  let redisClient: RedisClientType;
-  try {
-    redisClient = createClient({ url: redisUrl }) as RedisClientType;
-    // The 'error' event handler is required to prevent unhandled exceptions
-    // from taking down the process. Startup connection failures still throw
-    // from `connect()` below and are caught by the outer try/catch.
-    //
-    // Runtime errors AFTER successful connect (cluster failover, TLS hiccups,
-    // auth expiry, network partitions) ARE surfaced here — they were
-    // previously silently swallowed, which hid operational problems. The
-    // handler logs with a stable prefix so operators can grep for it, and
-    // does NOT re-throw: a runtime Redis error must not crash the enterprise
-    // process, only make itself visible.
-    redisClient.on('error', (err: unknown) => {
-       
-      console.error('[iam/bootstrap] redis runtime error', err);
-    });
-    await redisClient.connect();
-    // Verify connection
-    await redisClient.ping();
-  } catch (err) {
-    throw new Error(
-      `Enterprise startup failed: Redis unavailable at ${redisUrl}. ` +
-      `Error: ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
-
-  // ── 5. Validate master key eagerly (item 8) ──────────────────────────
-
-  validateMasterKey();
+  // ── 5. (removed — master key now validated at step 2, before any I/O) ──
 
   // ── 6. Wire up injected clients ─────────────────────────────────────
 
   setMongoClient(mongoClient, mongoDb);
   setRedisGlobal(redisClient);
   setRedisSession(redisClient);
+  // CHARIOT::§18.3 — thread the degrade state into session.ts so
+  // verifyToken() knows whether a missing activity key is fail-closed
+  // (normal) or ignorable (degraded — see setSessionRedisDegraded()'s doc).
+  setSessionRedisDegraded(redisDegraded, redisDegradedReason);
 
-  // ── 7. License check (items 14, 15) ─────────────────────────────────
+  // ── 7. Entitlement gate (CH-24, items 14, 15) ───────────────────────
+  //
+  // Offline Ed25519 (default, §11) OR AWS License Manager CheckoutLicense
+  // (opt-in via CHARIOT_LICENSE_PROVIDER=aws-license-manager / Marketplace).
+  // In LM mode a denied/missing/unavailable entitlement THROWS here, so
+  // enterprise boot fails closed exactly like the secret/service checks above.
+  const checkout = await checkoutEntitlementAtBoot();
+  const license = buildBootstrapLicense(checkout);
+  const licenseConsumptionToken = checkout.consumptionToken;
 
-  const license = validateLicense();
+  // CH-24: return the consumed entitlement to License Manager at graceful
+  // shutdown (best-effort; provisional tokens expire on their own, and
+  // checkInEntitlement is a no-op off the LM path). Wired here so every
+  // enterprise boot path gets check-in without extra caller code; the token
+  // is also returned for an explicit shutdown sequence.
+  if (licenseConsumptionToken) {
+    registerLicenseCheckInShutdown(licenseConsumptionToken);
+  }
 
   // ── 8. Assemble config ──────────────────────────────────────────────
 
@@ -230,21 +372,29 @@ export async function bootstrapEnterprise(): Promise<BootstrapResult> {
     mongoUri,
     mongoDb,
     redisUrl,
+    redisMode,
     license,
     nativeBinaryAvailable: true,
   };
 
-  return { config, mongoClient, db, redisClient };
+  return { config, mongoClient, db, redisClient, licenseConsumptionToken };
 }
 
 /**
- * Check if enterprise mode is explicitly requested.
- * Enterprise mode is active when:
- * - CHARIOT_ENTERPRISE=true is set, OR
- * - the native binary is present
+ * CHARIOT::§18.2::1/2 — mode selection is CHARIOT_ENTERPRISE alone:
+ * "Single-user mode: `npx @epicai/chariot` with no `CHARIOT_ENTERPRISE=1`."
+ * / "Enterprise mode: `CHARIOT_ENTERPRISE=1 npx @epicai/chariot`."
+ * (CHARIOT-SPEC.md:1465, 1467). Native-binary presence is NOT a mode
+ * trigger under the clause — a host that happens to have the compiled
+ * binary installed (e.g. `chariot health`, dev machines) must still boot
+ * single-user with no IAM/Mongo/Redis requirement absent the flag. Prior
+ * to this fix, `binding !== null` alone flipped this to `true`, which
+ * would have caused a caller gating on this function to demand IAM/Mongo
+ * on every host with the native binary present, contradicting §18.2::1's
+ * "no CHARIOT_ENTERPRISE=1" single-user case. loadNativeBinding() import
+ * kept only for isEnterpriseEnvEnabled's own binary-mismatch check
+ * upstream in license/loader.ts; this function no longer consults it.
  */
 export function isEnterpriseModeRequested(): boolean {
-  if (process.env.CHARIOT_ENTERPRISE === 'true') return true;
-  const binding = loadNativeBinding();
-  return binding !== null;
+  return isEnterpriseEnvEnabled();
 }

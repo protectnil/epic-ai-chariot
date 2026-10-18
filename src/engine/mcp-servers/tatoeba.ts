@@ -33,7 +33,7 @@ export class TatoebaMCPServer extends MCPAdapterBase {
       name: 'tatoeba',
       displayName: 'Tatoeba',
       version: '1.0.0',
-      category: 'language',
+      category: 'communication',
       keywords: [
         'tatoeba', 'sentences', 'multilingual', 'translations', 'corpus',
         'language learning', 'linguistics', 'iso 639-3', 'parallel corpus',

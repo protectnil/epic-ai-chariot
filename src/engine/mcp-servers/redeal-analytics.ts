@@ -41,7 +41,7 @@ export class RedealAnalyticsMCPServer extends MCPAdapterBase {
       name: 'redeal-analytics',
       displayName: 'Redeal Analytics',
       version: '1.0.0',
-      category: 'analytics',
+      category: 'data',
       keywords: [
         'redeal', 'analytics', 'events', 'deals', 'real estate', 'site',
         'company', 'metrics', 'tracking', 'event type', 'reporting',

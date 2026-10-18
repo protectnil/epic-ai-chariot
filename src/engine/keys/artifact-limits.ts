@@ -31,8 +31,12 @@ export const ABSOLUTE_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
  */
 export const ARTIFACT_LIMITS = {
   /** chariot-adapter-bundle.json / chariot-adapter-catalog.json /
-   *  chariot-mcp-registry.json. Historically called MAX_CATALOG_BYTES. */
-  catalog: 64 * 1024 * 1024,
+   *  chariot-mcp-registry.json. Every catalog entry now carries its top-level
+   *  `tools` (per-tool inputSchema: ToolDispatchRoute.ts, validateToolSchema.ts),
+   *  so the 5,050-entry 4.0 bundle is ~186 MiB and its catalog ~138 MiB;
+   *  256 MiB (the vector-index cap) preserves a bounded pre-parse envelope
+   *  with headroom and stays below ABSOLUTE_MAX_ARTIFACT_BYTES. */
+  catalog: 256 * 1024 * 1024,
   /** vector-index.json — dense+sparse routing artifact. Currently ~85 MB
    *  at v3.0.7; 256 MB leaves headroom for future catalog growth. */
   vectorIndex: 256 * 1024 * 1024,

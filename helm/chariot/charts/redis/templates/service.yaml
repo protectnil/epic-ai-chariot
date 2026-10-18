@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chariot-redis.fullname" . }}
+  labels:
+    {{- include "chariot-redis.labels" . | nindent 4 }}
+spec:
+  # Headless governing service; gateway connects via
+  # <release>-redis:{{ .Values.service.port }} (set in the gateway's REDIS_URL).
+  clusterIP: None
+  ports:
+    - name: redis
+      port: {{ .Values.service.port }}
+      targetPort: redis
+      protocol: TCP
+  selector:
+    {{- include "chariot-redis.selectorLabels" . | nindent 4 }}

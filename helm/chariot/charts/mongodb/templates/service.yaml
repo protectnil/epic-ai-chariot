@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chariot-mongodb.fullname" . }}
+  labels:
+    {{- include "chariot-mongodb.labels" . | nindent 4 }}
+spec:
+  # Headless governing service for the StatefulSet; gateway connects via
+  # <release>-mongodb:{{ .Values.service.port }} (set in the gateway's MONGODB_URI).
+  clusterIP: None
+  ports:
+    - name: mongodb
+      port: {{ .Values.service.port }}
+      targetPort: mongodb
+      protocol: TCP
+  selector:
+    {{- include "chariot-mongodb.selectorLabels" . | nindent 4 }}

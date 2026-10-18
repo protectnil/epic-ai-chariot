@@ -31,7 +31,7 @@ export class BoardGamesMCPServer extends MCPAdapterBase {
       name: 'boardgames',
       displayName: 'Board Game Atlas',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'board games', 'boardgames', 'tabletop', 'tabletop games',
         'card games', 'catan', 'board game atlas', 'bga',

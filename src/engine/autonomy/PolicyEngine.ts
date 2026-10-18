@@ -6,6 +6,10 @@
  */
 
 import type { AutonomyPolicy, ActionContext } from '../types/index.js';
+import { createLogger } from '../logger.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('engine.policy-engine');
 
 /**
  * Callback fired when a policy's `condition` predicate throws during
@@ -41,7 +45,7 @@ export class PolicyEngine {
       options?.onConditionError ??
       ((info) => {
          
-        console.warn(
+        moduleLog.warn(
           `[chariot/policy-engine] policy "${info.policyName}" condition threw and was skipped: ${info.error.message}`,
         );
       });

@@ -1,0 +1,93 @@
+name: PR Checks
+
+# The status check branch protection requires on every pull request.
+#
+# Before this workflow existed there was NO general CI on `pull_request`:
+# `release.yml` runs only on `v*.*.*` tags and `workflow_dispatch`,
+# `bien-runtime.yml` is path-filtered to native/retrieval, and
+# `leak-pattern-check.yml` scans the diff for secrets but never builds or tests.
+# A PR could therefore change any TypeScript in `src/` and no job would
+# typecheck, lint, or run the suite — and branch protection had no required
+# status check to point at.
+#
+# Deliberately uses `pull_request`, NOT `pull_request_target`: this job builds
+# and executes repository code, so it must run with the fork's read-only token
+# and no access to repository secrets. (`leak-pattern-check.yml` correctly uses
+# `pull_request_target` because it needs the denylist secrets, and it never
+# checks out PR code — it fetches the head ref as text and diffs it.)
+
+on:
+  pull_request:
+    branches: [main, master]
+  # Also run on pushes to the trunk so the required check has a baseline result
+  # on the branch itself, not only on PRs into it.
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must track engines.node (">=22.13.0") and the pin in release.yml.
+  NODE_VERSION: '22.13.0'
+
+jobs:
+  checks:
+    name: typecheck / lint / test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      # `scripts/run-all-tests.mjs` runs the registered suite. Two of its
+      # entries need external services and self-report their requirements
+      # rather than falling back to hardcoded defaults, so they are supplied
+      # here from ephemeral service containers, never from real credentials.
+      - name: Run the registered test suite
+        env:
+          CHARIOT_EVAL_MONGO_URI: mongodb://127.0.0.1:27017
+          CHARIOT_EVAL_REDIS_URL: redis://127.0.0.1:6379/15
+        run: npm test
+
+    services:
+      mongo:
+        image: mongo:7.0.14
+        ports: ['27017:27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7.4.1-bookworm
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10

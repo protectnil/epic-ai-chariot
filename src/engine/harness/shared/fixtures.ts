@@ -7,40 +7,24 @@
 
 import { SeededRandom, SEED } from './seed.js';
 
-export const ECHO_PAYLOAD = { message: 'harness-echo-test-1337' };
-export const ECHO_EXPECTED = { message: 'harness-echo-test-1337' };
-
-export const SLEEP_PAYLOAD = { ms: 100 };
-export const SLEEP_EXPECTED = { slept: 100 };
-
-export const SLEEP_OVER_MAX_PAYLOAD = { ms: 6000 };
-export const SLEEP_OVER_MAX_EXPECTED = { slept: 5000 };
-
-export const FAIL_PAYLOAD = { reason: 'harness-test-failure' };
-export const FAIL_EXPECTED_CODE = 'HARNESS_FAIL';
-
-export const MALFORMED_PAYLOAD_INJECTION = { variant: 2 };
-
-export const APPROVAL_PAYLOAD = { action: 'delete_all_records' };
-
-export const MULTI_STEP_PAYLOAD_1 = { step: 1 };
-export const MULTI_STEP_PAYLOAD_2 = { step: 2 };
-
-export const PING_EXPECTED_STATUS = 'ok';
-
-/** Auth token for the API harness backend */
-export const API_AUTH_TOKEN = process.env.HARNESS_API_TOKEN ?? 'test-harness-token';
-
-/** Deterministic vulnerability fixtures for API backend pagination */
-export function createVulnerabilityFixtures(count: number = 25): Array<{
+export interface ShadowRecord {
   id: string;
   severity: string;
   title: string;
   cvss: number;
-}> {
+}
+
+/** Auth token for the API harness backend */
+export const API_AUTH_TOKEN = process.env.HARNESS_API_TOKEN ?? 'test-harness-token';
+
+// CHARIOT::§8.11::2 — "... use deterministic mulberry32 fixtures seeded 1337 ..."
+// (CHARIOT-SPEC.md:824). All shadow-store seed data and error-handling
+// variants are generated from SeededRandom(SEED), never Math.random().
+/** Deterministic shadow-store seed records, shared by every profile's list/search/read/write-shadow/delete-shadow tools. */
+export function createShadowRecords(count: number = 25): ShadowRecord[] {
   const localRng = new SeededRandom(SEED);
   const severities = ['critical', 'high', 'medium', 'low'] as const;
-  const results = [];
+  const results: ShadowRecord[] = [];
   for (let i = 0; i < count; i++) {
     results.push({
       id: `VULN-${1000 + i}`,
@@ -51,3 +35,23 @@ export function createVulnerabilityFixtures(count: number = 25): Array<{
   }
   return results;
 }
+
+export const LIST_DEFAULT_LIMIT = 10;
+export const LIST_MAX_LIMIT = 50;
+
+export const SEARCH_PAYLOAD_MATCH = { query: 'Vulnerability 1' };
+export const SEARCH_PAYLOAD_SEVERITY = { query: 'critical' };
+export const SEARCH_PAYLOAD_NO_MATCH = { query: 'no-such-record-xyz' };
+
+export const READ_PAYLOAD_MISSING = { id: 'VULN-does-not-exist' };
+
+export const WRITE_SHADOW_PAYLOAD_CREATE = { fields: { severity: 'high', title: 'New Shadow Record', cvss: 7.5 } };
+export const WRITE_SHADOW_PAYLOAD_UPDATE_FIELDS = { fields: { severity: 'low', title: 'Updated Title', cvss: 1.0 } };
+
+export const DELETE_SHADOW_PAYLOAD_MISSING = { id: 'VULN-does-not-exist' };
+
+export const ERROR_HANDLING_PAYLOAD_REDACTION = { variant: 2 };
+export const ERROR_HANDLING_PAYLOAD_INJECTION = { variant: 3 };
+
+export const AUTH_FAILURE_EXPECTED_CODE = 'AUTH_FAILURE';
+export const RATE_LIMIT_EXPECTED_CODE = 'RATE_LIMIT_EXCEEDED';

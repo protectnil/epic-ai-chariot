@@ -36,7 +36,7 @@ export class RickMortyMCPServer extends MCPAdapterBase {
       name: 'rickmorty',
       displayName: 'Rick and Morty API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'rick and morty', 'rick', 'morty', 'characters', 'episodes',
         'locations', 'tv show', 'animation', 'adult swim', 'sci-fi',

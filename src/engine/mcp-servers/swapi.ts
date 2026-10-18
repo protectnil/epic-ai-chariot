@@ -92,7 +92,7 @@ export class SwapiMCPServer extends MCPAdapterBase {
       name: 'swapi',
       displayName: 'Star Wars API (SWAPI)',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'star wars', 'swapi', 'characters', 'people', 'planets', 'starships',
         'films', 'movies', 'sci-fi', 'luke skywalker', 'tatooine', 'death star',

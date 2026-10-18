@@ -28,7 +28,7 @@ export class DOAJMCPServer extends MCPAdapterBase {
       name: 'doaj',
       displayName: 'DOAJ — Directory of Open Access Journals',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'doaj', 'open access', 'journals', 'articles', 'academic',
         'peer review', 'research', 'scholarly', 'publications',

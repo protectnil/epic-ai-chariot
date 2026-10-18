@@ -4,11 +4,25 @@
  * Runs before BM25 to close the semantic gap without inference.
  * Zero cost. Zero latency. Zero cloud calls.
  *
+ * CHARIOT-SPEC.md §4.6: "`QueryExpander` (`src/engine/federation/
+ * QueryExpander.ts`) rewrites queries that contain known abbreviations (e.g.,
+ * "PD" -> "PagerDuty incident"). The expansion list is loaded from the
+ * catalog `keywords` field per adapter." `buildCatalogExpansionIndex` /
+ * `expandQuery`'s `catalogIndex` parameter below implement that: the
+ * catalog-driven path is what satisfies CHARIOT::§4.6::1. The `EXPANSIONS`
+ * table below is a separate, pre-existing, hand-authored heuristic kept for
+ * BM25 eval tuning (see the inline notes throughout it) — it is
+ * NOT loaded from any adapter's catalog `keywords` field and does not itself
+ * satisfy §4.6's data-source requirement.
+ *
  * Built on the Epic AI® Intelligence Platform
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
-/** Expansion rules: if query contains the key phrase, inject these terms */
+/**
+ * LEGACY heuristic expansion rules: if query contains the key phrase, inject
+ * these terms. Hand-authored, not catalog-sourced — see the file header.
+ */
 const EXPANSIONS: Record<string, string[]> = {
   // Security
   'brute force': ['crowdstrike', 'okta', 'auth0', 'sentinelone', 'login', 'authentication'],
@@ -16,7 +30,7 @@ const EXPANSIONS: Record<string, string[]> = {
   'ransomware': ['crowdstrike', 'sentinelone', 'carbon-black', 'backup', 'endpoint'],
   'vulnerability': ['qualys', 'tenable', 'snyk', 'aqua-security', 'cve', 'patch'],
   'vulnerabilities': ['qualys', 'tenable', 'snyk', 'aqua-security', 'cve', 'patch'],
-  // bug-tracker-ref: vendor expansions for vulnerability + container security.
+  // Vendor expansions for vulnerability + container security.
   // Pulls wiz / crowdstrike / aqua into the candidate set on "Kubernetes
   // vulnerability scan" style queries where the user named the technology
   // (kubernetes) but the test accepts the security adapter that scans it.
@@ -29,7 +43,7 @@ const EXPANSIONS: Record<string, string[]> = {
   'production deployment': ['github', 'github-actions', 'argocd', 'gitlab', 'circleci', 'jenkins'],
   'deployment changes': ['github', 'github-actions', 'argocd', 'gitlab', 'pagerduty'],
   'release deploy': ['github', 'github-actions', 'argocd', 'gitlab', 'circleci'],
-  // bug-tracker-ref retriever expansions for the eval-01 run-5 remaining misses.
+  // Retriever expansions closing the remaining eval misses.
   // Each phrase pulls domain-correct adapters into the candidate set so they
   // can compete with whatever generic-token match the retriever defaults to.
   'endpoint security': ['crowdstrike', 'sentinelone', 'agentsec', 'carbon-black', 'malwarebytes'],
@@ -47,7 +61,7 @@ const EXPANSIONS: Record<string, string[]> = {
   'hotel occupancy': ['impala-travel-hotels', 'nelly-elephant', 'opera-pms', 'mews', 'cloudbeds'],
   'hotel properties': ['impala-travel-hotels', 'nelly-elephant', 'opera-pms', 'mews', 'cloudbeds'],
   'hotel reporting': ['impala-travel-hotels', 'nelly-elephant', 'opera-pms', 'mews'],
-  // bug-tracker-ref: explicit identity / cloud expansions for queries
+  // Explicit identity / cloud expansions for queries
   // where the canonical brand (okta, aws) is dropped from the bundle and the
   // semantic-sibling adapter needs to be pulled into the candidate set.
   'okta login': ['microsoft-entra', 'auth0', 'crowdstrike-identity'],
@@ -276,11 +290,94 @@ const EXPANSIONS: Record<string, string[]> = {
   'rebooking': ['sabre', 'amadeus', 'travelport'],
 };
 
+// ─── Catalog-driven expansion (CHARIOT::§4.6::1) ───────────────────────────
+//
+// CHARIOT-SPEC.md §4.6: "The expansion list is loaded from the catalog
+// `keywords` field per adapter." Each adapter's `keywords` array is both the
+// set of triggers AND the set of expansion terms for that adapter: a query
+// containing any one of an adapter's keywords (e.g. the abbreviation "PD")
+// expands to include that adapter's id/name plus its OTHER keywords (e.g.
+// "PagerDuty", "incident") — the clause's own worked example.
+
+/** Structural view of the catalog fields needed to build the expansion index.
+ * Matches `AdapterEntry` (ChariotState.ts) and `AdapterCatalogEntry`
+ * (AdapterCatalog.ts) without importing either — this module stays a leaf. */
+export interface CatalogAdapterLike {
+  id?: string;
+  name?: string;
+  keywords?: string[];
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** One compiled catalog-keyword expansion rule. */
+interface CatalogExpansionRule {
+  /** Word-boundary, case-insensitive match on the catalog keyword — never a
+   * bare substring test, so a short abbreviation (e.g. "PD") cannot false-fire
+   * inside an unrelated token. */
+  regex: RegExp;
+  terms: Set<string>;
+}
+
+/** Built once per catalog load; consumed by every `expandQuery` call. */
+export type CatalogExpansionIndex = CatalogExpansionRule[];
+
 /**
- * Expand a query with domain-specific keywords.
- * Returns the original query with injected terms appended.
+ * Build the catalog-driven expansion index (CHARIOT::§4.6::1) from the
+ * adapter catalog. For every adapter with a non-empty `keywords` field, each
+ * keyword becomes a trigger whose expansion terms are the adapter's id, its
+ * name, and every other keyword on that same adapter. Adapters with no
+ * `keywords` contribute nothing (never a source of expansion — matches the
+ * clause: the list is "loaded from the catalog `keywords` field", so an
+ * adapter that publishes none has no expansion rule).
  */
-export function expandQuery(query: string): string {
+export function buildCatalogExpansionIndex(adapters: Iterable<CatalogAdapterLike>): CatalogExpansionIndex {
+  // Merge terms for keywords shared by multiple adapters before compiling the
+  // regex, so a keyword owned by two adapters expands to the union of both.
+  const byKeyword = new Map<string, Set<string>>();
+
+  for (const adapter of adapters) {
+    const keywords = Array.isArray(adapter.keywords)
+      ? adapter.keywords.filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+      : [];
+    if (keywords.length === 0) continue;
+
+    const terms = new Set<string>();
+    if (adapter.id) terms.add(adapter.id);
+    if (adapter.name) terms.add(adapter.name);
+    for (const kw of keywords) terms.add(kw);
+
+    for (const kw of keywords) {
+      const key = kw.toLowerCase();
+      const existing = byKeyword.get(key);
+      if (existing) {
+        for (const t of terms) existing.add(t);
+      } else {
+        byKeyword.set(key, new Set(terms));
+      }
+    }
+  }
+
+  const index: CatalogExpansionIndex = [];
+  for (const [keyword, terms] of byKeyword) {
+    index.push({ regex: new RegExp(`\\b${escapeRegExp(keyword)}\\b`, 'i'), terms });
+  }
+  return index;
+}
+
+/**
+ * Expand a query with domain-specific keywords. Returns the original query
+ * with injected terms appended.
+ *
+ * `catalogIndex` (CHARIOT::§4.6::1), when supplied, additionally expands
+ * abbreviations known to the adapter catalog's `keywords` field per §4.6 —
+ * this is the mechanism that satisfies the clause's data-source requirement.
+ * The `EXPANSIONS` heuristic above runs regardless (see the file header for
+ * why it is a separate, non-catalog mechanism).
+ */
+export function expandQuery(query: string, catalogIndex?: CatalogExpansionIndex): string {
   const lower = query.toLowerCase();
   const additions: Set<string> = new Set();
 
@@ -288,6 +385,16 @@ export function expandQuery(query: string): string {
     if (lower.includes(phrase)) {
       for (const term of terms) {
         additions.add(term);
+      }
+    }
+  }
+
+  if (catalogIndex) {
+    for (const rule of catalogIndex) {
+      if (rule.regex.test(query)) {
+        for (const term of rule.terms) {
+          additions.add(term);
+        }
       }
     }
   }

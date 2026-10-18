@@ -47,7 +47,7 @@ export class IpLookupMCPServer extends MCPAdapterBase {
       name: 'iplookup',
       displayName: 'IP Lookup',
       version: '1.0.0',
-      category: 'networking',
+      category: 'devops',
       keywords: [
         'ip', 'ip address', 'geolocation', 'geo', 'ipv4', 'ipv6',
         'isp', 'timezone', 'country', 'city', 'latitude', 'longitude',

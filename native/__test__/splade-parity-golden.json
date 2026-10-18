@@ -1,0 +1,10 @@
+{
+  "_comment": "SPLADE post-process parity golden (synthetic logits, batch=1, seq=2, vocab=4). Locks the lockstep contract: activation ln(1+max(0,x)), max-pool over seq with attention mask, >0 zero-suppression, ascending-token-id canonical serialization at 4 decimal places. The P5.2 publisher MUST reproduce expected_sha256 for the same logits. End-to-end real-model (Splade_PP_en_v1) parity between the publisher output and the native query path is the separate release gate.",
+  "dims": [1, 2, 4],
+  "attention_mask": [1, 1],
+  "logits": [2.0, -1.0, 0.0, 0.5, 0.0, 3.0, -0.5, 0.5],
+  "precision": 4,
+  "expected_indices": [0, 1, 3],
+  "expected_canonical": "0:1.0986,1:1.3863,3:0.4055",
+  "expected_sha256": "42417113fa605483123ec13c707ca38ee66e918b8220e2feb71d3e829eed5299"
+}

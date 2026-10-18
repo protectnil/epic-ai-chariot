@@ -10,77 +10,24 @@ import { canonicalStringify } from '../../util/canonical-json.js';
 import type { ActionRecord } from '../types/index.js';
 
 /**
- * Out-of-band anchor / attestation metadata the hash chain exposes to
- * operators and verifiers. Populated by the operator-driven CLI flows
- * (`chariot audit anchor` → , `chariot audit attest` → )
- * — NOT by the per-record append loop. See:
- *   - src/engine/audit/anchor.ts          (RFC-3161 external anchor)
- *   - src/engine/audit/length-attestation.ts (signed length attestation)
+ * Out-of-band anchor / attestation evidence is NOT held in this class.
  *
- * A verifier that holds the latest values from `getAnchorMetadata`
- * detects two attacks the bare hash chain cannot:
- *   - full re-stitch (Mode 2 of eval 07) — `lastAnchoredHead` was
- *     externally timestamped and any rewritten chain head differs.
- *   - silent truncation (Mode 5 of eval 07) — `lastAttestedLength`
- *     bounds the minimum acceptable current chain length.
+ * Re-stitch and silent-truncation detection are provided by FILE-BASED
+ * evidence that is persisted and verified independently of any HashChain
+ * instance:
+ *   - src/engine/audit/anchor.ts — RFC-3161 external anchor. Persisted as a
+ *     `.tsr` and verified via `verifyAnchor` (`chariot audit verify-anchor`).
+ *   - src/engine/audit/length-attestation.ts — signed length attestation.
+ *     Persisted as JSON and verified via `loadAttestations` + `detectTruncation`
+ *     (`chariot audit verify-length`).
  *
- * CLI registration GAP — neither `chariot audit anchor` nor `chariot
- * audit attest` is wired into the CLI registrar by this commit. The
- * CLI surface lives outside the engine package boundary; wire-up is a
- * follow-up commit on the CLI side.
+ * A previous version exposed per-instance `recordAnchor` /
+ * `recordLengthAttestation` / `getAnchorMetadata`, but the CLI wrote them to a
+ * throwaway instance that was garbage-collected at process exit and no verifier
+ * ever read them — dead, misleading API. It has been removed; use the
+ * file-based verify paths above.
  */
-export interface AnchorMetadata {
-  lastAnchoredHead?: Buffer;
-  lastAnchoredAt?: Date;
-  lastAttestedLength?: number;
-}
-
 export class HashChain {
-  /**
-   * Per-instance anchor metadata. Static methods on HashChain operate
-   * over caller-supplied record arrays so this state lives on the
-   * instance returned to operators rather than as module-global state.
-   */
-  private anchorMetadata: AnchorMetadata = {};
-
-  /** See {@link AnchorMetadata}. Returns a defensive shallow copy so
-   *  callers cannot mutate the internal record. The Buffer reference
-   *  IS shared — Buffers are treated as immutable bytes by convention
-   *  throughout this file. */
-  getAnchorMetadata(): AnchorMetadata {
-    return { ...this.anchorMetadata };
-  }
-
-  /** Hook for the `chariot audit anchor` CLI handler. Records the
-   *  head hash and time most recently anchored to the operator's TSA.
-   *  Does NOT itself perform the anchoring — see
-   *  src/engine/audit/anchor.ts `anchorChainHead`. */
-  recordAnchor(headHash: Buffer, anchoredAt: Date): void {
-    if (!Buffer.isBuffer(headHash) || headHash.length !== 32) {
-      throw new TypeError('recordAnchor: headHash must be a 32-byte Buffer');
-    }
-    if (!(anchoredAt instanceof Date) || Number.isNaN(anchoredAt.getTime())) {
-      throw new TypeError('recordAnchor: anchoredAt must be a valid Date');
-    }
-    this.anchorMetadata.lastAnchoredHead = headHash;
-    this.anchorMetadata.lastAnchoredAt = anchoredAt;
-  }
-
-  /** Hook for the `chariot audit attest` CLI handler. Records the
-   *  highest length ever asserted in a signed length attestation for
-   *  this chain. Detection of truncation against this value is the
-   *  caller's responsibility — see
-   *  src/engine/audit/length-attestation.ts `detectTruncation`. */
-  recordLengthAttestation(length: number): void {
-    if (!Number.isInteger(length) || length < 0) {
-      throw new TypeError('recordLengthAttestation: length must be a non-negative integer');
-    }
-    const prior = this.anchorMetadata.lastAttestedLength ?? 0;
-    if (length > prior) {
-      this.anchorMetadata.lastAttestedLength = length;
-    }
-  }
-
   /**
    * Compute SHA-256 hash of a record.
    * The hash field is set to empty string during computation.
@@ -90,11 +37,17 @@ export class HashChain {
    * the same ISO-8601 string they would under standard JSON.stringify.
    */
   static computeHash(record: Omit<ActionRecord, 'hash'>): string {
-    // Exclude mutable fields that may be updated after initial hashing
-    // (status, output, durationMs are set by updateStatus on pending records)
-    const { status: _s, output: _o, durationMs: _d, ...immutableFields } = record as Record<string, unknown>;
+    // Hash ALL fields — including status, output, and durationMs — so that any
+    // post-hoc edit to those fields (e.g. flipping status completed→failed, or
+    // altering output on a JSONL serve-path record) is detected by verifyChain.
+    //
+    // On the serve-sink path (serveAuditSink.recordDispatch) records are always
+    // written complete and final in a single record() call; updateStatus is never
+    // invoked on that path. On the orchestrator path (EpicAI.create) the
+    // InMemoryAuditAdapter.updateStatus cascade-recomputes hashes forward from
+    // the mutated record to maintain chain integrity after finalization.
     const serializable = {
-      ...immutableFields,
+      ...(record as Record<string, unknown>),
       hash: '',
     };
     const json = canonicalStringify(serializable);
@@ -102,12 +55,33 @@ export class HashChain {
   }
 
   /**
+   * True when a record is a full hash-chain participant — i.e. it carries a
+   * numeric `sequenceNumber` and a non-empty `hash`. JSONLAdapter status-update
+   * supplement lines carry neither (they only patch {id,status,output,...}),
+   * so they are NOT chain records and must be excluded before verifyChain,
+   * otherwise verifyChain recomputes a hash for a hashless supplement and
+   * reports the chain broken even with zero tampering.
+   *
+   * Single source of truth for the three call sites that must agree:
+   * AuditTrail.updateStatus lastHash sync, JSONLAdapter.lastRecord, and both
+   * verify() paths.
+   */
+  static isChainRecord(r: ActionRecord): boolean {
+    return typeof r.sequenceNumber === 'number' && typeof r.hash === 'string' && r.hash.length > 0;
+  }
+
+  /**
    * Verify the integrity of a chain of records.
    * Walks from first to last, recomputing each hash and checking previousHash links.
    *
+   * Non-chain records (e.g. JSONLAdapter status-update supplement lines) are
+   * filtered out first — they are not part of the hash chain and would
+   * otherwise be misread as tampering.
+   *
    * @returns valid=true if the entire chain is intact, or brokenAt=sequenceNumber where it breaks.
    */
-  static verifyChain(records: ActionRecord[]): { valid: boolean; chainLength: number; brokenAt?: number } {
+  static verifyChain(allRecords: ActionRecord[]): { valid: boolean; chainLength: number; brokenAt?: number } {
+    const records = allRecords.filter(r => HashChain.isChainRecord(r));
     if (records.length === 0) {
       return { valid: true, chainLength: 0 };
     }

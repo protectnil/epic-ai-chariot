@@ -68,7 +68,7 @@ export class NsfAwardsMCPServer extends MCPAdapterBase {
       name: 'nsf-awards',
       displayName: 'NSF Awards',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'nsf', 'national science foundation', 'awards', 'grants', 'funding',
         'research', 'science', 'engineering', 'education', 'pi', 'principal investigator',

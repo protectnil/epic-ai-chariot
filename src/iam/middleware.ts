@@ -23,8 +23,12 @@ import { clientIp as extractClientIp, escapeDpopHeaderValue, requestHtu, userAge
 import { validateLicense, checkSeatLimit } from '../license/loader.js';
 import { PromptCache } from '../engine/resilience/PromptCache.js';
 import { createLogger } from '../engine/logger.js';
+import { filterAdapterIdsForPrincipal } from './services/principal-partition.js';
+import type { LoadMappingsFn, NativeRbacResolver } from './services/principal-partition.js';
 
 const scimLog = createLogger('iam.scim');
+const principalPartitionLog = createLogger('iam.principal-partition');
+const moduleLog = createLogger('iam.middleware');
 
 // In-memory cache of tenant.settings.mfaRequired keyed by tenantId.
 // Avoids a DB lookup on every authenticated request when the token's
@@ -323,6 +327,17 @@ export function enterpriseAuthMiddleware(): RequestHandler {
       req.enterpriseUser = payload;
       req.tenantId = payload.tenantId;
 
+      // §10.8::5 / §3.5::23 — reject a URL tenantId that does not match the
+      // token's tid claim. The URL is the authoritative tenant selector; a
+      // token for another tenant must never operate under this tenant's path.
+      if (
+        typeof req.params.tenantId === 'string' &&
+        req.params.tenantId !== payload.tenantId
+      ) {
+        res.status(403).json({ error: 'Tenant mismatch' });
+        return;
+      }
+
       next();
     } catch {
       res.status(401).json({ error: 'Invalid or expired token' });
@@ -465,9 +480,55 @@ export function enterpriseAdminGuard(): RequestHandler {
  *    a fallback to the tenant ceiling; this branch enforces that boundary.
  *
  * 4. If both paths yield nothing, 403 with an explicit message.
+ *
+ * ## Principal-kind partition (gap #3 — Wiz 2 human/agent/service)
+ *
+ * This middleware is ALSO the live enforcement point for the principal
+ * partition. When the authenticated session is a NON-HUMAN principal
+ * (`enterpriseUser.principalType === 'agent' | 'service'` — stamped at
+ * issuance, e.g. by the ID-JAG token exchange), the Path-1 RBAC adapter
+ * list is re-filtered through `filterAdapterIdsForPrincipal`
+ * (services/principal-partition.ts): any adapter the session can only
+ * justify via a mapping whose `principalScope` excludes the caller's
+ * kind (e.g. `principalScope: ['human']`) is stripped before
+ * `req.allowedAdapterIds` is populated. If nothing survives, the
+ * request gets the same 403 as a user with no grants.
+ *
+ * Safe default — NO change to existing traffic: sessions with
+ * `principalType` absent, `'human'`, or any unrecognized value take the
+ * exact pre-partition code path (no mapping-store read, no native
+ * call). Mappings without `principalScope` apply to every principal
+ * kind, so agent/service sessions only lose grants an operator
+ * EXPLICITLY scoped away from them. The Path-2 tenant ceiling carries
+ * no per-grant principal scope and is intentionally not filtered.
+ *
+ * Fail-closed: if principal-scope re-resolution itself fails (mapping
+ * store unreachable), the non-human request is rejected with 503 rather
+ * than falling back to the unfiltered session list.
  */
-export function adapterFilterMiddleware(): RequestHandler {
-  return (req: Request, res: Response, next: NextFunction): void => {
+export interface AdapterFilterOptions {
+  /**
+   * Test seam: overrides how tenant mapping documents are loaded inside
+   * `filterAdapterIdsForPrincipal`. Production callers omit it (Mongo-
+   * backed `mapping.list`). Only ever invoked for agent/service
+   * sessions — never on the human/absent default path.
+   */
+  loadMappings?: LoadMappingsFn;
+  /**
+   * Test seam: overrides how the native RBAC decision surface is resolved
+   * inside `filterAdapterIdsForPrincipal` (CHARIOT::§2.1::2 — the decision
+   * is always the native `resolveUserAdaptersForPrincipal` export in
+   * production; there is no TS fallback to test around). Production
+   * callers omit it (real `resolveNativeFromBinding`). Lets unit tests
+   * exercise both the native-decision path and the fail-closed refusal
+   * path deterministically, independent of whether a platform binary
+   * happens to be present on the host running the test.
+   */
+  resolveNative?: NativeRbacResolver;
+}
+
+export function adapterFilterMiddleware(options: AdapterFilterOptions = {}): RequestHandler {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const enterpriseUser = req.enterpriseUser;
     const rbacAdapters = enterpriseUser?.adapterIds;
     const tenantCeiling = enterpriseUser?.allowedAdapterIds;
@@ -477,6 +538,40 @@ export function adapterFilterMiddleware(): RequestHandler {
     if (rbacAdapters && rbacAdapters.length > 0) {
       // Path 1: normal RBAC path.
       adapterIds = rbacAdapters;
+
+      // Principal partition (gap #3): agent/service sessions must not
+      // inherit grants an operator scoped to other principal kinds.
+      // STRICT membership check — absent/'human'/unknown values all fall
+      // through to the unchanged legacy behavior (safe default).
+      const principalType = enterpriseUser?.principalType;
+      if ((principalType === 'agent' || principalType === 'service')
+        && enterpriseUser?.tenantId) {
+        try {
+          adapterIds = await filterAdapterIdsForPrincipal(
+            enterpriseUser.tenantId,
+            principalType,
+            userGroups ?? [],
+            adapterIds,
+            options.loadMappings ?? undefined,
+            options.resolveNative,
+          );
+        } catch (err) {
+          // Fail closed for the stricter (non-human) path only: never
+          // hand an agent the unfiltered human grant list because the
+          // mapping store was unreachable.
+          principalPartitionLog.error('principal-scope re-resolution failed', {
+            tenantId: enterpriseUser.tenantId,
+            principalType,
+            error: String(err),
+          });
+          res.status(503).json({
+            error: 'Authorization temporarily unavailable',
+            detail:
+              'Principal-scoped adapter authorization could not be resolved. Retry shortly.',
+          });
+          return;
+        }
+      }
     } else if (!userGroups || userGroups.length === 0) {
       // Path 2: allowlist-only tenant — user has no IdP groups, so
       // fall back to the tenant ceiling.
@@ -507,18 +602,28 @@ export function adapterFilterMiddleware(): RequestHandler {
 // ---------------------------------------------------------------------------
 
 /**
- * Remove adapters that have failed verification from the
- * request's `allowedAdapterIds`. MUST run AFTER
+ * Remove adapters that have not (yet) passed verification from
+ * the request's `allowedAdapterIds`. MUST run AFTER
  * `adapterFilterMiddleware()` — reads what the session said
- * the user could access, then strips any adapters whose
- * `VerifiedCatalog` record has `status: 'failed'`.
+ * the user could access, then strips any adapter whose
+ * `VerifiedCatalog` record is NOT `status: 'verified'` — i.e.
+ * `'failed'` (demoted), `'pending'` (never reviewed) or
+ * `'stale'` (review expired). Only `'verified'` adapters are
+ * reachable via REST/HTTP.
  *
  * This is the C2 enforcement surface for the Chariot
  * middleware. Upstream catalog demotion events eventually
  * become `catalog.markFailed(adapterName, reason)` calls on
- * the Chariot process; this middleware ensures that failed
- * adapters cannot be invoked via any authenticated
- * request, even if the session token still lists them.
+ * the Chariot process, and brand-new adapters simply have no
+ * verification record yet (`getVerification()` synthesizes a
+ * `'pending'` record for any adapter the catalog has never
+ * seen `markVerified`/`markFailed` called for). This
+ * middleware ensures that neither demoted NOR not-yet-reviewed
+ * adapters can be invoked via any authenticated request, even
+ * if the session token still lists them (feed #7 — the REST
+ * half of the same gate FederationManager already enforces on
+ * the dispatch side via `verifiedCatalog`/`AdapterVerificationLookup`,
+ * see FederationManager.ts's `verifiedCatalog` option doc).
  *
  * ## Fail-closed semantics
  *
@@ -534,15 +639,16 @@ export function adapterFilterMiddleware(): RequestHandler {
  * `adapterFilterMiddleware()` handles it.
  *
  * Adapter IDs on both sides (the session's list and the
- * catalog's failed records) are normalized via
+ * catalog's verification records) are normalized via
  * `canonicalName()` before comparison. The catalog
  * canonicalizes storage keys internally but preserves the
  * raw `adapterName` on its records, so without explicit
- * normalization a case/format mismatch would let failed
+ * normalization a case/format mismatch would let unverified
  * adapters through.
  *
- * If every adapter in the user's session has been demoted,
- * the request fails with `403 All adapters unavailable`.
+ * If every adapter in the user's session has been demoted or
+ * is not yet verified, the request fails with `403 All
+ * adapters unavailable`.
  *
  * When the provided catalog is undefined (tests or local
  * dev that doesn't wire one up), the middleware is a
@@ -552,12 +658,13 @@ export interface VerifiedCatalogEnforcementOptions {
   /**
    * Optional per-tenant override store (C3). When present,
    * any adapter that would normally be blocked by the C2
-   * failed-catalog filter is EXEMPTED for tenants that
-   * have an active override for that adapter. Requires
-   * `tenantResolutionMiddleware()` to have run first so
-   * `req.tenantId` is populated. When `req.tenantId` is
-   * unset (non-multi-tenant deployments), overrides are
-   * not consulted and enforcement behaves as plain C2.
+   * not-verified filter (failed, pending, OR stale) is
+   * EXEMPTED for tenants that have an active override for
+   * that adapter. Requires `tenantResolutionMiddleware()` to
+   * have run first so `req.tenantId` is populated. When
+   * `req.tenantId` is unset (non-multi-tenant deployments),
+   * overrides are not consulted and enforcement behaves as
+   * plain C2.
    */
   overrides?: TenantDemotionOverrideStore;
   /** Injected clock for deterministic tests. */
@@ -592,18 +699,31 @@ export function verifiedCatalogEnforcementMiddleware(
       next();
       return;
     }
-    const failedRecords = catalog.failedAdapters();
-    if (failedRecords.length === 0) {
+
+    // feed #7: block anything that is NOT 'verified' — 'failed' (demoted),
+    // 'pending' (no verification record at all yet — brand-new/never
+    // reviewed), and 'stale' (review expired) all resolve here, mirroring
+    // the FederationManager dispatch-side gate's status set but stricter
+    // (REST denies pending/stale outright rather than routing them to an
+    // approval queue, since there is no approval surface at this layer).
+    // getVerification() synthesizes a 'pending' record for any adapter id
+    // the catalog has never seen, so this also catches adapters with zero
+    // verification history — not just ones explicitly marked failed.
+    const notVerifiedSet = new Set<string>();
+    for (const id of allowed) {
+      const canonical = canonicalName(id);
+      if (catalog.getVerification(id).status !== 'verified') {
+        notVerifiedSet.add(canonical);
+      }
+    }
+    if (notVerifiedSet.size === 0) {
       next();
       return;
     }
-    const failedSet = new Set(
-      failedRecords.map((r) => canonicalName(r.adapterName)),
-    );
 
     // C3: consult the per-tenant override store. An adapter
     // that has an active override for this tenant is
-    // removed from the failed set for this request only.
+    // removed from the not-verified set for this request only.
     // The override is a deliberate business-continuity
     // decision by the tenant admin and does not affect
     // other tenants.
@@ -611,16 +731,16 @@ export function verifiedCatalogEnforcementMiddleware(
       const now = nowFn();
       const tenantId = req.tenantId;
       const exempt = new Set<string>();
-      for (const canonical of failedSet) {
+      for (const canonical of notVerifiedSet) {
         if (options.overrides.isExempted(tenantId, canonical, now)) {
           exempt.add(canonical);
         }
       }
-      for (const c of exempt) failedSet.delete(c);
+      for (const c of exempt) notVerifiedSet.delete(c);
     }
 
     const filtered = allowed.filter(
-      (id) => !failedSet.has(canonicalName(id)),
+      (id) => !notVerifiedSet.has(canonicalName(id)),
     );
     if (filtered.length === 0) {
       res.status(403).json({
@@ -760,7 +880,7 @@ export function requireEnterpriseAuth(
   const user = req.enterpriseUser;
   if (!tenantId || !user) {
      
-    console.error(
+    moduleLog.error(
       '[iam/middleware] requireEnterpriseAuth invoked without prior auth — ' +
         'route is missing enterpriseAuthMiddleware()',
     );

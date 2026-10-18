@@ -6,12 +6,15 @@
  * counterpart watcher in this file is therefore consuming a feed that
  * is no longer produced by the canonical Chariot catalog source. The
  * class remains exported for downstream SDK consumers who maintain
- * their own kill-list endpoint, but the bundled Chariot catalog flow
- * does not construct or start this watcher today. Catalog-refresh
- * driven revocation (`AdapterCatalogEntry.revoked = true`) plus
- * `TenantDemotionOverrides` for per-tenant overrides cover the same
- * win condition. See bug for the cross-spec resolution
- * tracking.
+ * their own kill-list endpoint, and the bundled Chariot runtime can
+ * construct and start this watcher when `CHARIOT_KILL_LIST_URL` is
+ * configured. Catalog-refresh driven revocation
+ * (`AdapterCatalogEntry.revoked = true`) plus `TenantDemotionOverrides`
+ * for per-tenant overrides cover the same win condition, but they still
+ * wait for the catalog refresh cadence. This watcher is the faster
+ * revocation path: it polls a signed kill-list feed, diffs against the
+ * currently connected adapters, and unloads newly revoked ones without
+ * waiting for the full catalog refresh cycle.
  *
  * Polls a signed kill list from a well-known URL and calls
  * `FederationManager.unloadAdapter()` for any currently-connected
@@ -25,9 +28,13 @@
  *
  * The kill list is Ed25519-signed using the same key pattern as the
  * adapter catalog (L2). When `publicKeyPem` is not supplied, the
- * watcher falls back to `CHARIOT_CATALOG_PUBLIC_KEY_PEM` from
- * `src/keys/chariot-catalog-public.ts`, so operators using the default
- * Chariot trust root get kill-list enforcement for free.
+ * watcher verifies against every entry of the compiled-in
+ * `CHARIOT_CATALOG_PUBLIC_KEYS` rotation set from
+ * `src/engine/keys/chariot-catalog-public.ts` (a signature that validates
+ * against ANY entry is accepted; the matched entry's `id` is logged), so
+ * operators using the default Chariot trust root get kill-list
+ * enforcement for free and a key rotation of the catalog publisher never
+ * strands the kill list on the previous key.
  *
  * Consumers who want a distinct kill-list key pass `publicKeyPem` in
  * `KillListWatcherOptions`. Consumers who explicitly want to opt out
@@ -71,10 +78,13 @@
 import { verify as cryptoVerify } from 'node:crypto';
 import { createLogger } from '../logger.js';
 import {
-  CHARIOT_CATALOG_PUBLIC_KEY_PEM,
-  CHARIOT_CATALOG_PUBLIC_KEY_ID,
+  CHARIOT_CATALOG_PUBLIC_KEYS,
+  type ChariotCatalogPublicKey,
 } from '../keys/chariot-catalog-public.js';
 import type { FederationManager } from './FederationManager.js';
+// CHARIOT::§16.1 Federation (rulings item 91/105/112(a)) — direct import,
+// matching this repo's established pattern.
+import { chariotEmitter } from '../../observability/emitter.js';
 
 const log = createLogger('federation.killlist');
 
@@ -102,6 +112,32 @@ export interface SignedKillList {
   entries: KillListEntry[];
 }
 
+/** Result of `verifyKillListSignature`: which accepted key (if any) validated the body. */
+export type KillListSignatureVerdict =
+  | { valid: true; keyId: string }
+  | { valid: false; keyId: null };
+
+/**
+ * Verify a kill-list body against an accepted-key set. The signature is
+ * accepted iff it validates against ANY entry (same rule as the catalog
+ * rotation set in `chariot-catalog-public.ts`); the matched entry's `id`
+ * is returned for logging. Key MATERIAL decides, never the `id`. Throws
+ * only on malformed key material, which callers log as `verify_error`.
+ */
+export function verifyKillListSignature(
+  bodyBytes: Buffer,
+  signatureBase64: string,
+  acceptedKeys: ReadonlyArray<ChariotCatalogPublicKey>,
+): KillListSignatureVerdict {
+  const signature = Buffer.from(signatureBase64, 'base64');
+  for (const key of acceptedKeys) {
+    if (cryptoVerify(null, bodyBytes, key.pem, signature)) {
+      return { valid: true, keyId: key.id };
+    }
+  }
+  return { valid: false, keyId: null };
+}
+
 export interface KillListWatcherOptions {
   /**
    * Federation manager to issue unload events against. Required —
@@ -127,9 +163,10 @@ export interface KillListWatcherOptions {
   verifySignature?: boolean;
   /**
    * PEM-encoded Ed25519 public key used to verify the kill list.
-   * Defaults to the bundled Chariot catalog public key
-   * (`CHARIOT_CATALOG_PUBLIC_KEY_PEM`). Pass a distinct key if your
-   * deployment uses separate signing keys for catalog vs kill list.
+   * Defaults to the bundled Chariot catalog rotation set
+   * (`CHARIOT_CATALOG_PUBLIC_KEYS`, every entry accepted). Pass a
+   * distinct key if your deployment uses separate signing keys for
+   * catalog vs kill list; a supplied key is then the ONLY key tried.
    */
   publicKeyPem?: string;
   /**
@@ -147,7 +184,7 @@ export class KillListWatcher {
   private readonly url: string | undefined;
   private readonly intervalMs: number;
   private readonly verifyEnabled: boolean;
-  private readonly publicKeyPem: string;
+  private readonly acceptedKeys: ReadonlyArray<ChariotCatalogPublicKey>;
   private readonly maxQuiescenceMs: number;
 
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -159,7 +196,10 @@ export class KillListWatcher {
     this.url = opts.url;
     this.intervalMs = opts.intervalMs ?? 5 * 60 * 1000;
     this.verifyEnabled = opts.verifySignature !== false;
-    this.publicKeyPem = opts.publicKeyPem ?? CHARIOT_CATALOG_PUBLIC_KEY_PEM;
+    this.acceptedKeys =
+      opts.publicKeyPem !== undefined
+        ? [{ id: 'caller-supplied', pem: opts.publicKeyPem }]
+        : CHARIOT_CATALOG_PUBLIC_KEYS;
     this.maxQuiescenceMs = opts.maxQuiescenceMs ?? 30_000;
 
     if (!this.verifyEnabled) {
@@ -196,7 +236,7 @@ export class KillListWatcher {
       url: this.url,
       intervalMs: this.intervalMs,
       verify: this.verifyEnabled,
-      keyId: this.verifyEnabled ? CHARIOT_CATALOG_PUBLIC_KEY_ID : 'disabled',
+      keyIds: this.verifyEnabled ? this.acceptedKeys.map((k) => k.id) : ['disabled'],
     });
 
     // Install the interval timer FIRST, then fire the immediate poll.
@@ -299,7 +339,10 @@ export class KillListWatcher {
         const result = await this.federation.unloadAdapter(
           entry.adapter_id,
           `kill_list: ${reason}` + (entry.ruleId ? ` (${entry.ruleId})` : ''),
-          { maxQuiescenceMs: this.maxQuiescenceMs },
+          // CHARIOT::§7.6::1/§7.6::4/§7.6::5 — every kill-list unload IS a
+          // runtime revocation: join the in-memory revocation set, cancel
+          // pending approvals, and emit federation.adapter.revoked.
+          { maxQuiescenceMs: this.maxQuiescenceMs, revoked: true },
         );
         log.info('kill_list_watcher.unloaded', {
           adapterId: entry.adapter_id,
@@ -309,6 +352,37 @@ export class KillListWatcher {
           quiescent: result.quiescent,
           inFlightAtClose: result.inFlightAtClose,
           durationMs: result.durationMs,
+        });
+        // CHARIOT::§16.1 Federation (CHARIOT-SPEC.md:1347, rulings item
+        // 91/105/112(a)/121) — the kill list's own runtime retirement
+        // path (ruling 112(a): this watcher is live, not dead code,
+        // despite its module-level @deprecated note about the upstream
+        // FEED being retired — a caller can still construct and start it
+        // against a self-hosted kill-list endpoint). RENAMED from the
+        // spec's original event name (ruling 121: that name collides
+        // with a repo leak-denylist pattern for internal catalog-
+        // lifecycle vocabulary) — semantics unchanged: an adapter the
+        // kill list names is retired from the tenant's catalog. Fires on
+        // every unload attempt regardless of `result.success` — the
+        // retirement decision was made and acted on either way; a failed
+        // teardown (quiescence timeout, transport-close error) is
+        // reflected in `result.success` for the caller, not withheld
+        // from this notification. Distinct from `adapter.revoked`
+        // (FederationManager.ts, fired inside unloadAdapter itself for
+        // EVERY `revoked: true` unload, kill-list or otherwise) — this
+        // event is specifically the kill-list's own retirement semantic,
+        // carrying `demotedAt` from the signed kill-list entry (that
+        // FIELD name is unrelated vocabulary and is unaffected by the
+        // rename — see the field's own doc comment above).
+        chariotEmitter.send('adapter.retired', {
+          severity: 'warning',
+          data: {
+            adapterId: entry.adapter_id,
+            demotedAt: entry.demotedAt ?? null,
+            reason,
+            ruleId: entry.ruleId ?? null,
+            success: result.success,
+          },
         });
       }
     } catch (err) {
@@ -344,14 +418,9 @@ export class KillListWatcher {
         });
         return null;
       }
-      let valid: boolean;
+      let verdict: KillListSignatureVerdict;
       try {
-        valid = cryptoVerify(
-          null,
-          bodyBytes,
-          this.publicKeyPem,
-          Buffer.from(signature, 'base64'),
-        );
+        verdict = verifyKillListSignature(bodyBytes, signature, this.acceptedKeys);
       } catch (err) {
         log.error('kill_list_watcher.verify_error', {
           url,
@@ -359,14 +428,15 @@ export class KillListWatcher {
         });
         return null;
       }
-      if (!valid) {
+      if (!verdict.valid) {
         log.error('kill_list_watcher.signature_verification_failed', {
           url,
-          keyId: CHARIOT_CATALOG_PUBLIC_KEY_ID,
-          note: 'kill list refused — either tampered or signed with a different key',
+          keyIds: this.acceptedKeys.map((k) => k.id),
+          note: 'kill list refused — either tampered or signed with a key outside the accepted set',
         });
         return null;
       }
+      log.debug('kill_list_watcher.signature_verified', { url, keyId: verdict.keyId });
     }
 
     let parsed: SignedKillList;

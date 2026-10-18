@@ -34,6 +34,22 @@ export interface RunTelemetrySnapshot {
   recentLogs: RunTelemetryLog[];
   lastEventType: StreamEvent['type'] | null;
   lastError: string | null;
+  // CHARIOT::§8.12::4 — "RunTelemetry.ts — per-run summary (token in, token
+  // out, latency, tool calls, audit records) written to the observability
+  // sink." The five fields below are the pinned set; durationMs above is
+  // preserved unchanged for existing consumers (format(), the 'done'-event
+  // timing line) and latencyMs mirrors its value under the clause's own
+  // field name rather than replacing durationMs.
+  /** CHARIOT::§8.12::4 pinned field — cumulative generator input tokens for this run. */
+  tokenIn: number;
+  /** CHARIOT::§8.12::4 pinned field — cumulative generator output tokens for this run. */
+  tokenOut: number;
+  /** CHARIOT::§8.12::4 pinned field — this run's latency; equal to durationMs. */
+  latencyMs: number;
+  /** CHARIOT::§8.12::4 pinned field — count of 'action' (tool dispatch) StreamEvents this run. */
+  toolCalls: number;
+  /** CHARIOT::§8.12::4 pinned field — count of audit records written this run (recordAudit()). */
+  auditRecords: number;
 }
 
 interface TelemetrySource {
@@ -161,11 +177,39 @@ export class RunTelemetryCollector {
   private readonly recentLogs: RunTelemetryLog[] = [];
   private lastEventType: StreamEvent['type'] | null = null;
   private lastError: string | null = null;
+  // CHARIOT::§8.12::4 — tokenIn/tokenOut/auditRecords have no producer
+  // StreamEvent (no generator-token or audit-write event type exists in
+  // StreamEvent's discriminated union), so unlike eventCounts/logCounts
+  // (passively derived from recordEvent/recordLog) these three are
+  // accumulated via explicit recordTokens()/recordAudit() calls made by
+  // the caller that actually has that data (Orchestrator, at the token-
+  // usage and audit-record call sites).
+  private tokenIn = 0;
+  private tokenOut = 0;
+  private auditRecordCount = 0;
 
   constructor(options: RunTelemetryCollectorOptions = {}) {
     this.runId = options.runId ?? randomUUID();
     this.startedAt = options.startedAt ?? new Date();
     this.maxRecentEntries = options.maxRecentEntries ?? 12;
+  }
+
+  /**
+   * CHARIOT::§8.12::4 — accumulate this run's token-in/token-out counts.
+   * Additive: safe to call once per generator invocation.
+   */
+  recordTokens(tokenIn: number, tokenOut: number): void {
+    this.tokenIn += tokenIn;
+    this.tokenOut += tokenOut;
+  }
+
+  /**
+   * CHARIOT::§8.12::4 — increment this run's audit-record count by one.
+   * Call once per audit record written (e.g. once per
+   * AuditTrail.record() call in the Orchestrator loop).
+   */
+  recordAudit(): void {
+    this.auditRecordCount += 1;
   }
 
   recordEvent(event: StreamEvent): void {
@@ -231,6 +275,15 @@ export class RunTelemetryCollector {
       recentLogs: [...this.recentLogs],
       lastEventType: this.lastEventType,
       lastError: this.lastError,
+      tokenIn: this.tokenIn,
+      tokenOut: this.tokenOut,
+      latencyMs: durationMs,
+      // 'action' StreamEvents are emitted once per dispatch (ActionEvent —
+      // "each dispatch" per §8.12::2's own child-span enumeration), so the
+      // existing passively-tracked eventCounts.action count IS the tool-call
+      // count — no separate accumulator needed for this one.
+      toolCalls: this.eventCounts.action,
+      auditRecords: this.auditRecordCount,
     };
   }
 

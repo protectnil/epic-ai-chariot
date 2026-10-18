@@ -16,6 +16,7 @@ import type {
   EgressRule,
   EgressContext,
   EgressDecision,
+  PrincipalType,
 } from './types.js';
 
 const log = createLogger('trust.access-policy');
@@ -256,7 +257,20 @@ export class AccessPolicyEngine {
   }
 
   private principalMatches(rule: PolicyRule, ctx: TenantContext): boolean {
-    const { roles, attributes } = rule.principal;
+    const { roles, attributes, principalTypes } = rule.principal;
+
+    // Principal-kind partition (gap #3). Fail closed: a rule that
+    // restricts itself to specific principal kinds must not match a
+    // context of a different kind, even if roles/attributes otherwise
+    // match. Absent ctx.principalType defaults to 'human' — legacy
+    // callers/tests that predate this field are treated as human
+    // principals, which preserves every existing grant while still
+    // letting an operator write an agent/service-scoped (or human-only)
+    // restriction today.
+    if (principalTypes?.length) {
+      const effectiveType: PrincipalType = ctx.principalType ?? 'human';
+      if (!principalTypes.includes(effectiveType)) return false;
+    }
 
     // If neither specified, matches all principals
     if (!roles?.length && (!attributes || Object.keys(attributes).length === 0)) {
@@ -415,6 +429,31 @@ export function matchHostPattern(pattern: string, host: string): boolean {
 function normalizeHostForMatch(input: string): string | null {
   if (typeof input !== 'string' || input.length === 0) return null;
   if (input.trim().length === 0) return null;
+  // Synthetic, non-network host identifiers emitted by
+  // FederationManager.resolveEgressTargetOrDeny for transports with no
+  // real DNS hostname: stdio adapters (`stdio:<name>`) and sandboxed
+  // adapter dispatch (`sandboxed:<name>`). These are opaque identifiers,
+  // not hostnames, so running them through the WHATWG URL hostname
+  // parser below is wrong: the embedded colon is parsed as a host:port
+  // separator, the adapter-name suffix is essentially never a valid
+  // numeric port, the `URL` constructor throws, and `matchHostPattern`
+  // silently fails closed for EVERY such pattern/host — including two
+  // identical `stdio:foo` strings being compared to each other. That
+  // made any hostPatterns rule targeting a stdio/sandboxed synthetic
+  // host permanently unmatchable (regression surfaced by the
+  // installed-adapter egress allowlist seeding in FederationManager,
+  // which needs exactly this to allow a declared stdio adapter by
+  // default). Case-insensitive literal comparison is the correct match
+  // semantics here — there is no IDN/homograph surface on an in-process
+  // synthetic identifier, so skipping URL normalization does not weaken
+  // the anti-homograph guarantees below, which still apply to every
+  // real hostname pattern. Wildcard characters (`*`/`**`/`?`) are left
+  // untouched (no masking needed, since there's no URL parser to
+  // confuse them) so glob patterns like `stdio:*` still work via the
+  // regex-building step in `matchHostPattern`.
+  if (/^(?:stdio|sandboxed):/i.test(input)) {
+    return input.toLowerCase();
+  }
   // URL parser does not preserve glob characters; substitute them with
   // lowercase markers that survive the parser's case normalization.
   const placeholderStar = 'starxxx000xxxplaceholder';

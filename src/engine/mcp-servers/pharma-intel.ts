@@ -47,7 +47,7 @@ export class PharmaIntelMCPServer extends MCPAdapterBase {
       name: 'pharma-intel',
       displayName: 'Pharma Intel',
       version: '1.0.0',
-      category: 'health',
+      category: 'healthcare',
       keywords: [
         'pharma', 'pharmaceutical', 'drug', 'fda', 'openfda', 'clinical trials',
         'rxnorm', 'adverse events', 'faers', 'drug approvals', 'drug labels',

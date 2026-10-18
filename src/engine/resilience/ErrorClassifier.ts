@@ -6,7 +6,18 @@
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
-export type ErrorCategory = 'transient' | 'permanent' | 'rate-limited' | 'timeout';
+/**
+ * §8.7::2 — CHARIOT-SPEC.md:769: "buckets exceptions into `transient`,
+ * `permanent`, `policy`, `unknown`. Each bucket has a different retry policy."
+ *
+ * `rate-limited` and `timeout` were shipped as separate categories; both are
+ * kinds of TRANSIENT failure and keep their own backoff via distinct rules
+ * rather than distinct categories. `policy` (an authorization/policy denial) is
+ * never retried — retrying a denial cannot change the answer and only burns
+ * quota. `unknown` is the fallback: retried, but less eagerly than a positively
+ * identified transient fault, and never silently reported as transient.
+ */
+export type ErrorCategory = 'transient' | 'permanent' | 'policy' | 'unknown';
 
 export interface ClassifiedError {
   category: ErrorCategory;
@@ -30,8 +41,9 @@ interface ClassificationRule {
 // AbortError instances short-circuit to timeout regardless of message text.
 const CLASSIFICATION_RULES: ClassificationRule[] = [
   {
+    // Rate limiting is a TRANSIENT fault with its own, longer backoff.
     patterns: ['429', 'rate limit', 'too many requests'],
-    result: { category: 'rate-limited', retryable: true, maxRetries: 5, backoffMs: 5000 },
+    result: { category: 'transient', retryable: true, maxRetries: 5, backoffMs: 5000 },
     prefix: 'Rate limited',
   },
   {
@@ -40,12 +52,23 @@ const CLASSIFICATION_RULES: ClassificationRule[] = [
     prefix: 'Transient error',
   },
   {
+    // Timeouts are transient too, with their own intermediate backoff.
     patterns: ['timeout', 'timed out', 'aborted'],
-    result: { category: 'timeout', retryable: true, maxRetries: 3, backoffMs: 2000 },
+    result: { category: 'transient', retryable: true, maxRetries: 3, backoffMs: 2000 },
     prefix: 'Timeout',
   },
   {
-    patterns: ['401', '403', '404', '400', 'unauthorized', 'forbidden', 'not found', 'invalid', 'permission'],
+    // §8.7::2 — a policy/authorization DENIAL: a deliberate decision, not a
+    // malformed or missing resource. Never retried; retrying cannot change the
+    // verdict. Placed AFTER the transient rules on purpose, preserving the
+    // documented priority above: a 5xx that merely mentions "permission" is
+    // still a transient server fault, not a denial.
+    patterns: ['policy', 'denied', 'egress', 'forbidden', 'unauthorized', 'permission', '401', '403'],
+    result: { category: 'policy', retryable: false, maxRetries: 0, backoffMs: 0 },
+    prefix: 'Policy denial',
+  },
+  {
+    patterns: ['404', '400', 'not found', 'invalid'],
     result: { category: 'permanent', retryable: false, maxRetries: 0, backoffMs: 0 },
     prefix: 'Permanent error',
   },
@@ -58,7 +81,9 @@ export class ErrorClassifier {
 
     // AbortError name short-circuits to the timeout rule regardless of message text.
     if (err.name === 'AbortError') {
-      const rule = CLASSIFICATION_RULES.find((r) => r.result.category === 'timeout');
+      // §8.7::2 — 'timeout' is no longer a category; the timeout RULE is still
+      // distinct (its own backoff) and is selected by its prefix.
+      const rule = CLASSIFICATION_RULES.find((r) => r.prefix === 'Timeout');
       if (rule) {
         return { ...rule.result, originalError: err, message: `${rule.prefix}: ${err.message}` };
       }
@@ -70,8 +95,11 @@ export class ErrorClassifier {
       }
     }
 
+    // §8.7::2 — an unmatched error is `unknown`, NOT `transient`. Reporting an
+    // unclassified fault as a positively-identified transient one hides the
+    // classifier's own coverage gaps; it is still retried, but less eagerly.
     return {
-      category: 'transient',
+      category: 'unknown',
       retryable: true,
       maxRetries: 2,
       backoffMs: 1000,

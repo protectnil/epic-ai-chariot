@@ -1,0 +1,13 @@
+# Patterns to ignore when packaging the chart.
+.DS_Store
+.git/
+.gitignore
+*.tmp
+*.bak
+*.orig
+*.swp
+.idea/
+.vscode/
+# ECS task-definition is a sibling delivery artifact, not part of the K8s chart
+# render. Keep it out of `helm package` output.
+ecs/

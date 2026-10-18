@@ -68,6 +68,19 @@ export interface LengthAttestationPayload {
 }
 
 /**
+ * CHARIOT::§9.8.3::3 — verifier-API return shape for verifyLengthAttestation,
+ * pinned verbatim to CHARIOT-SPEC.md §9.8.3: "Returns {valid: boolean,
+ * attestedAt: Date, chainId: string, attestedLength: number, error?: string}."
+ */
+export interface AttestationVerifyResult {
+  valid: boolean;
+  attestedAt: Date;
+  chainId: string;
+  attestedLength: number;
+  error?: string;
+}
+
+/**
  * Build the canonical signing payload for a length attestation. Mirrors
  * the loadRevocationList() pattern: signature is computed over the
  * canonical JSON of every field except `signature` itself.
@@ -107,21 +120,37 @@ export function signLengthAttestation(
 }
 
 /**
- * Verify a length attestation against a public key. Returns `true` IFF
- * the Ed25519 signature is valid over the canonical payload of the
- * attestation. Never throws — returns `false` on any decode/parse/
- * verify failure so callers can treat verification as a pure boolean.
+ * Verify a length attestation against a public key.
+ *
+ * CHARIOT::§9.8.3::3 — "The verifier API verifyLengthAttestation(att,
+ * publicKeyPem) SHALL return {valid, attestedAt, chainId, attestedLength,
+ * error?}." (CHARIOT-SPEC.md §9.8.3, Verifier API surface: "verifyLengthAttestation(att:
+ * LengthAttestation, publicKeyPem: string): Promise<AttestationVerifyResult>").
+ *
+ * Never throws — every decode/parse/verify failure resolves `valid: false`
+ * with a populated `error` so callers can await this without a try/catch.
  */
-export function verifyLengthAttestation(
+export async function verifyLengthAttestation(
   att: LengthAttestation,
-  publicKeyPem: string | Buffer | KeyObject,
-): boolean {
+  publicKeyPem: string,
+): Promise<AttestationVerifyResult> {
+  const chainId = att?.chainId as string;
+  const attestedLength = (att && Number.isInteger(att.length) ? att.length : NaN) as number;
+  const attestedAt = new Date(att?.attestedAt ?? NaN);
   try {
-    if (!att || att.schemaVersion !== 1) return false;
-    if (typeof att.signature !== 'string' || att.signature.length === 0) return false;
-    if (!Number.isInteger(att.length) || att.length < 0) return false;
+    if (!att || att.schemaVersion !== 1) {
+      return { valid: false, attestedAt, chainId, attestedLength, error: 'schemaVersion must be 1' };
+    }
+    if (typeof att.signature !== 'string' || att.signature.length === 0) {
+      return { valid: false, attestedAt, chainId, attestedLength, error: 'missing or empty signature' };
+    }
+    if (!Number.isInteger(att.length) || att.length < 0) {
+      return { valid: false, attestedAt, chainId, attestedLength, error: 'length must be a non-negative integer' };
+    }
     const key = resolvePublicKey(publicKeyPem);
-    if (key.asymmetricKeyType !== 'ed25519') return false;
+    if (key.asymmetricKeyType !== 'ed25519') {
+      return { valid: false, attestedAt, chainId, attestedLength, error: 'key must be Ed25519' };
+    }
     const payload: LengthAttestationPayload = {
       schemaVersion: att.schemaVersion,
       chainId: att.chainId,
@@ -130,9 +159,12 @@ export function verifyLengthAttestation(
       attestedAt: att.attestedAt,
     };
     const sigBuf = Buffer.from(att.signature, 'base64url');
-    return edVerify(null, canonicalAttestationPayload(payload), key, sigBuf);
-  } catch {
-    return false;
+    const ok = edVerify(null, canonicalAttestationPayload(payload), key, sigBuf);
+    return ok
+      ? { valid: true, attestedAt, chainId, attestedLength }
+      : { valid: false, attestedAt, chainId, attestedLength, error: 'signature verification failed' };
+  } catch (e) {
+    return { valid: false, attestedAt, chainId, attestedLength, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -160,10 +192,78 @@ export function detectTruncation(
       lastAttestedLength = a.length;
     }
   }
-  return {
-    truncated: currentLength < lastAttestedLength,
-    lastAttestedLength,
-  };
+  return { truncated: currentLength < lastAttestedLength, lastAttestedLength };
+}
+
+/**
+ * CHARIOT::§9.8.3::4 — "On each audit export or periodic health check the
+ * verifier SHALL reconcile the current chain length against the most recent
+ * attested length, and IF currentLength < attestedLength THEN emit CRITICAL
+ * audit.tail_truncation_detected{chainId,attestedLength,currentLength} and
+ * halt export." (CHARIOT-SPEC.md §9.8.3)
+ *
+ * Single reusable reconciliation entry point so `chariot audit verify-length`
+ * and any export/health-check caller (e.g. the `/audit-logs` admin route)
+ * share one implementation and cannot drift. Loads attestations for
+ * `chainId` from `<packageRoot>/audit/length-attestations/`, keeps only
+ * those that verify against `publicKeyPem`, and reconciles the max verified
+ * attested length against `currentLength` via {@link detectTruncation}.
+ *
+ * Fail-closed semantics (CHARIOT §9.8.3, 2026-09-01): when no
+ * attestation exists for `chainId` there is nothing to reconcile against and
+ * the result is `truncated: false, attestedLength: 0, unverifiable: false`
+ * (the chain was never attested). When attestations DO exist but NONE can be
+ * verified — because no verification key was supplied or every signature
+ * fails — the result is `unverifiable: true`: the caller MUST treat the
+ * export as unverifiable and halt, never proceed as if nothing was attested.
+ * A forged or mis-signed attestation is excluded from the reconciled set, so
+ * it can never mask real truncation; but an attested chain that cannot be
+ * checked is never silently served.
+ */
+/**
+ * CHARIOT::§9.8.1::3 — "Historical records remain verifiable only if the
+ * old public key is retained in a multi-key verification set (CH-03
+ * pattern)." `LengthAttestation` carries no `kid` field (unlike a
+ * kid-tagged chain record), so there is no signer identity to route by —
+ * multi-key verification here means trying every retained key and
+ * accepting the attestation if it validates under ANY of them, which
+ * gives the identical practical outcome (a record signed under a
+ * RETIRED-but-still-retained key still verifies) without a schema change
+ * to the on-disk attestation format.
+ */
+export type VerifyKeys = string | ReadonlyMap<string, KeyObject>;
+
+function verifyKeyPemCandidates(verifyKeys: VerifyKeys | undefined): string[] {
+  if (!verifyKeys) return [];
+  if (typeof verifyKeys === 'string') return [verifyKeys];
+  return Array.from(verifyKeys.values(), (k) => k.export({ type: 'spki', format: 'pem' }) as string);
+}
+
+export async function reconcileChainLength(
+  packageRoot: string,
+  chainId: string,
+  currentLength: number,
+  verifyKeys?: VerifyKeys,
+): Promise<{ truncated: boolean; attestedLength: number; currentLength: number; unverifiable: boolean }> {
+  const attestations = loadAttestations(packageRoot, chainId);
+  // verifyLengthAttestation is now Promise-returning per CHARIOT::§9.8.3::3
+  // (verifier API surface); reconcile sequentially so a caller awaiting this
+  // function observes every attestation checked before it resolves.
+  const candidates = verifyKeyPemCandidates(verifyKeys);
+  const verified: LengthAttestation[] = [];
+  for (const a of attestations) {
+    for (const pem of candidates) {
+      const r = await verifyLengthAttestation(a, pem);
+      if (r.valid) {
+        verified.push(a);
+        break; // valid under this key — no need to try the rest for this attestation
+      }
+    }
+  }
+  // CHARIOT::§9.8.3::4 — attested but unverifiable is a fail-closed condition.
+  const unverifiable = attestations.length > 0 && verified.length === 0;
+  const { truncated, lastAttestedLength } = detectTruncation(currentLength, verified);
+  return { truncated, attestedLength: lastAttestedLength, currentLength, unverifiable };
 }
 
 /**

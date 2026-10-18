@@ -1,0 +1,437 @@
+# Epic AI® Chariot — Helm values (CHARIOT-SPEC §23.2, CH-24…CH-30).
+#
+# CH-29 invariant: EVERY image reference lives in THIS file. Templates never
+# hard-code an image. An air-gapped install only needs to override
+# `global.imageRegistry` to repoint all three images at the Marketplace ECR —
+# see values-airgap.yaml.
+#
+# AWS Marketplace "Helm chart structure requirements" (container-product-policies)
+# requires each image to carry `registry` / `repository` / `tag` as sibling
+# fields so the Marketplace regionalization step can rewrite the registry host
+# per region. Each of the three image blocks below therefore declares its own
+# `registry`. It defaults to "" and falls back to `global.imageRegistry`, so the
+# CH-29 single-knob air-gap override keeps working exactly as before.
+
+global:
+  # Fallback registry prefix, applied to any image whose own `registry` is empty.
+  # Empty AND no per-image `registry` = the render ABORTS (CH-29: the chart
+  # never falls back to Docker Hub). For air-gap set this to your
+  # Marketplace ECR, e.g. "<acct>.dkr.ecr.<region>.amazonaws.com"
+  # (values-airgap.yaml). Per-image `registry` takes precedence.
+  imageRegistry: ""
+  # Pull secrets for a private registry / Marketplace ECR.
+  imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Gateway (image 1 of 3) ───────────────────────────────────────────────────
+gateway:
+  replicaCount: 1
+
+  image:
+    # AWS Marketplace rewrites this field per region. Empty → global.imageRegistry.
+    registry: ""
+    # CHARIOT-SPEC §23.2 image 1: `chariot-gateway`. Must equal the repository
+    # .github/workflows/marketplace-ecr.yml pushes (GATEWAY_IMAGE_REPOSITORY_NAME).
+    repository: chariot-gateway
+    # CH-26: immutable tag, format chariot-vX.Y.Z. NEVER "latest".
+    # Emitted by `node scripts/release.mjs --emit-image-tag`.
+    tag: "chariot-v4.0.0"
+    # CH-26: optional digest pin. When set it takes precedence over `tag`
+    # (strongest immutability). Example: "sha256:abc123…".
+    digest: ""
+    pullPolicy: IfNotPresent
+
+  # CH-28 fail-closed: REQUIRED operator-supplied Secret holding the gateway's
+  # sensitive env. The chart aborts templating if this is empty — no default,
+  # no blank (mirrors src/iam/bootstrap.ts requireEnv). The Secret MUST provide:
+  #   ENTERPRISE_JWT_SECRET   (>=16 chars, high-entropy)
+  #   ENTERPRISE_MASTER_KEY   (AES-256 base64)
+  #   MONGODB_URI             (must embed the mongodb auth below)
+  #   REDIS_URL               (must embed the redis auth below)
+  existingSecret: ""
+
+  # Enterprise multi-user mode (src/iam/bootstrap.ts). Off => single-user.
+  enterprise: true
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+  # Probes hit GET /health (src/engine/gateway/InferenceGateway.ts:167).
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 40
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  # Extra non-secret env for integration (e.g. Phase 3/4 EdgeShard/SPLADE/BIEN-dense
+  # paths) without editing templates. Sensitive values must come from
+  # existingSecret. NOTE: none of CHARIOT_SPLADE_MODEL_DIR / CHARIOT_DENSE_MODEL_DIR /
+  # ORT_DYLIB_PATH need an entry here in the default deployment — the Dockerfile
+  # bakes each as an image-level ENV default pointing at its own COPY destination
+  # (BIEN::§9::10); this list only overrides that default for a non-stock layout.
+  extraEnv: []
+  #  - name: CHARIOT_EXAMPLE
+  #    value: "x"
+
+  nodeSelector:
+    # CH-30: single-arch linux/amd64 (napi target x86_64-unknown-linux-gnu).
+    kubernetes.io/arch: amd64
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── License entitlement (CH-24) ──────────────────────────────────────────────
+license:
+  # "offline"  => Ed25519 offline license (§11). DEFAULT for every non-Marketplace
+  #               deployment (CH-24: "offline Ed25519 stays default off-Marketplace").
+  # "aws-license-manager" => AWS License Manager CheckoutLicense at boot.
+  provider: "offline"
+  awsLicenseManager:
+    enabled: false
+    # REQUIRED when enabled: the Marketplace product SKU / License Manager
+    # license ARN, and the purchased tier (basic | intermediate | premium).
+    # The LM boot gate fails closed if these are unset.
+    productSKU: ""
+    tier: ""
+    # PROVISIONAL | PERPETUAL — License Manager checkout type.
+    checkoutType: "PROVISIONAL"
+    seats: ""
+    tierEntitlement: ""
+    seatsEntitlement: ""
+    keyFingerprint: ""
+    beneficiary: ""
+    nodeId: ""
+  # AWS region for License Manager (only consulted when provider is
+  # aws-license-manager). The container holds NO static AWS keys (CH-25); access
+  # is via the IRSA role on serviceAccount.roleArn below.
+  region: ""
+
+# ── ServiceAccount / IRSA (CH-25) ────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: ""
+  # EKS IRSA: IAM role ARN granting the pod AWS access (e.g. License Manager
+  # CheckoutLicense). The container requests NO AWS credentials and bakes NO
+  # keys (CH-25) — all AWS access flows through this role. Leave empty when
+  # license.provider is "offline".
+  roleArn: ""
+  annotations: {}
+  # Deny-by-default: the gateway needs NO Kubernetes API access, so the
+  # projected API token is not mounted (CIS 5.1.5/5.1.6). IRSA is unaffected —
+  # the EKS pod-identity webhook injects its own aws-iam-token projected volume
+  # independent of this setting. Set true only if a cluster add-on genuinely
+  # needs the in-pod API token.
+  automountServiceAccountToken: false
+
+# ── Service ──────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 8000
+  annotations: {}
+
+# ── CH-54 image seal / deploy-time signature verification ────────────────────
+# Default-on and fail-closed:
+# - EKS: Kyverno admission policy verifies the gateway image signature.
+# - ECS: a Lambda lifecycle hook verifies the same Notation signature before
+#   the service scales up.
+# - OpenShift / IBM Marketplace: RHACS (Red Hat Advanced Cluster Security) is
+#   the certified admission-time verifier on that channel, not Kyverno.
+# - Offline verification: the trust policy and trust-store material are shipped
+#   in the rendered chart / deployment bundle.
+imageVerification:
+  enabled: true
+  # Which admission-time verifier renders/applies:
+  #   kyverno — ClusterPolicy (templates/image-verify-policy.yaml). Default;
+  #             this is what EKS installs get and nothing changes for them.
+  #   rhacs   — RHACS (StackRox) is the OpenShift-certified verifier. RHACS
+  #             has NO Helm-renderable CRD for SignatureIntegration or its
+  #             enforcement policy (both are Central-owned REST resources,
+  #             per Red Hat Advanced Cluster Security for Kubernetes docs,
+  #             "Operating > Verifying image signatures") — this chart ships
+  #             a ConfigMap (templates/rhacs-signature-integration-note.yaml)
+  #             carrying the exact payload + roxctl commands an operator (or
+  #             a CI step with Central access) runs to reproduce Kyverno's
+  #             enforcement in RHACS. No Kyverno ClusterPolicy is rendered.
+  #   none    — no admission-time verifier renders at all. Refused by
+  #             chariot.assertImageVerifyFailClosed unless
+  #             allowInsecureAdmissionMode=true (see below) — CH-54 requires
+  #             SOME deploy-time verifier; "none" must be a deliberate choice.
+  engine: kyverno
+  # Break-glass: leave false so the chart fails closed (refuses to render) when
+  # NO verifier will actually run at admission time — imageVerification.enabled:
+  # false, engine: none, or (kyverno only) a weakened validationFailureAction /
+  # failurePolicy. Set true only to deliberately install without one (CH-54).
+  allowInsecureAdmissionMode: false
+  kyverno:
+    validationFailureAction: Enforce
+    failurePolicy: Fail
+    timeoutSeconds: 30
+  # RHACS (engine: rhacs) values. Consumed by
+  # templates/rhacs-signature-integration-note.yaml, which turns these into
+  # the roxctl invocation + Central API payload an operator applies manually
+  # — RHACS itself is not Helm-managed (see the `engine` comment above).
+  rhacs:
+    # Required (fail-closed, see chariot.assertImageVerifyFailClosed) whenever
+    # engine=rhacs and allowInsecureAdmissionMode is false: proves the value
+    # was supplied deliberately, not that Central enforces it yet — that is
+    # verified out-of-band after the operator completes the ConfigMap's steps.
+    signatureIntegrationName: ""
+    enforcementPolicyName: ""
+    cosign:
+      # PEM-encoded Cosign public keys, static-key verification.
+      publicKeys: []
+      # Keyless (Sigstore Fulcio/Rekor) verification instead of publicKeys.
+      certificateOIDCIssuer: ""
+      certificateIdentity: ""
+  notation:
+    trustPolicy:
+      name: aws-signer-tp
+      registryScopes:
+        - "*"
+      trustStores:
+        - signingAuthority:aws-signer-ts
+        - signingAuthority:aws-us-gov-signer-ts
+      # The AWS Signer signing profile that signs the Chariot images (seller
+      # account 827566276480, profile chariot_gateway_notation). Operators who
+      # re-sign images with their own profile replace this ARN.
+      trustedIdentities:
+        - arn:aws:signer:us-east-1:827566276480:/signing-profiles/chariot_gateway_notation
+    # PEM bundle shipped with the deployment so offline verification can use
+    # only public material: the AWS Signer Code Signing Root CA G1 (commercial)
+    # and the AWS Signer Code Signing GovCloud (US) Root CA G1, as published at
+    # https://docs.aws.amazon.com/signer/latest/developerguide/image-signing-prerequisites.html
+    # (d2hvyiie56hcat.cloudfront.net/aws-signer-notation-root.cert and
+    # aws-us-gov-signer-notation-root.cert). Signatures are partition-isolated.
+    certs: |-
+      -----BEGIN CERTIFICATE-----
+      MIICWTCCAd6gAwIBAgIRAMq5Lmt4rqnUdi8qM4eIGbYwCgYIKoZIzj0EAwMwbDEL
+      MAkGA1UEBhMCVVMxDDAKBgNVBAoMA0FXUzEVMBMGA1UECwwMQ3J5cHRvZ3JhcGh5
+      MQswCQYDVQQIDAJXQTErMCkGA1UEAwwiQVdTIFNpZ25lciBDb2RlIFNpZ25pbmcg
+      Um9vdCBDQSBHMTAgFw0yMjEwMjcyMTMzMjJaGA8yMTIyMTAyNzIyMzMyMlowbDEL
+      MAkGA1UEBhMCVVMxDDAKBgNVBAoMA0FXUzEVMBMGA1UECwwMQ3J5cHRvZ3JhcGh5
+      MQswCQYDVQQIDAJXQTErMCkGA1UEAwwiQVdTIFNpZ25lciBDb2RlIFNpZ25pbmcg
+      Um9vdCBDQSBHMTB2MBAGByqGSM49AgEGBSuBBAAiA2IABM9+dM9WXbVyNOIP08oN
+      IQW8DKKdBxP5nYNegFPLfGP0f7+0jweP8LUv1vlFZqVDep5ONus9IxwtIYBJLd36
+      5Q3Z44Xnm4PY/wSI5xRvB/m+/B2PHc7Smh0P5s3Dt25oVKNCMEAwDwYDVR0TAQH/
+      BAUwAwEB/zAdBgNVHQ4EFgQUONhd3abPX87l4YWKxjysv28QwAYwDgYDVR0PAQH/
+      BAQDAgGGMAoGCCqGSM49BAMDA2kAMGYCMQCd32GnYU2qFCtKjZiveGfs+gCBlPi2
+      Hw0zU52LXIFC2GlcvwcekbiM6w0Azlr9qvMCMQDl4+Os0yd+fVlYMuovvxh8xpjQ
+      NPJ9zRGyYa7+GNs64ty/Z6bzPHOKbGo4In3KKJo=
+      -----END CERTIFICATE-----
+      -----BEGIN CERTIFICATE-----
+      MIICdDCCAfqgAwIBAgIRANXkpKrZj0L324qGaqRhW/cwCgYIKoZIzj0EAwMwejEL
+      MAkGA1UEBhMCVVMxDDAKBgNVBAoMA0FXUzEVMBMGA1UECwwMQ3J5cHRvZ3JhcGh5
+      MQswCQYDVQQIDAJXQTE5MDcGA1UEAwwwQVdTIFNpZ25lciBDb2RlIFNpZ25pbmcg
+      R292Q2xvdWQgKFVTKSBSb290IENBIEcxMCAXDTI0MDMwNjIzMzgyOFoYDzIxMjQw
+      MzA3MDAzODI4WjB6MQswCQYDVQQGEwJVUzEMMAoGA1UECgwDQVdTMRUwEwYDVQQL
+      DAxDcnlwdG9ncmFwaHkxCzAJBgNVBAgMAldBMTkwNwYDVQQDDDBBV1MgU2lnbmVy
+      IENvZGUgU2lnbmluZyBHb3ZDbG91ZCAoVVMpIFJvb3QgQ0EgRzEwdjAQBgcqhkjO
+      PQIBBgUrgQQAIgNiAARog54ObzWaGU6fAOcL4Af+P93l2t8Dl9hVD2n0eSSfmPq1
+      3jtXgjcpXZIjMfoiWQPJTvyAB3opRyvO3grvUaWxRnjtwB/Pusj4tzhnaN+b80eJ
+      iRn6AzrI9vBssd1ZyRKjQjBAMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFJF4
+      zoYzTyn/5s8EleoNvek9QeE6MA4GA1UdDwEB/wQEAwIBhjAKBggqhkjOPQQDAwNo
+      ADBlAjEA8tcKeLPxBB0mRmfkJn5+hgYxZaRGQatO5mxmjkB/DNIfJ1WeEE3tbCHr
+      pNJL32FUAjBQY82UNV5yJrKFHOxuiQ+athQZUHLvWvAIXKExt9wvLdtKzfpag8BI
+      o2A2A4nk0jk=
+      -----END CERTIFICATE-----
+
+# ── Writable volume (CH-30) ──────────────────────────────────────────────────
+# Mounted at EPIC_AI_DIR_OVERRIDE (/var/lib/chariot). ALL runtime writers
+# (license cache, recovery store, Edge shard working copy, health file) target
+# it, so the container root filesystem stays read-only.
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 8Gi
+  existingClaim: ""
+
+# ── Pod / container security (CH-30 non-root least-privilege) ─────────────────
+# seccomp.customProfile: opt-in hardened Localhost profile (Wiz "isolate and
+# sandbox" gap #10). RuntimeDefault (the kubelet-shipped moderate profile)
+# stays the DEFAULT — flip customProfile.enabled=true to switch BOTH
+# podSecurityContext AND securityContext to
+# `type: Localhost, localhostProfile: <profiles/chariot-hardened.json>`. The
+# profile file ships in the chart (files/seccomp/chariot-hardened.json) and
+# must be placed on every node's kubelet seccomp root
+# (--root-dir/seccomp/profiles, default /var/lib/kubelet/seccomp/profiles)
+# at the SAME relative path before enabling this — the kubelet fails the pod
+# closed (not silently falls back to RuntimeDefault) if the file is missing.
+seccomp:
+  customProfile:
+    enabled: false
+    # Path is relative to the kubelet seccomp root
+    # (<kubelet-root-dir>/seccomp/<localhostProfile>), per the K8s
+    # localhostProfile contract. Ships in this chart at
+    # files/seccomp/chariot-hardened.json — copy it to every node's
+    # <kubelet-root-dir>/seccomp/profiles/chariot-hardened.json first.
+    localhostProfile: "profiles/chariot-hardened.json"
+podSecurityContext:
+  runAsNonRoot: true
+  # runAsUser / runAsGroup / fsGroup are DELIBERATELY UNSET at the pod level for
+  # the same reason as the container block below: OpenShift's default
+  # `restricted-v2` SCC allocates all three from the namespace's own ranges
+  # (`openshift.io/sa.scc.uid-range`, `.../supplemental-groups`), and a pinned
+  # 1000 falls outside every realistic range, so admission would reject the pod
+  # unless the buyer grants `nonroot-v2` or `anyuid`.
+  #
+  # fsGroup mattered most here: it is what chowns the mounted data volume, so
+  # pinning it to 1000 while OpenShift injects a different UID produced a volume
+  # the process could not write. Leaving it unset lets the SCC pick a value that
+  # is consistent with the injected UID. On vanilla Kubernetes the image's own
+  # `USER 1000:1000` still applies and /app plus the runtime dir are group-0
+  # writable with setgid, so nothing regresses there.
+  #
+  #   runAsUser: 1000
+  #   runAsGroup: 1000
+  #   fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  # runAsUser is DELIBERATELY UNSET so this chart is admissible under OpenShift's
+  # default `restricted-v2` SCC. That SCC uses the MustRunAsRange strategy and
+  # allocates UIDs per namespace from the project's
+  # `openshift.io/sa.scc.uid-range` annotation (ranges look like
+  # 1000680000-1000689999). Red Hat's guidance is explicit: "for Openshift's
+  # restricted/restricted-v2 SCC you MUST leave the runAsUser field empty, or
+  # provide a value that falls within the specific user range for the namespace.
+  # Otherwise, you will only be able to run the Pod if it has access to the SCC
+  # nonroot-v2 or anyuid." A hardcoded 1000 is outside every realistic range, so
+  # pinning it forced buyers into a cluster-admin SCC grant and would be flagged
+  # in Red Hat container certification.
+  #
+  # Nothing is weakened by omitting it. The image declares `USER 1000:1000`
+  # (Dockerfile), which is what satisfies runAsNonRoot on vanilla Kubernetes,
+  # and /app plus the runtime dir are group-0 owned and group-writable with the
+  # setgid bit, so an injected UID can write. Operators who need a pinned UID on
+  # non-OpenShift clusters can set `gateway.securityContext.runAsUser` back.
+  #
+  #   runAsUser: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# ── Pod egress NetworkPolicy (Wiz "isolate and sandbox" gap #8) ───────────────
+# Default OFF so existing installs render/behave identically on upgrade
+# (opt-in, no regression). When enabled, the policy is deny-by-default
+# egress: only DNS, the gateway's own in-cluster MongoDB/Redis pods (when
+# those subcharts are enabled), and the buyer-declared CIDR/port allowlist
+# below are permitted — everything else is blocked by the K8s NetworkPolicy
+# object model (an egress NetworkPolicy with no matching rule denies).
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, AWS VPC CNI
+# with NP support, …) — on a non-enforcing CNI this renders but has no
+# effect, which fails OPEN, not closed; verify enforcement in your cluster.
+networkPolicy:
+  enabled: false
+  # Cluster DNS egress. Always allowed when networkPolicy.enabled and
+  # dns.enabled — the gateway cannot resolve names (including the buyer's
+  # own MCP/AWS endpoints below) without it. Defaults match EKS CoreDNS.
+  dns:
+    enabled: true
+    namespaceSelector:
+      kubernetes.io/metadata.name: kube-system
+    podSelector:
+      k8s-app: kube-dns
+    port: 53
+  # Buyer-declared external endpoints the gateway is allowed to reach (MCP
+  # servers, AWS License Manager/STS/etc. via IRSA — see serviceAccount.roleArn).
+  # K8s NetworkPolicy has no native FQDN matching, so hostnames must be
+  # resolved to CIDRs by the operator (a /32 for a single fixed IP, or the
+  # provider's published range, e.g. AWS ip-ranges.json for the target
+  # region/service).
+  allowedEgress: []
+  # - cidr: "203.0.113.10/32"   # example: buyer's declared MCP endpoint
+  #   ports: [443]
+  # - cidr: "52.94.0.0/16"      # example: AWS service range for the buyer's region
+  #   ports: [443]
+  # Raw NetworkPolicyEgressRule entries, rendered as-is, for anything the
+  # structured `allowedEgress` shorthand above can't express (e.g. a
+  # namespaceSelector-based rule to reach another in-cluster service).
+  extraEgressRules: []
+
+# ── Vendored MongoDB subchart (image 2 of 3) — CH-28 ─────────────────────────
+mongodb:
+  enabled: true
+  image:
+    # AWS Marketplace rewrites this field per region. Empty → global.imageRegistry.
+    registry: ""
+    # Docker Official mongo image (env: MONGO_INITDB_ROOT_USERNAME/PASSWORD).
+    repository: mongo
+    tag: "8.0.34"   # pinned; never "latest" (CH-26)
+    digest: "sha256:4a4ab5d4834207389e0d7270fac988e21ffedccecba77991a552f755df229907"
+    pullPolicy: IfNotPresent
+  auth:
+    enabled: true
+    database: "epicai"
+    username: "chariot"
+    # CH-28 fail-closed: supply creds via an operator K8s Secret (PREFERRED)…
+    existingSecret: ""          # keys: mongodb-root-password, mongodb-password
+    # …or an inline password. The chart REFUSES a blank or weak/default value
+    # (mirrors src/iam/bootstrap.ts WEAK_SECRETS). No default is ever generated.
+    rootPassword: ""
+    password: ""
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 20Gi
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+  nodeSelector:
+    kubernetes.io/arch: amd64
+
+# ── Vendored Redis subchart (image 3 of 3) — CH-28 ───────────────────────────
+redis:
+  enabled: true
+  image:
+    # AWS Marketplace rewrites this field per region. Empty → global.imageRegistry.
+    registry: ""
+    repository: redis
+    tag: "8.10.2"   # pinned glibc base; never "latest" (CH-26)
+    digest: "sha256:2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6"
+    pullPolicy: IfNotPresent
+  auth:
+    enabled: true
+    # CH-28 fail-closed: operator Secret (PREFERRED) …
+    existingSecret: ""          # key: redis-password
+    # … or inline password; blank/weak/default is REFUSED.
+    password: ""
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 8Gi
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+  nodeSelector:
+    kubernetes.io/arch: amd64

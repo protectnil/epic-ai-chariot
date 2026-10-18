@@ -493,7 +493,7 @@ export class AWSS3MCPServer extends MCPAdapterBase {
       allHeaders['x-amz-security-token'] = this.sessionToken;
     }
 
-    const sortedHeaderKeys = Object.keys(allHeaders).sort();
+    const sortedHeaderKeys = Object.keys(allHeaders).sort((a, b) => { const x = a.toLowerCase(), y = b.toLowerCase(); return x < y ? -1 : x > y ? 1 : 0; });
     const canonicalHeaders = sortedHeaderKeys
       .map(k => `${k.toLowerCase()}:${allHeaders[k].trim()}`)
       .join('\n') + '\n';

@@ -26,6 +26,10 @@ Chariot license **validation** is fully offline (Ed25519 signature against a com
 - [ ] **Offline renewal:** Do not invoke `renewNow()`. Coordinate with protectNIL out-of-band to receive a refreshed license file before your term expires, and replace the file on disk.
 - [ ] **Override renewal endpoint:** Set environment variable `CHARIOT_LICENSE_URL=https://your-internal-proxy/license/renew` and proxy the call through your own egress controls.
 
+**AWS Marketplace deployments — a distinct licensing path.** Everything above describes the offline Ed25519 default. The Helm chart's air-gap overlay (`values-airgap.yaml`) ships this default explicitly: `license.provider: "offline"` with `license.awsLicenseManager.enabled: false`. If instead you deploy the AWS Marketplace container listing with AWS License Manager integration turned on, licensing is enforced by License Manager's `CheckoutLicense` call at gateway boot rather than by the offline Ed25519 path, and that call reports entitlement checks to AWS — a separate outbound dependency from the `epic-ai.io/api/license/renew` renewal call above. A deployment in this mode is bounded by AWS License Manager's own supported regions and connectivity requirements and is not zero-outbound.
+
+- [ ] Confirm which licensing mode this deployment uses: offline Ed25519 (`license.provider: offline`, air-gap default) or AWS License Manager (`license.provider: aws-license-manager`). If this deployment must remain air-gapped or zero-outbound, License Manager must stay disabled — it requires AWS reachability.
+
 ### 3. Identity provider configuration
 
 Chariot enforces access via SAML 2.0, OIDC, or SCIM 2.0 against your existing IdP (Okta, Entra ID, Ping, Auth0, Keycloak). All access control derives from claims your IdP issues:
@@ -50,7 +54,26 @@ Three outbound paths are off by default; verify they remain off:
 - [ ] Confirm the adapter integrity manifest verifies at startup (a tampered adapter file prevents Chariot from loading).
 - [ ] Acknowledge the documented adapter-sandbox limitation: Node.js adapters can in principle exfiltrate decrypted credentials if compromised at the npm dependency layer. Mitigate via network isolation per item 1.
 
-### 6. Internal API discovery scope
+### 6. Container image seal (CH-54)
+
+The deployment chain now extends from the catalog seal to the container image
+seal. The gateway image must be signed when pushed to Amazon ECR and deployed
+by immutable digest. Before a rollout, verify all of the following:
+
+- [ ] The rendered EKS manifest includes the Kyverno `ClusterPolicy` that
+  matches the gateway Pod, mutates the image to an immutable digest, and
+  requires a valid Notary signature.
+- [ ] The EKS policy is backed by the Notation trust store rendered with the
+  deployment bundle, including the trust policy and PEM certificate material.
+- [ ] The ECS service definition uses the digest-pinned gateway image reference
+  and the lifecycle hook Lambda is wired to `PRE_SCALE_UP`.
+- [ ] The ECS hook has an SNS topic configured so invalid or absent signatures
+  produce an alert before the deployment can proceed.
+- [ ] For air-gapped or disconnected verification, the operator has shipped the
+  public Notation trust material with the deployment and can run `notation
+  verify <repo>@sha256:...` without reaching out to a vendor endpoint.
+
+### 7. Internal API discovery scope
 
 The `chariot discover ./src` feature exposes internal REST/gRPC endpoints as MCP tools. Regulated environments must constrain this carefully:
 

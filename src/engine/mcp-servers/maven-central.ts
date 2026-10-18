@@ -24,7 +24,7 @@ export class MavenCentralMCPServer extends MCPAdapterBase {
       name: 'maven-central',
       displayName: 'Maven Central',
       version: '1.0.0',
-      category: 'developer-tools',
+      category: 'devops',
       keywords: [
         'maven', 'maven central', 'java', 'jvm', 'artifact', 'dependency',
         'groupId', 'artifactId', 'jar', 'pom', 'gradle', 'sonatype',

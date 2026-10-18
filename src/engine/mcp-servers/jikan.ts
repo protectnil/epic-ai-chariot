@@ -32,7 +32,7 @@ export class JikanMCPServer extends MCPAdapterBase {
       name: 'jikan',
       displayName: 'Jikan — MyAnimeList API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'jikan', 'anime', 'manga', 'myanimelist', 'mal', 'characters',
         'top anime', 'anime search', 'anime details', 'otaku', 'animation',

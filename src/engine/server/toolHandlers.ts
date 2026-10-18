@@ -7,27 +7,66 @@
  */
 
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { confinePath } from '../keys/pathConfinement.js';
+import { confinePath, confineStdioCommand } from '../keys/pathConfinement.js';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { ChariotState, ChariotHealthEmitArgs } from './ChariotState.js';
+import type { ChariotState, ChariotHealthEmitArgs, AdapterEntry } from './ChariotState.js';
 import { isOperationAllowed, type EnterpriseSessionPayload } from '../../iam/types.js';
 import { CHARIOT_ERROR_CODES } from '../types/index.js';
 import { PromptCache } from '../resilience/PromptCache.js';
 import { scanToolResultForInjection } from '../resilience/ToolResultInjectionScanner.js';
 import type { DlpInspector } from '../dlp/Inspector.js';
 import { findOnPath } from '../../cli/paths.js';
+import { CLI_BASE_ENV_ALLOWLIST, CLI_STDERR_CAP_BYTES, redactStderr, spawnWithTimeout } from './cliDispatch.js';
 import { retryTelemetryStorage } from '../mcp-servers/base.js';
 import { validateAgainstToolSchema } from '../federation/validateToolSchema.js';
-import { recordSurfacedTuples, wasSurfacedInSession } from './sessionSurfaceState.js';
+import {
+  recordSurfacedTuples,
+  wasSurfacedInSession,
+  wasPendingAlertsSurfacedInSession,
+  markPendingAlertsSurfacedInSession,
+} from './sessionSurfaceState.js';
+import { recordDispatch, AuditWriteError } from '../audit/serveAuditSink.js';
+import { applyCuratedHostOverride } from '../../catalog/curated.js';
 import { DOCKER_SAFE_IMAGE_RE, DOCKER_DIGEST_RE } from './dockerIntegrity.js';
-import { isEngineInternalCredentialKey } from '../../cli/credentials.js';
+import { isEngineInternalCredentialKey, loadCredentials } from '../../cli/credentials.js';
+import { buildRestAdapterConfig } from '../types/canonical-credentialed-brands.js';
+import { ensureCredentials, type CredentialPrompter } from '../credentials/ensureCredentials.js';
+
+/**
+ * The out-of-band credential prompter for the CURRENT tool call.
+ *
+ * Set by registerChariotTools around `handleCall` ONLY on the single-user
+ * local transport (stdio, localMode:true). Absent everywhere else — in
+ * multi-tenant HTTP there is no private page to send a tenant to, so the
+ * existing credentials_pending behavior applies unchanged. A request-scoped
+ * AsyncLocalStorage keeps one tenant's prompter from ever reaching another's call.
+ */
+export const credentialPrompterStorage = new AsyncLocalStorage<CredentialPrompter>();
 import { screenUserMessage, CODE_LEVEL_REFUSAL_TEXT } from '../persona/injection-defense.js';
-import { guardNpmStdioAdapter, enforcePinnedArgs } from '../federation/adapters/npmIntegrityGuard.js';
-import { extractStdioPackageName } from '../bin/concurrency.js';
+import type { DecisionAuditPort } from '../ports/DecisionAuditPort.js';
+import { enforceNpxStdioGate, isDangerousStdioEnvKey, stripDangerousStdioEnv } from '../federation/adapters/npmIntegrityGuard.js';
+import { resolveToolDispatchMechanism } from '../retrieval/ToolDispatchRoute.js';
+import { captureEvent } from '../../observability/operational-telemetry/capture.js';
+import { maybeUploadAfterCapture } from '../../telemetry-upload/uploader.js';
+import { chariotEmitter } from '../../observability/emitter.js';
+
+/**
+ * `captureEvent` plus the connected-deployment automatic-upload kick
+ * (C4AMD §8, amended 2026-10-12). `captureEvent` returns null unless the
+ * tenant has opted in, so an opted-out tenant never reaches the uploader.
+ * Never awaited by callers, never throws.
+ */
+function captureAndKick(input: Parameters<typeof captureEvent>[0]): Promise<void> {
+  return captureEvent(input).then(
+    (ev) => {
+      if (ev !== null) maybeUploadAfterCapture(input.tenantId);
+    },
+    () => undefined,
+  );
+}
+import { chariotAlertQueue } from '../../observability/alerts.js';
 // AS §1.5 CLI approval gate — hoisted to top-level so the hot dispatch
 // path doesn't pay a dynamic-import microtask on every CLI tool call.
 import { readAdapterApproval as _readAdapterApproval, computeAdapterShapeHash as _computeAdapterShapeHash, renderToolArgv as _renderToolArgv } from '../../cli/approval.js';
@@ -41,6 +80,11 @@ const _approvalGateLogger = _createLogger('engine.toolHandlers.approval');
 // radius signal channel: ops dashboards filter on
 // `epicai.toolHandlers.dlp` for redaction/block events.
 const _dlpFindingsLogger = _createLogger('engine.toolHandlers.dlp');
+// CHARIOT-SPEC §8.6a — tenant overlay tool registry read-path logging
+// (chariot_query listing degradation on a corrupt registry file; see the
+// call site's doc comment for why listing degrades instead of failing
+// the whole query, unlike the dispatch-path gate which fails closed hard).
+const _overlayRegistryLogger = _createLogger('engine.toolHandlers.customer-auth-overlay-registry');
 // Q-3.1: shape-hash is recomputed on every CLI dispatch. A prior
 // WeakMap<adapter.cli, string> memo was removed because the cache key
 // relied on object identity, which silently returned a stale hash if
@@ -72,9 +116,11 @@ function _shapeHashForCli(cli: { binary: string; args?: readonly unknown[]; tool
  *
  * INTERNAL-ONLY TELEMETRY — STRIPPED FROM PUBLIC TARBALL.
  *
- * Per internal product spec + security-review resolution (cite recorded
- * in the private repo handover): dispatch_events telemetry runs ONLY
- * on protectNIL-internal Chariot installs. The shipped @epicai/chariot
+ * dispatch_events telemetry runs ONLY where the operator explicitly
+ * configures the sink: the telemetry sink is configured only where the
+ * operator sets CHARIOT_INTERNAL_TELEMETRY_MONGODB_URI (plus the other
+ * two env vars below), and this whole block is stripped from the
+ * published tarball by scripts/release.mjs. The shipped @epicai/chariot
  * npm package is air-gap-by-default per the product tagline
  * "Self-hosted. Your data never leaves."
  *
@@ -259,6 +305,75 @@ export const MAX_ARG_PAYLOAD_BYTES = 65_536;
  */
 export const DEFAULT_CALLS_PER_MINUTE = 60;
 
+/**
+ * CH-41 — default wall-clock budget for a remote MCP dispatch (connect +
+ * callTool) when the adapter does not pin its own `timeoutMs`. The 3.1.2
+ * dogfood saw a streamable-http call hang ~60s (the SDK callTool default, with
+ * NO bound on connect) before failing. An explicit, shorter default makes a
+ * black-holed server fail fast and typed instead of stalling the agent.
+ */
+export const DEFAULT_DISPATCH_TIMEOUT_MS = 30_000;
+/** Absolute ceiling so a hostile/misconfigured catalog timeoutMs can't reintroduce an unbounded hang. */
+export const MAX_DISPATCH_TIMEOUT_MS = 120_000;
+
+/** Sentinel thrown by raceDispatchTimeout so the caller can emit a typed timeout failure. */
+export class DispatchTimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(`dispatch timed out after ${timeoutMs}ms`);
+    this.name = 'DispatchTimeoutError';
+  }
+}
+
+/**
+ * Race `op` against a hard wall-clock timeout. On timeout the returned promise
+ * rejects with DispatchTimeoutError; the caller is responsible for reaping the
+ * underlying transport (client.close()) in its finally so the abandoned
+ * connect/call cannot leak. A late rejection from `op` after the race is lost
+ * is swallowed to avoid an unhandledRejection.
+ */
+export function raceDispatchTimeout<T>(op: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new DispatchTimeoutError(timeoutMs)), timeoutMs);
+  });
+  op.catch(() => { /* swallow late rejection once the race is already settled */ });
+  return Promise.race([op, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+/** Resolve the effective per-dispatch timeout: adapter pin, clamped to the safety ceiling, else default. */
+export function resolveDispatchTimeoutMs(adapterTimeoutMs: number | undefined): number {
+  const t = typeof adapterTimeoutMs === 'number' && adapterTimeoutMs > 0
+    ? adapterTimeoutMs
+    : DEFAULT_DISPATCH_TIMEOUT_MS;
+  return Math.min(t, MAX_DISPATCH_TIMEOUT_MS);
+}
+
+/**
+ * CH-41: shared typed timeout response used by every MCP transport branch
+ * (stdio / docker / SSE / streamable-http) so a dispatch timeout is always a
+ * TYPED failure (outcome:'timeout', errorClass:'timeout', code:
+ * DISPATCH_TIMEOUT) — never a 60s stall that then reports success or an
+ * undifferentiated transport error.
+ */
+function dispatchTimeoutCallResult(adapterId: string, toolName: string, timeoutMs: number): CallResult {
+  return {
+    content: JSON.stringify({
+      error: `Dispatch to adapter "${adapterId}" tool "${toolName}" timed out after ${timeoutMs}ms`,
+      code: 'DISPATCH_TIMEOUT',
+      adapter: adapterId,
+      tool: toolName,
+      timeoutMs,
+    }),
+    isError: true,
+    retryCount: 0,
+    retryReasons: [],
+    outcome: 'timeout',
+    errorClass: 'timeout',
+  };
+}
+
 // Engine-internal first-party credentials are stripped from state.credentials
 // at load (isEngineInternalCredentialKey in cli/credentials.ts), so no dispatch
 // path that reads state.credentials can forward them — regardless of what a
@@ -316,11 +431,14 @@ export function __resetTenantBuckets(): void {
 }
 
 /**
- * Round-1 R1: shared MCP-client tool-result handoff helper. The three
- * MCP transport branches (stdio, sse, streamable-http) all do the
- * exact same content extraction + scanner wiring + return-shape; this
- * helper is the single source of truth so a future change applies to
- * every branch uniformly.
+ * Round-1 R1: shared MCP-client tool-result handoff helper. The MCP
+ * transport branches that actually connect (stdio, docker, streamable-http)
+ * all do the exact same content extraction + scanner wiring + return-shape;
+ * this helper is the single source of truth so a future change applies to
+ * every branch uniformly. CHARIOT::§7.2::3 — any transport other than
+ * `stdio`/`streamable-http` (sse, an alias/case-variant of it, or any other
+ * unimplemented value) is refused before dispatch and never reaches this
+ * helper.
  *
  * Extracts text content parts from the MCP result, joins with '\n',
  * runs the injection scanner, and returns the standard dispatcher
@@ -405,7 +523,7 @@ export function extractAndScanMcpTextResult(
  * fires; consumers can wire an observability emitter later by extending
  * this function rather than every call site.
  */
-function applyDlpInspection(
+export function applyDlpInspection(
   rawContent: string,
   ctx: { adapterId: string; toolName: string; dlp?: { inspector?: DlpInspector; tenantId?: string } },
 ): { kind: 'allow' | 'redact'; content: string } | { kind: 'block'; errorContent: string } {
@@ -716,8 +834,17 @@ export interface CallContext {
    * Enterprise session payload — required to enforce per-operation RBAC
  *. When undefined the call is anonymous and RBAC denies
    * unless `localMode` is explicitly true.
+   *
+   * `isAdmin` (CHARIOT::§16.2 step 4, rulings item 91(2)/115(b)) — added
+   * to this Pick so the §16.2 step-4 pendingAlerts gate (handleQuery/
+   * handleList) can read it from the SAME verified-session shape
+   * handleCall's RBAC already reads, rather than inventing a second
+   * parallel admin-flag path. Already stamped into the JWT at session-
+   * issue time (src/iam/services/session.ts:386) — this widening reads an
+   * existing, already-trusted field; it does not add a new trust
+   * boundary. Non-admin sessions never see the pendingAlerts block.
    */
-  auth?: Pick<EnterpriseSessionPayload, 'allowedOperations' | 'userId'> | null;
+  auth?: (Pick<EnterpriseSessionPayload, 'allowedOperations' | 'userId'> & { isAdmin?: boolean }) | null;
   /**
    * draft-04 §4.3 — Chariot-as-Client ID-JAG path. JWT `jti` of the
    * authenticated session. When the adapter manifest declares
@@ -740,6 +867,33 @@ export interface CallContext {
    */
   localMode?: boolean;
   /**
+   * CHARIOT::§16.2 (rulings item 91(2)/112(a)) — narrow, explicit system
+   * principal for the internal alert-dispatch subsystem
+   * (src/observability/alertDispatchWiring.ts), replacing an earlier
+   * `localMode: true` bypass. UNLIKE `localMode` (which trusts EVERY
+   * tool call once set), `systemPrincipal: 'alert-dispatch'` is checked
+   * against an explicit allow-list in `resolveRbacDecision` — ONLY the
+   * three alert-dispatch tools (Slack `post_message`, `send_email` on
+   * sendgrid/amazon-ses, PagerDuty `create_incident`) are permitted;
+   * every other (adapter, tool) pair is denied even under this
+   * principal. Set EXCLUSIVELY by trusted, server-side code
+   * (`alertDispatchWiring.ts`'s `createFederationAlertDispatcher`) that
+   * constructs the `CallContext` object literal directly — no transport
+   * (REST/HTTP/stdio) ever reads or forwards this field from request
+   * data, the same discipline `localMode` already follows (see that
+   * field's own doc comment: "NEVER set to true for any HTTP/SSE/
+   * streamable-HTTP transport" — the analogous rule for this field is
+   * "NEVER derived from caller-supplied request data, on any transport").
+   */
+  systemPrincipal?: 'alert-dispatch';
+  /**
+   * §3.5::17 (CH-12) — pre-dispatch hash-chained audit hook, supplied by the
+   * enterprise IAM layer. `handleCallImpl` (the request-boundary caller) invokes
+   * it after the RBAC and catalog gates pass and before any upstream dispatch.
+   * Absent on OSS / single-user installs with no IAM in front.
+   */
+  decisionAudit?: DecisionAuditPort;
+  /**
    * MCP per-session id when available. Threaded through from the
    * streamable-http transport (real per-connection uuid) or from the
    * stdio fallback synthesised in setup.ts. When present and
@@ -750,6 +904,31 @@ export interface CallContext {
    * because REST callers cannot maintain session continuity.
    */
   sessionId?: string;
+  /**
+   * Client IP the request originated from, when the transport can determine
+   * one (REST/HTTP — from the request socket). Threaded into the serve-path
+   * audit record (recordDispatch) for attribution. Undefined for stdio /
+   * transports with no per-request network origin — never fabricated.
+   */
+  sourceIp?: string;
+  /**
+   * CH-39 — engine-internal entity-resolver fan-out marker. The
+   * EntityResolver (src/engine/entity/EntityResolver.ts) dispatches its own
+   * tool calls to gather sources; those calls are issued under the caller's
+   * real context but were NEVER surfaced by a chariot_query in the session, so
+   * the TOOL_NOT_SURFACED_IN_SESSION gate would reject 100% of them and the
+   * resolver would always return 0 sources. When this flag is true the
+   * session-surface gate is skipped for that call ONLY.
+   *
+   * SECURITY: this exempts EXCLUSIVELY the session-surface confabulation gate.
+   * RBAC (resolveRbacDecision), the per-tenant rate limit, the depth/fan-out
+   * budget, the TOOL_NOT_REGISTERED catalog check, and DLP/injection scanning
+   * all still run unchanged. The flag is set internally by the resolver on a
+   * context it DERIVES from the caller's ctx; it is never read from tool args
+   * and no external transport populates it, so a caller cannot set it to
+   * bypass the gate for a hand-issued chariot_call.
+   */
+  internalResolverFanout?: boolean;
 }
 
 /**
@@ -759,7 +938,7 @@ export interface CallContext {
  * subsequent invocations in the same session, plus the per-request
  * tenant.
  *
- * tenantId (bug-tracker-ref): the caller's verified tenant. handleQueryImpl
+ * tenantId: the caller's verified tenant. handleQueryImpl
  * passes it to state.getConfiguredAdapters — the OSS build ignores the
  * arg (process-wide inventory) but the enterprise build injects a
  * per-tenant implementation, so threading the real tenant here is what
@@ -770,6 +949,27 @@ export interface CallContext {
 export interface QueryContext {
   sessionId?: string;
   tenantId?: string;
+  /** Per-tenant rate-limit override (req/min) for chariot_query. Defaults to DEFAULT_CALLS_PER_MINUTE. */
+  callsPerMinute?: number;
+  /**
+   * CHARIOT::§16.2 step 4 (rulings item 91(2)/115) — true only for a
+   * verified enterprise session whose JWT carries `isAdmin: true`
+   * (src/iam/services/session.ts:386). Gates the `pendingAlerts` block
+   * `handleQueryImpl` prepends to its response — never set from caller-
+   * supplied request data, only from the verified session the transport
+   * resolved (see registerChariotTools.ts / setup.ts's sec construction).
+   */
+  isAdmin?: boolean;
+}
+
+/**
+ * CHARIOT::§16.2 step 4 (rulings item 91(2)/115) — the equivalent context
+ * for chariot_list, which previously took no context parameter at all.
+ */
+export interface ListContext {
+  sessionId?: string;
+  tenantId?: string;
+  isAdmin?: boolean;
 }
 
 // =============================================================================
@@ -857,16 +1057,133 @@ export interface QueryArgs {
 }
 
 /**
+ * C4AMD §8 telemetry sentinel `canonicalToolId` for chariot_query events.
+ * chariot_query returns a bounded SHORTLIST, not one dispatched tool — it
+ * has no single canonical tool_id of its own (tool-level routing/dispatch
+ * telemetry belongs to chariot_call, wired above). This constant marks
+ * "this event is a chariot_query completion" distinctly from any real
+ * `adapter.tool` id, so query-level and call-level telemetry are never
+ * conflated in the stored/exported event stream.
+ */
+const QUERY_TELEMETRY_TOOL_ID = '(chariot_query)';
+
+/**
  * wrapper — every handleQuery response runs through this so the
  * estimatedTokenCost is stamped and the per-tenant budget is enforced.
+ * Also the chariot_query completion point wired to C4AMD §8 operational-
+ * telemetry capture (§8::2 off-by-default / §8::4 independence enforced
+ * inside `captureEvent` itself, exactly as in handleCall above).
+ *
+ * CHARIOT::§4.6::2 — chariot_query is the natural-language admin request
+ * call site: it carries a free-text `query` (QueryArgs) that flows into
+ * `activeFilter.select(query, ...)` (handleQueryImpl below), which runs
+ * QueryExpander's catalog-driven expansion. This is the "enabled ... for
+ * natural-language admin requests" half of §4.6's opt-in-per-call-site rule.
  */
+/**
+ * CHARIOT::§16.2 step 4 (CHARIOT-SPEC.md:1363, rulings item 91(2)/115) —
+ * "Conversational queue: surfaced at the start of the admin's next AI
+ * conversation." Chariot owns no conversation surface of its own
+ * (CHARIOT-SPEC.md:60), so this is operationalized as the FIRST
+ * successful chariot_query/chariot_list response of a new MCP session
+ * whose principal is a verified admin — shared by both `handleQuery` and
+ * `handleList`.
+ *
+ * Fail-closed gating (rulings item 115(b)/(c)): fires ONLY when
+ * `isAdmin === true` (from the verified JWT, never caller-supplied),
+ * `sessionId` is present (§16.2 step 4 is per-session, once), AND
+ * `tenantId` is present — a session with no resolvable tenant gets NO
+ * alerts rather than defaulting to "show everything" (which would leak
+ * every tenant's + process-scoped alerts to an unresolvable-tenant
+ * session). `sessionSurfaceState` gates once-per-session firing so a
+ * second call in the same session never repeats the block, matching the
+ * existing (adapter,tool)-surfacing tracker's own "fires once" contract
+ * — the session is marked EVEN when there happen to be zero pending
+ * alerts, so a later alert arriving mid-conversation is not retroactively
+ * surfaced on a subsequent call in that same session (spec: surfaced at
+ * conversation START, not on every call).
+ *
+ * Tenant scoping (rulings item 115(c)): `chariotAlertQueue.formatForAI
+ * (tenantId)` returns that tenant's own alerts PLUS process-wide
+ * (no-tenantId) operational alerts — see AlertQueue.matchesTenantScope's
+ * own doc comment. Presented alert ids are marked via markPresented()
+ * only after the response object is built (mirrors formatForAI's own
+ * "PURE READ, caller marks presented after delivery is confirmed"
+ * contract — this function's caller is about to return the response,
+ * the same "confirmed" assumption every other side effect on this path
+ * already makes).
+ *
+ * Returns `result` UNCHANGED (never mutates it) when the gate does not
+ * fire; otherwise returns a NEW object with `pendingAlerts` prepended.
+ */
+function maybeAttachPendingAlerts(
+  result: Record<string, unknown>,
+  state: ChariotState,
+  context: { sessionId?: string; tenantId?: string; isAdmin?: boolean } | undefined,
+): Record<string, unknown> {
+  if (context?.isAdmin !== true || !context.sessionId || !context.tenantId) return result;
+  if (!state.sessionSurfaceState) return result;
+  if (wasPendingAlertsSurfacedInSession(state.sessionSurfaceState, context.sessionId)) return result;
+
+  markPendingAlertsSurfacedInSession(state.sessionSurfaceState, context.sessionId);
+  const formatted = chariotAlertQueue.formatForAI(context.tenantId);
+  if (!formatted) return result;
+
+  // CHARIOT::§16.2 step 4 (rulings item 91(2)/115(c), chariot-verify-
+  // wave6 finding) — pass tenantId so a process-scoped alert is marked
+  // presented ONLY for THIS tenant, not globally (which previously hid
+  // it from every other tenant's admin session).
+  chariotAlertQueue.markPresented(formatted.alertIds, context.tenantId);
+  return { pendingAlerts: formatted.message, ...result };
+}
+
 export async function handleQuery(args: QueryArgs, state: ChariotState, context?: QueryContext): Promise<unknown> {
+  const queryStartedAt = Date.now();
+  const queryTelemetryTenantId = context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local';
+ // Per-tenant token-bucket rate limit (gap #17 — Wiz 5 finding
+  // that chariot_query, reachable from both REST /v1/tools/query and
+  // /mcp, never called consumeTenantToken at all, unlike chariot_call).
+  // Mirrors the existing handleCallImpl gate exactly: counted at entry,
+  // before any query processing, so a tenant cannot evade the per-tenant
+  // limit simply by hitting chariot_query instead of chariot_call.
+  const rateLimitTenantId = context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local';
+  const queryCallsPerMinute = context?.callsPerMinute ?? DEFAULT_CALLS_PER_MINUTE;
+  const rate = consumeTenantToken(rateLimitTenantId, queryCallsPerMinute);
+  if (!rate.allowed) {
+    void captureAndKick({
+      tenantId: queryTelemetryTenantId,
+      canonicalToolId: QUERY_TELEMETRY_TOOL_ID,
+      outcome: 'failure',
+      latencyMs: Date.now() - queryStartedAt,
+      failureStage: 'other',
+      occurredAt: new Date(),
+    });
+    return {
+      isError: true,
+      error: 'Per-tenant rate limit exceeded',
+      code: CHARIOT_ERROR_CODES.RATE_LIMIT_EXCEEDED,
+      tenantId: rateLimitTenantId,
+      retryAfterMs: rate.retryAfterMs,
+      retryAfterSeconds: Math.ceil(rate.retryAfterMs / 1000),
+      limit: queryCallsPerMinute,
+      windowSeconds: 60,
+    };
+  }
+
   // Screen the user query for refusal-fuzz / hypothetical-frame injection
   // attacks before any adapter selection or LLM call. Runs on every
   // chariot_query invocation (MCP and REST). screenUserMessage is
   // synchronous; cost is negligible relative to adapter selection.
   const screen = screenUserMessage(args.query ?? '');
   if (screen.block) {
+    void captureAndKick({
+      tenantId: queryTelemetryTenantId,
+      canonicalToolId: QUERY_TELEMETRY_TOOL_ID,
+      outcome: 'failure',
+      latencyMs: Date.now() - queryStartedAt,
+      failureStage: 'other',
+      occurredAt: new Date(),
+    });
     return {
       isError: true,
       error: 'content_policy_violation',
@@ -875,7 +1192,7 @@ export async function handleQuery(args: QueryArgs, state: ChariotState, context?
     };
   }
   const result = await handleQueryImpl(args, state, context);
-  // bug-tracker-ref: meter the per-tenant context budget against the caller's own
+  // Meter the per-tenant context budget against the caller's own
   // tenant, not a shared process-env tenant, so one tenant's queries cannot
   // consume another's budget. Falls back to process tenant when unset.
   const tenantId = context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local';
@@ -899,6 +1216,14 @@ export async function handleQuery(args: QueryArgs, state: ChariotState, context?
             tenantId, currentTokens: current, budgetTokens, wouldAddTokens: tokenCost,
           });
         }
+        void captureAndKick({
+          tenantId,
+          canonicalToolId: QUERY_TELEMETRY_TOOL_ID,
+          outcome: 'failure',
+          latencyMs: Date.now() - queryStartedAt,
+          failureStage: 'other',
+          occurredAt: new Date(),
+        });
         return {
           isError: true,
           error: 'context_budget_exceeded',
@@ -914,7 +1239,15 @@ export async function handleQuery(args: QueryArgs, state: ChariotState, context?
       contextRunningCost.set(tenantId, current + tokenCost);
     }
   }
-  return stamped;
+  void captureAndKick({
+    tenantId,
+    canonicalToolId: QUERY_TELEMETRY_TOOL_ID,
+    outcome: stamped['isError'] === true ? 'failure' : 'success',
+    latencyMs: Date.now() - queryStartedAt,
+    failureStage: stamped['isError'] === true ? 'other' : null,
+    occurredAt: new Date(),
+  });
+  return maybeAttachPendingAlerts(stamped, state, context);
 }
 
 function estimateRetrievalConfidence(
@@ -940,7 +1273,7 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
   const detail = args.detail ?? 'full';
   const discover = args.discover ?? false;
   const activeFilter = discover ? state.fullCatalogFilter : state.toolPreFilter;
-  // bug-tracker-ref: resolve the caller's verified tenant per-request. OSS
+  // Resolve the caller's verified tenant per-request. OSS
   // getConfiguredAdapters ignores the arg (process-wide inventory), but the
   // enterprise build injects a per-tenant impl — so passing the real tenant
   // here is what keeps the query-side adapter list tenant-isolated. Falls
@@ -955,7 +1288,7 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
     // tool-definition list loaded into the orchestrator LLM's context. Same
  // carve-out rationale as L292's Ring-1. See spec §3 for the
     // distinction between live-shortlist call sites and API-response paths.
-    const selected200 = await activeFilter.select(query, { maxTools: 220, maxPerServer: 10 });
+    const selected200 = await activeFilter.select(query, { maxTools: 220, maxPerServer: 10, tenantId: getTenantId() });
     const servers200 = [...new Set(selected200.map(t => t.server))];
     const ring2Servers = servers200.slice(20);
     const summaries = ring2Servers.flatMap(serverId => {
@@ -983,12 +1316,15 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
     };
   }
 
-  // shortlist-size: > 12 OK because chariot_query Ring-1 (BM25 + query
-  // expansion, top 20 detailed) returns matchedAdapters as an explicit
-  // search-result list the calling agent consumes (adapter IDs + metadata),
-  // NOT a tool-definition list loaded into the orchestrator LLM's context.
- // spec §3.
-  const selected = await activeFilter.select(query, { maxTools: 20, maxPerServer: 5 });
+  // §4.5: rank + honest-signal verdict. selectWithVerdict returns the same
+  // shortlist as select() plus the calibrated confidence (CH-37), the CH-49
+  // abstention verdict, the contributing legs, and whether a vector leg degraded
+  // to BM25 (§4.4). On abstention the shortlist is already empty → the no_match
+  // branch below fires (the router does not surface a confident absurd top-1).
+  // shortlist-size: > 12 OK because Ring-1 returns matchedAdapters as an explicit
+  // search-result list (adapter IDs + metadata), NOT tool-defs in LLM context. §3.
+  const verdict = activeFilter.selectWithVerdict(query, { maxTools: 20, maxPerServer: 5, tenantId: getTenantId() });
+  const selected = verdict.tools;
   const selectedServers = [...new Set(selected.map(t => t.server))];
 
   // Build category hints
@@ -1020,27 +1356,103 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
   const matches = selectedServers.flatMap(serverId => {
     const adapter = state.adapterById.get(serverId);
     if (!adapter) return [];
-    const toolNames = adapter.rest?.toolNames ?? adapter.mcp?.toolNames ?? [];
+    // cli-bridge adapters (AS §1.5) surface their tools via
+    // cli.toolSchemas[], not rest/mcp toolNames. Include them so the entire
+    // cli-bridge surface is reachable through chariot_query.
+    const toolNames = adapter.rest?.toolNames ?? adapter.mcp?.toolNames ?? adapter.cli?.toolSchemas?.map(s => s.name) ?? [];
+    // CH-50 — count honesty: the surfaced count is the authoritative bundle
+    // toolCount, never a stale/empty runtime tally (paypal/grafana/aws showed
+    // "0 tools" while toolCount=25). Fall back to the name-list length only when
+    // the bundle did not stamp a count.
+    const bundleToolCount = adapter.rest?.toolCount ?? adapter.mcp?.toolCount ?? toolNames.length;
+    // CH-34 (CHARIOT::§23.2::52-53) — retrieval result richness: per-adapter
+    // descriptionForRetrieval + per-tool {name, description, inputSchema} for
+    // the top-k, surfaced directly as `tools` (bare name strings are not
+    // richness). Per-tool metadata comes from the bundle's
+    // rest.tools[]/mcp.tools[], or cli.toolSchemas[] for cli-bridge adapters;
+    // when the bundle has not published per-tool metadata for an adapter,
+    // name-only entries fall back to an empty description/schema placeholder
+    // rather than a bare string.
+    const perTool = adapter.rest?.tools ?? adapter.mcp?.tools ?? adapter.cli?.toolSchemas;
+    const declaredToolList = (perTool && perTool.length > 0)
+      ? perTool.map(t => ({
+          name: t.name,
+          description: t.description ?? '',
+          inputSchema: t.inputSchema ?? { type: 'object', properties: {} },
+        }))
+      : toolNames.map(n => ({ name: n, description: '', inputSchema: { type: 'object', properties: {} } }));
+
+    // CHARIOT-SPEC §8.6a (team-lead review 2026-09-05): a `requiresCustomerAuth`
+    // adapter's declared list is empty/search-only at catalog publish; the
+    // tenant's customer-verified overlay tools (once embedded) must appear
+    // in chariot_query's per-adapter tool array too, or they are dispatchable
+    // (per the call-path fix above) but permanently invisible to discovery.
+    // Union by name, declared entries win on a name collision (they may
+    // carry richer catalog metadata) — new overlay-only names are appended.
+    // Asymmetric fail-closed: unlike the dispatch path (which hard-fails
+    // the call on a corrupt registry — a dispatch decision must never be
+    // made on unverifiable data), a corrupt registry HERE degrades this
+    // one adapter's listing to declared-tools-only rather than failing the
+    // entire (possibly multi-adapter) chariot_query response — listing
+    // FEWER tools than actually exist is not a security exposure the way
+    // authorizing an unverified dispatch would be.
+    let tools = declaredToolList;
+    if (adapter.requiresCustomerAuth === true && state.tenantOverlayToolRegistry) {
+      try {
+        const overlayTools = state.tenantOverlayToolRegistry.getTools(getTenantId(), adapter.id);
+        if (overlayTools.length > 0) {
+          const seen = new Set(declaredToolList.map((t) => t.name));
+          const merged = [...declaredToolList];
+          for (const ot of overlayTools) {
+            if (!seen.has(ot.name)) {
+              merged.push({
+                name: ot.name,
+                description: ot.description,
+                inputSchema: (ot.inputSchema ?? { type: 'object', properties: {} }) as Record<string, unknown> | { type: string; properties: Record<string, never> },
+              });
+              seen.add(ot.name);
+            }
+          }
+          tools = merged;
+        }
+      } catch (err) {
+        _overlayRegistryLogger.error('customer_auth_overlay registry unreadable during chariot_query listing — degrading to declared tools only', {
+          tenantId: getTenantId(),
+          adapterId: adapter.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const overlayAddedCount = tools.length - declaredToolList.length;
+
     return [{
       id: adapter.id,
       name: adapter.name,
       type: adapter.type,
       category: adapter.category,
-      tools: toolNames,
-      toolCount: toolNames.length,
+      descriptionForRetrieval: adapter.descriptionForRetrieval ?? adapter.description ?? '',
+      tools,
+      // CH-50 count honesty extends to the overlay: a tenant-visible overlay
+      // tool that widens the list beyond the bundle's declared toolCount
+      // must be reflected here too, or "N tools" would undercount what
+      // chariot_query's own `tools` array just returned for this tenant.
+      toolCount: bundleToolCount + overlayAddedCount,
       configured: state.configuredAdapterIds.has(adapter.id),
-      transport: adapter.mcp?.transport ?? (adapter.rest ? 'rest' : 'unknown'),
+      transport: adapter.mcp?.transport ?? (adapter.rest ? 'rest' : adapter.cli ? 'cli' : 'unknown'),
     }];
   });
 
-  const retrievalConfidence = estimateRetrievalConfidence(query, matches, discover);
+  // CH-37: calibrated confidence IS the contract (§4.5). The legacy heuristic
+  // (estimateRetrievalConfidence) is no longer emitted as retrievalConfidence —
+  // the calibrated verdict.confidence is the authoritative value for all consumers.
+  const retrievalConfidence = verdict.confidence;
   const lowConfidence = retrievalConfidence < 0.85;
   const baseMsg = discover
     ? `Found ${matches.length} adapters in the full catalog. Adapters marked configured:true are ready to use.`
     : matches.length < 3
       ? `Only ${matches.length} of your ${configuredAdapters.length} configured adapters matched. Try chariot_query with discover:true to search all ${state.allAdapters.length} available adapters.`
       : `Found ${matches.length} matching adapters from your ${configuredAdapters.length} configured adapters.`;
-  const antiFab = ' IMPORTANT — these are SEARCH RESULTS only. They have NOT been executed. The matchedAdapters list shows what is available; no tool output has been produced yet. To execute any tool, you MUST call chariot_call. Do not describe tool output, results, or behaviour in your reply until you have made a chariot_call and received its response. If you write "I found the X tool" or "the Y adapter returned" or "the tool reports Z" without a corresponding chariot_call invocation, you are fabricating — say instead "the catalog has a tool that may match; I will call it now" then issue chariot_call, OR if no listed tool matches tell the user the catalog has no tool for this task. When you do invoke chariot_call, only use tool names that appear EXACTLY in matchedAdapters[].tools — do not infer, guess, abbreviate, or invent plausible tool names from adapter descriptions, vendor API memory, or what a tool "should" be called. If the user asks for a capability and no tool name in matchedAdapters[].tools literally provides it, you MUST tell the user the catalog has no such tool — do NOT call chariot_call with a made-up name. If a chariot_call is rejected because the tool was not surfaced, that tool does not exist: do not claim it ran or fabricate its output — report to the user that no such tool is available.';
+  const antiFab = ' IMPORTANT — these are SEARCH RESULTS only. They have NOT been executed. The matchedAdapters list shows what is available; no tool output has been produced yet. To execute any tool, you MUST call chariot_call. Do not describe tool output, results, or behaviour in your reply until you have made a chariot_call and received its response. If you write "I found the X tool" or "the Y adapter returned" or "the tool reports Z" without a corresponding chariot_call invocation, you are fabricating — say instead "the catalog has a tool that may match; I will call it now" then issue chariot_call, OR if no listed tool matches tell the user the catalog has no tool for this task. When you do invoke chariot_call, only use tool names that appear EXACTLY in matchedAdapters[].tools[].name — do not infer, guess, abbreviate, or invent plausible tool names from adapter descriptions, vendor API memory, or what a tool "should" be called. If the user asks for a capability and no tool in matchedAdapters[].tools[].name/description literally provides it, FIRST check whether any matched adapter has an EMPTY tools[] (toolCount 0). Such an adapter is a capability-level match that EXISTS in the catalog but is NOT YET CONNECTED — its tools are gated behind a credential and are only enumerated after the customer authenticates (AS §1.2a residual tier). In that case you MUST NOT say the catalog has no such tool: tell the user the catalog HAS a matching adapter, name it, and say it needs to be connected/authenticated before its tools can be called. Do NOT call chariot_call against it — it exposes no tool names yet, and inventing one is a critical correctness failure. ONLY when NO adapter matched at all — neither with tools nor with an empty tools[] — may you tell the user the catalog has no such tool. Never call chariot_call with a made-up name. If a chariot_call is rejected because the tool was not surfaced, that tool does not exist: do not claim it ran or fabricate its output — report to the user that no such tool is available.';
   // Low-confidence steering: when retrievalConfidence < 0.85, the top
   // match's id/name/category was not literally present in the query, and
   // BM25/miniCOIL ranking landed on a category-overlap rather than a
@@ -1049,7 +1461,7 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
   // may be in the right neighbourhood but not actually do what the user
   // asked for.
   const lowConfMsg = lowConfidence
-    ? ` Retrieval confidence is ${retrievalConfidence.toFixed(2)} (below 0.85 threshold) — the ranking is based on keyword/category overlap rather than direct signal match. Before calling chariot_call, verify that matchedAdapters[0] actually performs the user's requested action by inspecting its tools list. If no tool in matchedAdapters[].tools clearly addresses the request, tell the user the catalog has no tool for this task rather than guessing.`
+    ? ` Retrieval confidence is ${retrievalConfidence.toFixed(2)} (below 0.85 threshold) — the ranking is based on keyword/category overlap rather than direct signal match. Before calling chariot_call, verify that matchedAdapters[0] actually performs the user's requested action by inspecting its tools list (matchedAdapters[].tools[].name/description). If no tool clearly addresses the request, check first whether a matched adapter has an EMPTY tools[] (toolCount 0) — that is a not-yet-connected capability match, so report it as available-but-requiring-connection rather than absent. Only if no adapter matched at all, tell the user the catalog has no tool for this task rather than guessing.`
     : '';
 
   // Record surfaced (adapter, tool) tuples for the session-surface gate.
@@ -1062,7 +1474,7 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
     const tuples: Array<{ adapterId: string; toolName: string }> = [];
     for (const m of matches) {
       for (const t of m.tools) {
-        tuples.push({ adapterId: m.id, toolName: t });
+        tuples.push({ adapterId: m.id, toolName: t.name });
       }
     }
     recordSurfacedTuples(state.sessionSurfaceState, context.sessionId, query, retrievalConfidence, tuples);
@@ -1072,7 +1484,12 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
     status: 'matched',
     query,
     mode: discover ? 'discover' : 'configured',
+    // CH-37: retrievalConfidence is the calibrated verdict.confidence (§4.5).
+    // retrievalLegs reports which legs contributed (§4.1); retrievalDegraded
+    // flags any vector leg that fell back to BM25 (§4.4).
     retrievalConfidence,
+    retrievalLegs: verdict.legsUsed,
+    retrievalDegraded: verdict.degraded,
     matchedAdapters: matches,
     totalMatched: matches.length,
     configuredCount: configuredAdapters.length,
@@ -1085,6 +1502,11 @@ async function handleQueryImpl(args: QueryArgs, state: ChariotState, context?: Q
 // chariot_call
 // =============================================================================
 
+// CHARIOT::§4.6::2 — direct tool/call invocations address an adapter+tool
+// pair explicitly; there is no free-text `query` field here for
+// QueryExpander to expand, so the direct-invocation call site is structurally
+// excluded from expansion (see handleCallImpl/handleCallInner below, neither
+// of which reference ToolPreFilter.select/expandQuery).
 export interface CallArgs {
   adapter: string;
   tool: string;
@@ -1166,6 +1588,20 @@ function classifyThrownOutcome(err: unknown): import('../types/index.js').CallOu
 // =============================================================================
 
 /**
+ * CHARIOT::§16.2 (rulings item 91(2)/112(a)) — the exact (adapterId,
+ * toolName) pairs the `alert-dispatch` system principal may call. Every
+ * other pair is denied even under this principal — see `systemPrincipal`'s
+ * own doc comment on `CallContext` for why this exists (replacing an
+ * earlier, broader `localMode: true` bypass) and who is trusted to set it.
+ */
+const ALERT_DISPATCH_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+  'slack:post_message',
+  'sendgrid:send_email',
+  'amazon-ses:send_email',
+  'pagerduty:create_incident',
+]);
+
+/**
  * Resolve the RBAC tri-state for a (context, adapterId, toolName) tuple.
  *
  * Returns `{ allowed: true }` when the call may proceed, or
@@ -1174,7 +1610,11 @@ function classifyThrownOutcome(err: unknown): import('../types/index.js').CallOu
  * the 6-guard early-return chain and to allow direct unit testing of the
  * RBAC logic without exercising rate limiting or depth guards.
  *
- * Tri-state:
+ * Tri-state (plus the narrow system-principal gate checked FIRST,
+ * exclusively, never falling through to (a)/(b)/(c) below):
+ *   (0) systemPrincipal === 'alert-dispatch' → allowed ONLY for the
+ *       exact (adapter, tool) pairs in ALERT_DISPATCH_ALLOWED_TOOLS;
+ *       every other pair is denied, regardless of `auth`/`localMode`.
  *   (a) auth present       → enforce isOperationAllowed (deny-by-default)
  *   (b) auth absent + localMode:true → bypass (single-user stdio trust)
  *   (c) auth absent + localMode:false → DENY
@@ -1184,6 +1624,26 @@ export function resolveRbacDecision(
   adapterId: string,
   toolName: string,
 ): { allowed: true } | { allowed: false; errorPayload: CallResult } {
+  if (context?.systemPrincipal === 'alert-dispatch') {
+    if (ALERT_DISPATCH_ALLOWED_TOOLS.has(`${adapterId}:${toolName}`)) {
+      return { allowed: true };
+    }
+    return {
+      allowed: false,
+      errorPayload: {
+        content: JSON.stringify({
+          error: 'Operation not permitted: the alert-dispatch system principal may only call the alert-dispatch tool set',
+          code: CHARIOT_ERROR_CODES.RBAC_OPERATION_DENIED,
+          adapter: adapterId,
+          tool: toolName,
+        }),
+        isError: true,
+        retryCount: 0,
+        retryReasons: [],
+        outcome: 'explicit_failure',
+      },
+    };
+  }
   if (context?.auth !== undefined && context.auth !== null) {
     if (!isOperationAllowed(context.auth, adapterId, toolName)) {
       return {
@@ -1225,13 +1685,48 @@ export function resolveRbacDecision(
 }
 
 /**
+ * C4AMD §8::2/§8::3/§8::4 — maps handleCall's own outcome/errorClass
+ * signals onto the closed operational-telemetry schema. `errorClass` is
+ * "absent on success" by its own doc comment (types/index.ts), so this is
+ * only ever called with `outcome: 'failure'`. `route`/`args`/`dispatch`
+ * are the CHARIOT §4.5 / BIEN §2(d) G-C taxonomy; `other` covers
+ * pre-dispatch gate failures (RBAC, rate limit, budget, policy) that are
+ * real failures but do not fit that three-stage triad — chariot_call
+ * never reaches this function having FAILED at "route" (tool_id
+ * selection happens upstream, in chariot_query/Tier 2), so 'route' is
+ * defined for taxonomy consistency but never actually emitted from here.
+ */
+function classifyCallFailureStage(
+  errorClass: import('../types/index.js').ErrorClass | undefined,
+): import('../../observability/operational-telemetry/redact.js').TelemetryFailureStage {
+  switch (errorClass) {
+    case 'invalid_arguments':
+    case 'validation':
+      return 'args';
+    case 'adapter_config_invalid':
+    case 'transport_not_supported':
+    case 'vendor_5xx':
+    case 'timeout':
+      return 'dispatch';
+    default:
+      return 'other';
+  }
+}
+
+/**
  * wrapper — every handleCall return runs through this so the
  * estimatedTokenCost is always stamped AND the per-tenant context budget
  * is enforced uniformly (preflight rejects, RBAC denies, depth/payload
- * caps, IAM-vault failures, transport branches alike).
+ * caps, IAM-vault failures, transport branches alike). Also the single
+ * chariot_call completion point wired to C4AMD §8 operational-telemetry
+ * capture (§8::2 off-by-default / §8::4 independence enforced inside
+ * `captureEvent` itself — this call site passes no consent/authorization
+ * signal, only the call's own outcome).
  */
 export async function handleCall(callArgs: CallArgs, state: ChariotState, context?: CallContext): Promise<CallResult> {
   const tenantId = context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local';
+  const startedAt = Date.now();
+  const canonicalToolId = `${callArgs.adapter}.${callArgs.tool}`;
   const result = await handleCallImpl(callArgs, state, context);
   // Estimate over the result WITH a placeholder estimatedTokenCost
   // field so the meter accounts for its own bytes.
@@ -1252,6 +1747,14 @@ export async function handleCall(callArgs: CallArgs, state: ChariotState, contex
             wouldAddTokens: tokenCost,
           });
         }
+        void captureAndKick({
+          tenantId,
+          canonicalToolId,
+          outcome: 'failure',
+          latencyMs: Date.now() - startedAt,
+          failureStage: 'other',
+          occurredAt: new Date(),
+        });
         return {
           content: JSON.stringify({ error: 'context_budget_exceeded', tenantId, currentTokens: current, budgetTokens, wouldAddTokens: tokenCost }),
           isError: true,
@@ -1266,7 +1769,82 @@ export async function handleCall(callArgs: CallArgs, state: ChariotState, contex
       contextRunningCost.set(tenantId, current + tokenCost);
     }
   }
+  void captureAndKick({
+    tenantId,
+    canonicalToolId,
+    outcome: result.isError ? 'failure' : 'success',
+    latencyMs: Date.now() - startedAt,
+    failureStage: result.isError ? classifyCallFailureStage(result.errorClass) : null,
+    occurredAt: new Date(),
+  });
   return result;
+}
+
+/**
+ * CHARIOT-SPEC §8.6a — "On the first authenticated connect the runtime
+ * obtains the live tool list with the customer credential." Shared by
+ * BOTH call sites below: `handleCallImpl` runs this BEFORE tool-name
+ * validation (team-lead review R1 — the connect must precede validation
+ * for a `requiresCustomerAuth` adapter, or a tool-less one's registry can
+ * NEVER be populated: validation would reject every call before the
+ * connector is ever reached, permanently); `handleCallInner` runs it
+ * again, deeper, as defense-in-depth immediately before REST/MCP dispatch
+ * — a no-op re-check there, since `CustomerAuthOverlayConnector.connect()`
+ * is itself idempotent (`already-embedded` short-circuits without a live
+ * connect or re-embed).
+ *
+ * Returns `null` when the caller should proceed (not-applicable /
+ * embedded / already-embedded); returns a fail-closed `CallResult` for
+ * every other case — no connector wired, or the connector refused
+ * (revoked/expired/no-credential/rate-limited/connect-failed credential).
+ * `overlayResult.reason` (when present) is a transport error string or a
+ * fixed literal, never credential material — see CustomerAuthOverlay.ts's
+ * own contract (nothing decrypted is ever placed on `OverlayConnectResult`).
+ */
+async function runCustomerAuthOverlayGate(
+  state: ChariotState,
+  adapter: AdapterEntry,
+  adapterId: string,
+  toolName: string,
+  tenantId: string,
+  userId: string | undefined,
+): Promise<CallResult | null> {
+  if (adapter.requiresCustomerAuth !== true) return null;
+  if (!state.customerAuthOverlayConnector) {
+    return {
+      content: JSON.stringify({
+        error: `Adapter "${adapterId}" requires a customer-credentialed connect (CHARIOT-SPEC §8.6a) but this runtime has no overlay connector wired`,
+        code: 'CUSTOMER_AUTH_OVERLAY_NOT_WIRED',
+        adapter: adapterId,
+        tool: toolName,
+      }),
+      isError: true,
+      retryCount: 0,
+      retryReasons: [],
+      outcome: 'explicit_failure',
+    };
+  }
+  const overlayResult = await state.customerAuthOverlayConnector.connect(adapter, tenantId, { userId });
+  if (
+    overlayResult.status !== 'embedded'
+    && overlayResult.status !== 'already-embedded'
+    && overlayResult.status !== 'not-applicable'
+  ) {
+    return {
+      content: JSON.stringify({
+        error: `Adapter "${adapterId}" customer-credentialed connect was refused (${overlayResult.status})`,
+        code: 'CUSTOMER_AUTH_OVERLAY_DENIED',
+        adapter: adapterId,
+        tool: toolName,
+        detail: overlayResult.status,
+      }),
+      isError: true,
+      retryCount: 0,
+      retryReasons: [],
+      outcome: 'explicit_failure',
+    };
+  }
+  return null;
 }
 
 async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?: CallContext): Promise<CallResult> {
@@ -1338,7 +1916,19 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
   // recursion check — so a tenant cannot evade by rapidly spawning shallow
   // calls that each pass the depth guard.
   const callsPerMinute = context?.callsPerMinute ?? DEFAULT_CALLS_PER_MINUTE;
-  const rate = consumeTenantToken(tenantId, callsPerMinute);
+  // (§22.1): the EntityResolver fan-out probes many adapters through
+  // handleCall under the CALLER's context. Charging every probe to the tenant's
+  // USER-FACING bucket meant one resolve_entity/entity_profile drained the
+  // tenant's budget and self-starved subsequent real calls for ~60s. The
+  // fan-out is already DoS-bounded on its own axes (PROBE_CONCURRENCY /
+  // PROBE_BUDGET_MS / FANOUT_BUDGET_MS and the maxAdapters cap), so meter its
+  // internal probes against a SEPARATE per-tenant bucket keyed distinctly. This
+  // keeps per-tenant DoS protection over the internal path intact while
+  // ensuring resolver probes never consume the user-facing rate budget.
+  const rateLimitKey = context?.internalResolverFanout
+    ? `__resolver_fanout__::${tenantId}`
+    : tenantId;
+  const rate = consumeTenantToken(rateLimitKey, callsPerMinute);
   if (!rate.allowed) {
     return {
       content: JSON.stringify({
@@ -1404,7 +1994,23 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
 
   // QUALITY #12: RBAC tri-state extracted into resolveRbacDecision().
   const rbac = resolveRbacDecision(context, adapterId, toolName);
-  if (!rbac.allowed) return rbac.errorPayload!;
+  if (!rbac.allowed) {
+    // CHARIOT::§16.1 Federation (CHARIOT-SPEC.md:1347, rulings item
+    // 91/105) — emitted at the call site (not inside resolveRbacDecision
+    // itself) so that function stays a pure decision helper, per its own
+    // doc comment ("allow direct unit testing ... without exercising
+    // rate limiting or depth guards").
+    chariotEmitter.send('tool.denied', {
+      severity: 'warning',
+      data: {
+        tenantId: context?.tenantId,
+        actorId: context?.auth?.userId,
+        adapterId,
+        toolName,
+      },
+    });
+    return rbac.errorPayload!;
+  }
 
  // Validate the requested tool name against the adapter's
   // declared tool list BEFORE any upstream dispatch. Without this, a
@@ -1416,19 +2022,111 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
   // populated at catalog publish time.
   const adapter = state.adapterById.get(adapterId);
   if (adapter) {
+    // CHARIOT-SPEC §8.6a (team-lead review R1 — BLOCKING). "On the first
+    // authenticated connect the runtime obtains the live tool list" — the
+    // connect MUST run BEFORE the tool-name validation below, not after.
+    // The validation forces `toolRejected = true` for a `requiresCustomerAuth`
+    // adapter with no declared tools (the §8.6a primary "ships tool-less"
+    // case) unless the tenant's overlay registry already has the name —
+    // but on the FIRST call for a tenant, that registry is empty precisely
+    // BECAUSE the connect that populates it has not run yet. Running
+    // validation first made the adapter permanently undispatchable: every
+    // call was refused before `handleCallInner`'s connector gate (further
+    // downstream) was ever reached, so the connect could never happen.
+    // Gated on `adapter.mcp` (the two §8.6a transports) — REST-only
+    // adapters are out of §8.6a's scope and take the unchanged §10.5 path;
+    // `dispatchMechanism` itself is not resolved yet at this point in the
+    // request (it depends on `toolName`, resolved further down in
+    // `handleCallInner`), so `adapter.mcp` presence is the earliest signal
+    // available for "this MIGHT be an MCP dispatch." `handleCallInner`'s
+    // own call to the SAME gate (below, deeper) remains as defense-in-depth
+    // — its `already-embedded` path is a cheap no-op there.
+    if (adapter.mcp) {
+      const overlayTenantId = context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local';
+      const gateResult = await runCustomerAuthOverlayGate(state, adapter, adapterId, toolName, overlayTenantId, context?.auth?.userId);
+      if (gateResult) return gateResult;
+    }
  // EFFICIENCY #2: prefer the pre-built Set (O(1)) populated
     // by loadAllAdapters() / AdapterCatalog.buildIndex(). Fall back to
     // Array.includes only for test stubs that don't go through the loaders.
     const toolNamesSet: Set<string> | undefined = adapter.toolNamesSet;
     const declaredTools = adapter.rest?.toolNames ?? adapter.mcp?.toolNames;
     const hasDeclaredTools = Array.isArray(declaredTools) && declaredTools.length > 0;
-    const toolRejected = hasDeclaredTools && (
+    let toolRejected = hasDeclaredTools && (
       toolNamesSet ? !toolNamesSet.has(toolName) : !declaredTools!.includes(toolName)
     );
-    // Only enforce when the catalog actually declares a tool list.
-    // Adapters with an empty/unspecified declaration (early catalog
-    // versions, partial publishes) are not subject to validation —
-    // changing that would silently break in-flight deployments.
+    // CHARIOT-SPEC §8.6a (team-lead review 2026-09-05): "A requiresCustomerAuth:
+    // true adapter ships tool-less or with declared-registry (search-only)
+    // tools" — the tenant's customer-verified overlay registry, NOT the
+    // catalog, is the source of truth for what such an adapter can
+    // dispatch. Two sub-cases, BOTH must be gated here (a `requiresCustomerAuth`
+    // adapter is NEVER exempt from tool-name validation, unlike an
+    // ordinary adapter with a genuinely empty declaration):
+    //   (a) `hasDeclaredTools` true but the name isn't in it
+    //       (`declared-registry` tier, or a parity-corrected list that
+    //       grew) — `toolRejected` is already true; the overlay registry
+    //       can still clear it.
+    //   (b) `hasDeclaredTools` FALSE (the primary "ships tool-less" case)
+    //       — the general "empty declaration is not subject to validation"
+    //       carve-out below must NOT apply to a `requiresCustomerAuth`
+    //       adapter, or ANY tool name would sail through unauthorized
+    //       until the remote MCP server itself happens to reject it. Force
+    //       `toolRejected = true` here so the SAME overlay-registry check
+    //       is the only path to acceptance.
+    // A corrupt registry file fails this call closed (a distinct code)
+    // rather than silently treating "cannot prove the tool is registered"
+    // as either acceptance or an ordinary rejection.
+    if (adapter.requiresCustomerAuth === true) {
+      if (!hasDeclaredTools) toolRejected = true;
+      if (toolRejected) {
+        if (!state.tenantOverlayToolRegistry) {
+          // Fall through to the ordinary TOOL_NOT_REGISTERED refusal below
+          // — no registry wired means no overlay tool can ever be proven,
+          // so this is exactly the same as "not found."
+        } else {
+          const overlayTenantId = context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local';
+          try {
+            if (state.tenantOverlayToolRegistry.hasTool(overlayTenantId, adapterId, toolName)) {
+              toolRejected = false;
+            }
+          } catch (err) {
+            // R3 (team-lead review): the registry's own error messages name
+            // the on-disk file path under the tenant's home directory
+            // (TenantOverlayRegistryCorruptError's message includes
+            // `filePath`) — that must never reach the client envelope.
+            // Full detail goes to the server-side log only; the client
+            // gets a stable, path-free error-name literal.
+            _overlayRegistryLogger.error('customer_auth_overlay registry unreadable during dispatch-time tool validation', {
+              tenantId: context?.tenantId ?? process.env.CHARIOT_TENANT_ID ?? 'local',
+              adapterId,
+              toolName,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return {
+              content: JSON.stringify({
+                error: `Tenant overlay tool registry is unreadable for adapter "${adapterId}" — cannot verify tool authorization`,
+                code: 'CUSTOMER_AUTH_OVERLAY_REGISTRY_CORRUPT',
+                adapter: adapterId,
+                tool: toolName,
+                detail: err instanceof Error ? err.name : 'unknown_error',
+              }),
+              isError: true,
+              retryCount: 0,
+              retryReasons: [],
+              outcome: 'explicit_failure',
+            };
+          }
+        }
+      }
+    }
+    // Only enforce when the catalog actually declares a tool list — UNLESS
+    // this is a `requiresCustomerAuth` adapter, whose empty declaration was
+    // just forced into `toolRejected` above precisely so it IS enforced.
+    // A non-auth adapter's validation is byte-for-byte unchanged from
+    // before this §8.6a fix: adapters with an empty/unspecified
+    // declaration (early catalog versions, partial publishes) remain not
+    // subject to validation — changing that would silently break
+    // in-flight deployments.
     if (toolRejected) {
       return {
         content: JSON.stringify({
@@ -1445,6 +2143,47 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
     }
   }
 
+  // §3.5::17 (CH-12) — "The IAM audit.log() call that hash-chains the event is
+  // invoked by the request-boundary caller, before the federation dispatch
+  // begins." This IS that caller: handleCallImpl owns `context` (handleCallInner
+  // does not receive it) and is the single point through which all five
+  // transport dispatch branches flow. Placed after the RBAC and catalog gates
+  // so the record describes a call that genuinely proceeded toward dispatch — a
+  // request rejected by a gate was never an attempted dispatch. Deliberately
+  // NOT wrapped in try/catch: a chain write that fails must abort the call
+  // rather than let an unaudited dispatch through.
+  // Installation-scoped wiring on ChariotState is the production path; the
+  // per-request CallContext field is the override embedders and tests use.
+  const decisionAudit = state.decisionAudit ?? context?.decisionAudit;
+  if (decisionAudit) {
+    await decisionAudit.recordPreDispatchDecision({
+      context: {
+        tenantId: context?.tenantId,
+        actorId: context?.auth?.userId,
+        allowedOperations: context?.auth?.allowedOperations,
+        localMode: context?.localMode,
+      },
+      adapterId,
+      toolName,
+      detail: { event: 'tool_dispatch', phase: 'before_federation_dispatch' },
+    });
+  }
+
+  // CHARIOT::§16.1 Federation (CHARIOT-SPEC.md:1347, rulings item
+  // 91/105) — `tool.dispatched`: the single point every one of the five
+  // transport dispatch branches flows through, placed after the RBAC and
+  // catalog gates so it describes a call that genuinely proceeded toward
+  // dispatch (a request rejected by a gate emits tool.denied above
+  // instead, never both).
+  chariotEmitter.send('tool.dispatched', {
+    data: {
+      tenantId: context?.tenantId,
+      actorId: context?.auth?.userId,
+      adapterId,
+      toolName,
+    },
+  });
+
   // Session-surface gate: when an MCP sessionId is available and the
   // server is running with sessionSurfaceState installed, the agent
   // must have received this (adapter, tool) tuple from a chariot_query
@@ -1455,7 +2194,13 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
   // no prior surfacing reject every call. Skipped when sessionId is
   // absent (REST transport) or when the surface state is not installed
   // (test stubs and library embedders that opt out).
-  if (context?.sessionId && state.sessionSurfaceState) {
+  // CH-39: the entity resolver's own fan-out is exempt — it issues real,
+  // catalog-validated tool calls (the TOOL_NOT_REGISTERED check above already
+  // ran) to gather sources, but those tuples were never surfaced by a
+  // chariot_query, so the gate would otherwise reject every probe and the
+  // resolver would always return 0 sources. RBAC, rate-limit, depth/fan-out,
+  // and DLP all still applied above; only this confabulation gate is skipped.
+  if (context?.sessionId && state.sessionSurfaceState && !context.internalResolverFanout) {
     if (!wasSurfacedInSession(state.sessionSurfaceState, context.sessionId, adapterId, toolName)) {
       return {
         content: JSON.stringify({
@@ -1464,7 +2209,7 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
           sessionId: context.sessionId,
           adapter: adapterId,
           tool: toolName,
-          remediation: `This tool is non-existent. You MUST NOT claim it ran, MUST NOT fabricate, describe, or summarize any output or result for it, and MUST NOT retry it under a renamed variant. Recover by either (a) calling chariot_query with a query describing the user's request and then chariot_call ONLY on a tool name that literally appears in that response's matchedAdapters[].tools list, or (b) telling the user plainly that the catalog has no tool for this task. Inventing a tool name is a critical correctness failure.`,
+          remediation: `This tool is non-existent. You MUST NOT claim it ran, MUST NOT fabricate, describe, or summarize any output or result for it, and MUST NOT retry it under a renamed variant. Recover by either (a) calling chariot_query with a query describing the user's request and then chariot_call ONLY on a tool name that literally appears in that response's matchedAdapters[].tools[].name list, or (b) telling the user plainly that the catalog has no tool for this task. Inventing a tool name is a critical correctness failure.`,
         }),
         isError: true,
         retryCount: 0,
@@ -1622,7 +2367,7 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
   const _healthDispatchStartMs = Date.now();
   // Per-request dispatch tenant — resolved OUTSIDE the internal-telemetry
   // sentinel so it survives release.mjs stripInternalTelemetry into the public
-  // dist. handleCallInner's DLP context depends on it (bug-tracker-ref); the telemetry
+  // dist. handleCallInner's DLP context depends on it; the telemetry
   // block below reuses this same production var for dispatch_events. (Defining
   // it inside the sentinel would delete it from the stripped tarball while the
   // production reference below survived → ReferenceError on every call.)
@@ -1633,7 +2378,7 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
   let innerResult: CallResult;
   let _healthThrewError = false;
   try {
-    innerResult = await callContextStorage.run(childState, () => handleCallInner(callArgs, effectiveState, adapterId, toolName, toolCallArgs, _dispatchTenantId));
+    innerResult = await callContextStorage.run(childState, () => handleCallInner(callArgs, effectiveState, adapterId, toolName, toolCallArgs, _dispatchTenantId, context?.auth?.userId));
   } catch (dispatchErr: unknown) {
     _healthThrewError = true;
     // Emit failure ping before re-throwing so health telemetry covers
@@ -1647,6 +2392,27 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
         latencyMs: Math.max(0, Date.now() - _healthDispatchStartMs),
         errorCode: 'dispatch_threw',
       });
+    }
+    // CH-45: record the dispatch in the hash chain BEFORE re-throwing so a
+    // thrown dispatch is not a silent gap in the audit trail (§8.4.1).
+    // In fail-closed mode recordDispatch may itself throw AuditWriteError; the
+    // dispatch is already failing and being re-thrown, so the result is
+    // withheld either way — preserve the original dispatch error.
+    try {
+      await recordDispatch({
+        adapterId,
+        toolName,
+        args: toolCallArgs,
+        tenantId: _dispatchTenantId,
+        status: 'failed',
+        outcome: classifyThrownOutcome(dispatchErr),
+        durationMs: Math.max(0, Date.now() - _healthDispatchStartMs),
+        userId: context?.auth?.userId,
+        sourceIp: context?.sourceIp,
+      });
+    } catch (auditErr) {
+      if (!(auditErr instanceof AuditWriteError)) throw auditErr;
+      // else: fall through and re-throw the original dispatch error below.
     }
     throw dispatchErr;
   }
@@ -1688,7 +2454,7 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
       _healthArgs.errorCode = innerResult.errorClass;
     }
     state.healthEmitter.emit(_healthArgs);
-    // first-call-success (bug-tracker-ref): the first successful invocation per
+    // first-call-success: the first successful invocation per
     // adapter this process lifetime emits one extra one-shot ping.
     if (_healthOutcome === 'success' && state.firstCallSuccessSeen && !state.firstCallSuccessSeen.has(adapterId)) {
       state.firstCallSuccessSeen.add(adapterId);
@@ -1698,7 +2464,47 @@ async function handleCallImpl(callArgs: CallArgs, state: ChariotState, context?:
  // Cap upstream payload size at the outer handler so every
   // transport branch (REST adapter / MCP stdio / MCP SSE / streamable-HTTP)
   // is covered uniformly without duplicating the check.
-  return capCallResult(innerResult, adapterId, toolName);
+  const capped = capCallResult(innerResult, adapterId, toolName);
+  // CH-45: write the engine HashChain at the request boundary BEFORE the
+  // result is returned to the MCP caller (§7.1 / §8.4.1 "every dispatch
+  // recorded before the result"). One complete hash-chained record per
+  // dispatch — keeps HashChain.verifyChain / `audit verify-anchor` clean and
+  // populates ~/.epic-ai/audit/default.jsonl out-of-box. Best-effort: a
+  // storage failure warns loudly but never breaks the dispatch.
+  try {
+    await recordDispatch({
+      adapterId,
+      toolName,
+      args: toolCallArgs,
+      tenantId: _dispatchTenantId,
+      status: capped.isError ? 'failed' : 'completed',
+      outcome: capped.outcome,
+      errorClass: capped.errorClass,
+      durationMs: Math.max(0, Date.now() - _healthDispatchStartMs),
+      contentBytes: typeof capped.content === 'string' ? capped.content.length : undefined,
+      retryCount: capped.retryCount,
+      retryReasons: capped.retryReasons,
+      userId: context?.auth?.userId,
+      sourceIp: context?.sourceIp,
+    });
+  } catch (auditErr) {
+    // FAIL-CLOSED audit (CHARIOT_AUDIT_FAIL_CLOSED=1): the dispatch executed
+    // but could not be hash-chained. Withhold the result — return a structured
+    // error instead of an unaudited success — rather than let the caller act
+    // on a response with no tamper-evident record.
+    if (auditErr instanceof AuditWriteError) {
+      return {
+        content: JSON.stringify({ error: 'audit_write_failed', message: auditErr.message }),
+        isError: true,
+        outcome: 'explicit_failure',
+        errorCode: CHARIOT_ERROR_CODES.AUDIT_WRITE_FAILED,
+        retryCount: capped.retryCount ?? 0,
+        retryReasons: capped.retryReasons ?? [],
+      };
+    }
+    throw auditErr;
+  }
+  return capped;
 }
 
 /**
@@ -1712,10 +2518,18 @@ async function handleCallInner(
   adapterId: string,
   toolName: string,
   toolCallArgs: Record<string, unknown>,
-  // bug-tracker-ref: the caller's resolved per-request tenant (context.tenantId on the
+  // The caller's resolved per-request tenant (context.tenantId on the
   // JWT /mcp + REST paths, process tenant on stdio/loopback). Threaded so DLP
   // policy/overrides resolve to the CALLER's tenant, not a process-env tenant.
   dispatchTenantId: string,
+  // CHARIOT-SPEC §8.6a customer-auth overlay connect: the caller's resolved
+  // per-request user id (context.auth?.userId), threaded the SAME way as
+  // dispatchTenantId above so the vault read (`fetchActiveOverlayCredential`)
+  // can select a per-user credential row over the shared/org-wide one when
+  // both exist, mirroring `loadIamCredentialsForTenant`'s own userId param
+  // a few lines above this function's call site. Undefined on single-user /
+  // no-auth installs (context.auth is then undefined too).
+  dispatchUserId: string | undefined,
 ): Promise<CallResult> {
   void callArgs;
   // OWASP LLM02 DLP context — passed into extractAndScanMcpTextResult /
@@ -1735,8 +2549,149 @@ async function handleCallInner(
     };
   }
 
+  let dispatchMechanism: 'rest' | 'mcp' | undefined;
+  try {
+    dispatchMechanism = resolveToolDispatchMechanism(adapter, toolName);
+  } catch (error) {
+    // CHARIOT-SPEC §8.6a (team-lead review 2026-09-05): a `requiresCustomerAuth`
+    // adapter's §8.6a primary case ships TOOL-LESS at catalog publish
+    // ("ships tool-less or with declared-registry (search-only) tools") —
+    // `resolveToolDispatchMechanism` (src/engine/retrieval/ToolDispatchRoute.ts,
+    // a pure function over the STATIC catalog shape) can never see a
+    // tenant's dynamically-embedded overlay tools and always throws "not
+    // declared on an executable surface" for one. Rather than teach that
+    // shared, catalog-shape-only function about a per-tenant runtime
+    // registry, the overlay tool set is consulted HERE, only as a
+    // fallback after the static resolution has already failed, and only
+    // for MCP transports (§8.6a names only streamable-HTTP/SSE and
+    // stdio — never REST). A corrupt registry file fails this call closed
+    // with a distinct code, never silently as either the original
+    // TOOL_NOT_REGISTERED error or a false acceptance.
+    if (adapter.requiresCustomerAuth === true && state.tenantOverlayToolRegistry) {
+      try {
+        if (state.tenantOverlayToolRegistry.hasTool(dispatchTenantId, adapterId, toolName)) {
+          dispatchMechanism = 'mcp';
+        }
+      } catch (registryErr) {
+        // R3: same path-free-envelope rule as the earlier validation gate
+        // — full message server-side only, a stable error-name literal
+        // to the client.
+        _overlayRegistryLogger.error('customer_auth_overlay registry unreadable during dispatch-mechanism resolution fallback', {
+          tenantId: dispatchTenantId,
+          adapterId,
+          toolName,
+          error: registryErr instanceof Error ? registryErr.message : String(registryErr),
+        });
+        return {
+          content: JSON.stringify({
+            error: `Tenant overlay tool registry is unreadable for adapter "${adapterId}" — cannot verify tool authorization`,
+            code: 'CUSTOMER_AUTH_OVERLAY_REGISTRY_CORRUPT',
+            adapter: adapterId,
+            tool: toolName,
+            detail: registryErr instanceof Error ? registryErr.name : 'unknown_error',
+          }),
+          isError: true,
+          retryCount: 0,
+          retryReasons: [],
+          outcome: 'explicit_failure',
+        };
+      }
+    }
+    if (dispatchMechanism === undefined) {
+      return {
+        content: JSON.stringify({
+          error: error instanceof Error ? error.message : String(error),
+          code: CHARIOT_ERROR_CODES.TOOL_NOT_REGISTERED,
+          adapter: adapterId,
+          tool: toolName,
+        }),
+        isError: true,
+        retryCount: 0,
+        retryReasons: [],
+        outcome: 'explicit_failure',
+      };
+    }
+  }
+
+  // CHARIOT-SPEC §8.6a. Gated on `dispatchMechanism === 'mcp'` — REST rows
+  // take the existing §10.5 credential path unchanged, never this overlay.
+  // Defense-in-depth re-check: `handleCallImpl` (the request boundary,
+  // above this function in the call chain) already ran the SAME gate
+  // (`runCustomerAuthOverlayGate`) BEFORE tool-name validation — see that
+  // call site's comment for why the ordering matters. This second call is
+  // a cheap no-op when the connector already reports `already-embedded`.
+  if (dispatchMechanism === 'mcp') {
+    const gateResult = await runCustomerAuthOverlayGate(state, adapter, adapterId, toolName, dispatchTenantId, dispatchUserId);
+    if (gateResult) return gateResult;
+  }
+
+  // CHARIOT-SPEC §17.3 — credentials entered OUTSIDE the chat (the AI is the
+  // interface; the model must never see a secret). Only where a prompter exists (single-user local
+  // transport) and never for customer-auth overlay adapters, which have their
+  // own connect flow. Everywhere else this is a no-op and the existing
+  // credentials_pending behavior below is unchanged.
+  const credentialPrompter = credentialPrompterStorage.getStore();
+  if (credentialPrompter && adapter.requiresCustomerAuth !== true) {
+    const need = await ensureCredentials({
+      adapter: adapter as unknown as Parameters<typeof ensureCredentials>[0]['adapter'],
+      prompter: credentialPrompter,
+      reload: () => {
+        // The prompter exists only on the single-user local transport, where
+        // state.credentials is exactly the credential store (no IAM overlay,
+        // which needs an authenticated tenant). Re-sync it to the store IN
+        // PLACE, additions, changes and removals, because both the REST and
+        // the MCP dispatch branches read this object.
+        const fresh = loadCredentials();
+        for (const k of Object.keys(state.credentials)) {
+          if (!(k in fresh)) delete state.credentials[k];
+        }
+        Object.assign(state.credentials, fresh);
+        return state.credentials;
+      },
+    });
+    if (need.kind === 'pending') {
+      return {
+        content: JSON.stringify({
+          error: 'credentials_pending',
+          adapter: adapterId,
+          tool: toolName,
+          missing: need.keys,
+          privatePageUrl: need.url,
+          guidance:
+            `Tell the user ${adapterId} needs ${need.keys.length} credential${need.keys.length === 1 ? '' : 's'} and that ` +
+            `they enter ${need.keys.length === 1 ? 'it' : 'them'} on a private page on this computer, not in this chat: ${need.url} ` +
+            `(open it in a browser on this machine; it works once and expires in 10 minutes). ` +
+            `Then wait for the user to say they are done and call this tool again. Do not ask the user to paste the credential here.`,
+        }),
+        isError: true,
+        retryCount: 0,
+        retryReasons: [],
+        outcome: 'explicit_failure',
+        errorClass: 'auth',
+      };
+    }
+    if (need.kind === 'declined') {
+      return {
+        content: JSON.stringify({
+          error: 'credentials_declined',
+          adapter: adapterId,
+          tool: toolName,
+          missing: need.keys,
+          guidance: 'The user chose not to provide these credentials. Do not retry unless they ask you to.',
+        }),
+        isError: true,
+        retryCount: 0,
+        retryReasons: [],
+        outcome: 'explicit_failure',
+        errorClass: 'auth',
+      };
+    }
+    // 'ok' (stored or already present) and 'unavailable' both fall through:
+    // the branches below then dispatch, or return their own credentials_pending.
+  }
+
   // REST adapter execution
-  if (adapter.rest?.module && adapter.rest?.className) {
+  if (dispatchMechanism === 'rest' && adapter.rest?.module && adapter.rest?.className) {
  // Path B: per-tool input-schema gate before REST dispatch.
     // Mirrors the 4 non-REST transport branches below for uniform spec §2.3
  // coverage across all 5 transports. The instance.validateInput()
@@ -1783,19 +2738,44 @@ async function handleCallInner(
           outcome: 'explicit_failure',
         };
       }
+      // eslint-disable-next-line local/no-dynamic-module-specifier -- DYNAMIC_LOADER_SITES: adapter package path resolved from the signed catalog and confined by confinePath() to the package root before this import
       const mod = await import(confined.resolved) as Record<string, unknown>;
       const AdapterClass = (mod[adapter.rest.className] ?? mod['default']) as new (cfg: Record<string, string>) => {
         callTool(name: string, args: Record<string, unknown>): Promise<{ content: unknown; isError?: boolean }>;
         validateInput?(name: string, args: unknown): Record<string, unknown>;
       };
 
-      const adapterConfig: Record<string, string> = {};
-      if (adapter.rest.envKey && state.credentials[adapter.rest.envKey]) {
-        adapterConfig['apiKey'] = state.credentials[adapter.rest.envKey];
+      // Single shared builder (canonical-credentialed-brands.ts
+      // buildRestAdapterConfig) — the ONE place both live REST dispatch
+      // surfaces (this one, and setup.ts cmdQuery) build adapterConfig, so
+      // they can never diverge again. Legacy single-token rest.envKey ->
+      // apiKey, rest.baseUrl, rest.discoveredEndpointsJson ->
+      // endpointsJson, rest.authType -> authType, then REST_CREDENTIAL_MAP
+      // required/alternatives/optional fields, merged over
+      // {state.credentials, process.env}. Fails CLOSED with a named-
+      // missing-key error rather than let the adapter's own constructor
+      // throw "<field> is required" — that constructor throw is an
+      // uncaught-shaped internal error, not a credentials-pending
+      // diagnostic naming the env var to set.
+      const restConfigResult = buildRestAdapterConfig(adapter, state.credentials);
+      if (!restConfigResult.ok) {
+        const missingRestFields = restConfigResult.missing;
+        return {
+          content: JSON.stringify({
+            error: 'credentials_pending',
+            adapter: adapterId,
+            tool: toolName,
+            missing: missingRestFields,
+            message: `${adapterId}: missing credential(s) ${missingRestFields.join(', ')}. Run \`chariot add ${adapterId} --token ${missingRestFields[0]}=<value>\` (repeat --token per key) to configure.`,
+          }),
+          isError: true,
+          retryCount: 0,
+          retryReasons: [],
+          outcome: 'explicit_failure',
+          errorClass: 'auth',
+        };
       }
-      if (adapter.rest.baseUrl) {
-        adapterConfig['baseUrl'] = adapter.rest.baseUrl;
-      }
+      const adapterConfig: Record<string, string> = restConfigResult.config;
 
       const instance = new AdapterClass(adapterConfig);
  // invoke validateInput before dispatch so malformed args
@@ -1878,53 +2858,52 @@ async function handleCallInner(
   }
 
   // MCP stdio adapter
-  if (adapter.mcp?.transport === 'stdio' && adapter.mcp?.command) {
+  if (dispatchMechanism === 'mcp' && adapter.mcp?.transport === 'stdio' && adapter.mcp?.command) {
  // Path B: per-tool input-schema gate before stdio dispatch.
     const _v_stdio = validateForHandlerInner(adapter, adapterId, toolName, toolCallArgs, 'mcp');
     if (!_v_stdio.valid) {
       if (state.observabilityEmitter) state.observabilityEmitter.emitParameterValidationRejected({ adapterId, toolName, issues: _v_stdio.errors });
       return { content: JSON.stringify({ error: 'invalid_arguments', adapter: adapterId, tool: toolName, issues: _v_stdio.errors }), isError: true, retryCount: 0, retryReasons: [], outcome: 'explicit_failure', errorClass: 'invalid_arguments' };
     }
-    // Supply-chain integrity gate (air-gap): for npm stdio adapters (npx),
-    // verify the package tarball is present in the local cache with the
-    // expected SHA-512 hash BEFORE spawning the subprocess.
-    // Fail-closed when:
+    // Unified stdio-command trust boundary, identical to the `query`
+    // dispatch path. The ONLY allowlisted bare launcher is `npx` (PATH-resolved,
+    // then gated by its own downstream pinning/integrity guard below); every
+    // other bare executable — including `node`/`uvx`, which had no equivalent
+    // target gate and could execute arbitrary argv — is refused fail-closed; a
+    // package-relative script path is confined to the package root.
+    const _confinedStdioCmd = confineStdioCommand(adapter.mcp.command, PACKAGE_ROOT);
+    if (!_confinedStdioCmd.ok) {
+      if (state.observabilityEmitter) state.observabilityEmitter.emitParameterValidationRejected({ adapterId, toolName, issues: [{ path: 'mcp.command', message: `stdio command rejected: ${_confinedStdioCmd.reason}`, code: 'stdio_command_rejected' }] });
+      return {
+        content: JSON.stringify({ error: 'stdio_command_rejected', adapter: adapterId, tool: toolName, detail: `stdio command "${adapter.mcp.command}" rejected (${_confinedStdioCmd.reason}). A bare launcher must be on the allowlist (npx only); a script path must resolve inside the package root.` }),
+        isError: true,
+        retryCount: 0,
+        retryReasons: [],
+        outcome: 'explicit_failure',
+        errorClass: 'validation',
+      };
+    }
+    // Supply-chain integrity gate (air-gap) — SHARED with the `query` dispatch
+    // path via enforceNpxStdioGate so the two trust boundaries are provably
+    // identical (they had diverged, and query was ungated). For an npx
+    // command it resolves the package name, verifies the tarball SHA-512 in the
+    // local cache, and prepares the pinned pkg@version argv; fail-closed when
     //   (a) the package name cannot be resolved from the adapter entry, OR
     //   (b) integrityShasum / version are absent (unpinned), OR
     //   (c) the expected tarball is not in the local npm cache.
-    // Non-npx stdio adapters (uvx, git, direct binary) are out of scope
-    // for the npm integrity gate — they are covered by separate mechanisms.
-    if (adapter.mcp.command === 'npx') {
-      const stdioPackage = extractStdioPackageName(adapter);
-      if (!stdioPackage) {
-        // npx without a resolvable package name is a malformed entry.
-        if (state.observabilityEmitter) state.observabilityEmitter.emitParameterValidationRejected({ adapterId, toolName, issues: [{ path: 'mcp.command', message: `npx adapter ${adapterId} has no resolvable package name`, code: 'supply_chain_integrity_failure' }] });
-        return {
-          content: JSON.stringify({ error: 'supply_chain_integrity_failure', adapter: adapterId, tool: toolName, detail: `air-gap: ${adapterId} uses npx but no package name is resolvable from the adapter entry. Catalog may be malformed.` }),
-          isError: true,
-          retryCount: 0,
-          retryReasons: [],
-          outcome: 'explicit_failure',
-          errorClass: 'validation',
-        };
-      }
-      const integrityResult = guardNpmStdioAdapter(
-        adapterId,
-        stdioPackage,
-        adapter.mcp.version,
-        adapter.mcp.integrityShasum,
-      );
-      if (!integrityResult.ok) {
-        if (state.observabilityEmitter) state.observabilityEmitter.emitParameterValidationRejected({ adapterId, toolName, issues: [{ path: 'mcp', message: integrityResult.reason, code: 'supply_chain_integrity_failure' }] });
-        return {
-          content: JSON.stringify({ error: 'supply_chain_integrity_failure', adapter: adapterId, tool: toolName, detail: integrityResult.reason }),
-          isError: true,
-          retryCount: 0,
-          retryReasons: [],
-          outcome: 'explicit_failure',
-          errorClass: 'validation',
-        };
-      }
+    // A non-npx command is a passthrough: the launcher allowlist already
+    // restricts bare launchers to npx and script paths are confined upstream.
+    const _npxGate = enforceNpxStdioGate(adapter);
+    if (!_npxGate.ok) {
+      if (state.observabilityEmitter) state.observabilityEmitter.emitParameterValidationRejected({ adapterId, toolName, issues: [{ path: 'mcp', message: _npxGate.reason ?? 'supply-chain integrity failure', code: 'supply_chain_integrity_failure' }] });
+      return {
+        content: JSON.stringify({ error: 'supply_chain_integrity_failure', adapter: adapterId, tool: toolName, detail: _npxGate.reason }),
+        isError: true,
+        retryCount: 0,
+        retryReasons: [],
+        outcome: 'explicit_failure',
+        errorClass: 'validation',
+      };
     }
     try {
       const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
@@ -1939,39 +2918,63 @@ async function handleCallInner(
       const subprocessEnv: Record<string, string> = { ...getDefaultEnvironment() };
       const envKeys = adapter.mcp.envKeys ?? [];
       for (const k of envKeys) {
+        // A catalog row cannot forward a
+        // code-execution/preload env channel (NODE_OPTIONS, LD_PRELOAD, …) —
+        // that would run attacker code before the pinned bin, bypassing argv
+        // gating. Skip dangerous names regardless of what mcp.envKeys declares.
+        if (isDangerousStdioEnvKey(k)) continue;
         const v = state.credentials[k];
         if (typeof v === 'string' && v.length > 0) subprocessEnv[k] = v;
       }
-      let spawnArgs = adapter.mcp.args ?? [];
-      if (adapter.mcp.command === 'npx') {
-        // Pin enforcement (bug-tracker-ref): catalog args are unversioned, so a
-        // verbatim spawn would let npx re-resolve `latest` from the registry
-        // and run code the integrity guard never verified. Rewrite to
-        // pkg@version (guard above has already fail-closed on unpinned rows)
-        // and force offline resolution from the verified local cache.
-        const pinnedPkg = extractStdioPackageName(adapter);
-        if (pinnedPkg && adapter.mcp.version) {
-          const packageFromArgs = !(typeof adapter.mcp.packageName === 'string' && adapter.mcp.packageName.length > 0);
-          spawnArgs = enforcePinnedArgs(spawnArgs, pinnedPkg, adapter.mcp.version, packageFromArgs);
-        }
+      // Last-line-of-defense: strip any preload/exec/npm_config_* channel no
+      // matter how it entered the map. Runs BEFORE the engine
+      // sets its own npm_config_offline, so the engine flag is authoritative and
+      // never sourced from a catalog row.
+      stripDangerousStdioEnv(subprocessEnv);
+      // enforceNpxStdioGate (above) already rewrote argv to the pinned
+      // pkg@version for npx (fail-closed on unpinned rows) and left non-npx argv
+      // untouched. When it verified an npx row, force offline resolution so npx
+      // serves ONLY from the integrity-verified local cache and fails closed
+      // when the pin is absent.
+      const spawnArgs = _npxGate.spawnArgs;
+      if (_npxGate.offline) {
         subprocessEnv.npm_config_offline = 'true';
+        // Disable npm lifecycle scripts at dispatch.
+        // A pinned+verified package (or a dep) can still run arbitrary code via a
+        // preinstall/postinstall/prepare hook when npx links it from cache. The
+        // package was already built at `chariot setup --pre-install`; runtime
+        // dispatch must run ONLY the bin, never lifecycle scripts. Set via env
+        // (authoritative over any .npmrc), after the strip, so a catalog row
+        // cannot flip it back on. This is the strongest of the npm precedence
+        // sources short of a CLI flag.
+        subprocessEnv.npm_config_ignore_scripts = 'true';
       }
       const transport = new StdioClientTransport({
-        command: adapter.mcp.command,
+        command: _confinedStdioCmd.command,
         args: spawnArgs,
         env: subprocessEnv,
       });
       const client = new Client({ name: "chariot", version: PKG_VERSION }, { capabilities: {} });
-      // connect() inside the try whose finally closes — a connect failure reaps
-      // the spawned subprocess instead of leaking it.
+      // CH-41: bound BOTH connect() and callTool() with a single hard
+      // wall-clock budget (same pattern as streamable-http). The SDK's
+      // callTool default (~60s) does not cover transport start, and the
+      // adapter-pinned timeoutMs must pass through the MAX ceiling clamp.
+      // connect() inside the try whose finally closes — a connect failure
+      // reaps the spawned subprocess instead of leaking it.
+      const dispatchTimeoutMs = resolveDispatchTimeoutMs(adapter.timeoutMs);
       try {
-        await client.connect(transport);
-        const result = await client.callTool({ name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> }, undefined, adapter.timeoutMs !== undefined ? { timeout: adapter.timeoutMs } : undefined);
+        const result = await raceDispatchTimeout((async () => {
+          await client.connect(transport);
+          return client.callTool({ name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> }, undefined, { timeout: dispatchTimeoutMs });
+        })(), dispatchTimeoutMs);
         return extractAndScanMcpTextResult(result, { adapterId, toolName, dlp: _dlpCtx });
       } finally {
         await client.close().catch(() => { /* best-effort reap */ });
       }
     } catch (err: unknown) {
+      if (err instanceof DispatchTimeoutError) {
+        return dispatchTimeoutCallResult(adapterId, toolName, err.timeoutMs);
+      }
       const msg = sanitizeErrorForClient(err);
       return { content: JSON.stringify({ error: msg, adapter: adapterId, tool: toolName }), isError: true, retryCount: 0, retryReasons: [], outcome: classifyThrownOutcome(err) };
     }
@@ -1998,6 +3001,7 @@ async function handleCallInner(
   const _DOCKER_SAFE_IMAGE_RE = DOCKER_SAFE_IMAGE_RE;
   const _DOCKER_DIGEST_RE = DOCKER_DIGEST_RE;
   if (
+    dispatchMechanism === 'mcp' &&
     adapter.mcp?.transport === 'stdio' &&
     !adapter.mcp.command &&
     typeof adapter.mcp.dockerImage === 'string' && adapter.mcp.dockerImage.length > 0
@@ -2070,59 +3074,159 @@ async function handleCallInner(
         env: subprocessEnv,
       });
       const client = new Client({ name: 'chariot', version: PKG_VERSION }, { capabilities: {} });
+      // CH-41: bound BOTH connect() and callTool() with a single hard
+      // wall-clock budget (same pattern as streamable-http), clamped to the
+      // MAX ceiling so a hostile catalog timeoutMs can't hang the dispatch.
       // connect() is INSIDE the try whose finally closes the client, so a
       // connect failure (docker missing / image-not-found / runtime digest
       // mismatch) still reaps the spawned subprocess instead of leaking it
       //. close() is best-effort so it never masks the real error.
+      const dispatchTimeoutMs = resolveDispatchTimeoutMs(adapter.timeoutMs);
       try {
-        await client.connect(transport);
-        const result = await client.callTool(
-          { name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> },
-          undefined,
-          adapter.timeoutMs !== undefined ? { timeout: adapter.timeoutMs } : undefined,
-        );
+        const result = await raceDispatchTimeout((async () => {
+          await client.connect(transport);
+          return client.callTool(
+            { name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> },
+            undefined,
+            { timeout: dispatchTimeoutMs },
+          );
+        })(), dispatchTimeoutMs);
         return extractAndScanMcpTextResult(result, { adapterId, toolName, dlp: _dlpCtx });
       } finally {
         await client.close().catch(() => { /* best-effort reap */ });
       }
     } catch (err: unknown) {
+      if (err instanceof DispatchTimeoutError) {
+        return dispatchTimeoutCallResult(adapterId, toolName, err.timeoutMs);
+      }
       const msg = sanitizeErrorForClient(err);
       return { content: JSON.stringify({ error: msg, adapter: adapterId, tool: toolName }), isError: true, retryCount: 0, retryReasons: [], outcome: classifyThrownOutcome(err) };
     }
   }
 
-  // MCP SSE adapter
-  const sseUrl = adapter.mcp?.serverUrl ?? adapter.mcp?.url;
-  if (adapter.mcp?.transport === 'sse' && sseUrl) {
- // Path B: per-tool input-schema gate before SSE dispatch.
-    const _v_sse = validateForHandlerInner(adapter, adapterId, toolName, toolCallArgs, 'mcp');
-    if (!_v_sse.valid) {
-      if (state.observabilityEmitter) state.observabilityEmitter.emitParameterValidationRejected({ adapterId, toolName, issues: _v_sse.errors });
-      return { content: JSON.stringify({ error: 'invalid_arguments', adapter: adapterId, tool: toolName, issues: _v_sse.errors }), isError: true, retryCount: 0, retryReasons: [], outcome: 'explicit_failure', errorClass: 'invalid_arguments' };
-    }
-    try {
-      const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-      const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
-      const transport = new SSEClientTransport(new URL(sseUrl));
-      const client = new Client({ name: 'chariot', version: PKG_VERSION }, { capabilities: {} });
-      // connect() inside the try whose finally closes — a connect failure reaps
-      // the transport instead of leaking it.
-      try {
-        await client.connect(transport);
-        const result = await client.callTool({ name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> }, undefined, adapter.timeoutMs !== undefined ? { timeout: adapter.timeoutMs } : undefined);
-        return extractAndScanMcpTextResult(result, { adapterId, toolName, dlp: _dlpCtx });
-      } finally {
-        await client.close().catch(() => { /* best-effort reap */ });
-      }
-    } catch (err: unknown) {
-      const msg = sanitizeErrorForClient(err);
-      return { content: JSON.stringify({ error: msg, adapter: adapterId, tool: toolName }), isError: true, retryCount: 0, retryReasons: [], outcome: classifyThrownOutcome(err) };
-    }
+  // MCP unsupported-transport refusal — CHARIOT::§7.2::3
+  // CHARIOT-SPEC.md §7.2 (docs/spec/CHARIOT-SPEC.md:598, repo-local mirror
+  // docs/product/CHARIOT-SPEC.md:59-61), quoted verbatim: "The two
+  // transports currently implemented in `MCPClientAdapter`
+  // (`src/engine/federation/adapters/MCPClientAdapter.ts`) are `stdio` and
+  // `streamable-http`. **SSE is not implemented at the federation layer**
+  // ... The accepting code path errors out on dispatch; SSE transport must
+  // not be advertised to customers as supported until the federation
+  // adapter implements it."
+  //
+  // This is an ALLOW-LIST of the two implemented values, not a denylist of
+  // `'sse'`: a catalog/tool-surface transport of `'sse'`, `'SSE'`, `'Sse'`,
+  // `'server-sent-events'`, `'eventsource'`, an empty string, or `undefined`
+  // (mcp mechanism resolved but no transport field at all) is ALL refused
+  // here identically — none is normalized/lowercased first, so a
+  // case-variant or alias can never accidentally match `'sse'`-only logic
+  // and slip through to whatever MCPClientAdapter/the SDK does with an
+  // unrecognized transport. Must fire BEFORE any network activity — no
+  // transport-specific client import, no connection attempt of any kind.
+  // This branch never advertises an unsupported transport as available —
+  // isDispatchable() in ChariotState.ts is itself an allow-list of exactly
+  // `stdio`+command and `streamable-http`+url, so it drops every other
+  // transport value at catalog-load time and such adapters never reach the
+  // routing index, chariot_list output, or a customer's configured set;
+  // this check is defense-in-depth for any adapter that reaches dispatch
+  // anyway (e.g. a caller that bypasses the configured-set filter).
+  //
+  // This block is ONLY about the VALUE of `transport` — it decides whether
+  // the chosen transport is one of the two the clause names, `stdio` and
+  // `streamable-http`. It deliberately does NOT look at whether the record
+  // is otherwise complete (`command`/docker pin for stdio, `url` for
+  // streamable-http) — a `stdio`/`streamable-http` record missing its
+  // required field is refused separately, below, with the distinct
+  // `adapter_config_invalid` errorClass. Conflating the two would
+  // misclassify a genuinely-supported transport with a malformed shape as
+  // "not implemented", when the transport itself would dispatch fine given
+  // a complete record.
+  if (
+    dispatchMechanism === 'mcp' &&
+    adapter.mcp?.transport !== 'stdio' &&
+    adapter.mcp?.transport !== 'streamable-http'
+  ) {
+    return {
+      content: JSON.stringify({
+        error: 'transport_not_supported',
+        adapter: adapterId,
+        tool: toolName,
+        message: 'This MCP transport is not implemented at the federation layer; use stdio or streamable-http.',
+      }),
+      isError: true,
+      retryCount: 0,
+      retryReasons: [],
+      outcome: 'explicit_failure',
+      errorClass: 'transport_not_supported',
+    };
+  }
+
+  // CH-43: apply the operator curated-open-data host override so the ~20
+  // curated adapters pinned to the single managed host (mcp.olyport.com) can
+  // be repointed to an operator mirror, removing the hard single-host SPOF.
+  // Computed here (rather than immediately before the streamable-http
+  // dispatch branch below) so the incomplete-record check that follows can
+  // use it too.
+  const mcpServerUrl = applyCuratedHostOverride(adapter.mcp?.serverUrl ?? adapter.mcp?.url);
+
+  // MCP incomplete-record refusal (adapter_config_invalid) — CHARIOT::§7.2::3
+  // follow-on. Reached only when `transport` IS one of the two implemented
+  // values (the block above already refused every other value) but the
+  // record is missing the field that transport needs to dispatch:
+  //   - `stdio`: neither `command` (the npx/script stdio branch above) nor
+  //     a syntactically present docker `dockerImage` (the docker-run stdio
+  //     branch above, which — if reached — handles its OWN distinct
+  //     image/digest validation failures under errorClass 'validation';
+  //     this check does not duplicate that, it only covers "neither stdio
+  //     sub-branch even attempted dispatch");
+  //   - `streamable-http`: no `url`/`serverUrl` (`mcpServerUrl` computed
+  //     above is falsy).
+  // isDispatchable() in ChariotState.ts already drops both of these shapes
+  // at catalog-load time — same allow-list semantics, unchanged by this
+  // block — so a customer-configured adapter never reaches this refusal in
+  // practice; this is defense-in-depth for a caller that bypasses the
+  // configured-set filter, exactly like the transport_not_supported block
+  // above. The two refusals are DISTINCT failure classes on purpose: this
+  // one means "right transport, broken record"; transport_not_supported
+  // means "unimplemented transport, record irrelevant".
+  if (
+    dispatchMechanism === 'mcp' &&
+    adapter.mcp?.transport === 'stdio' &&
+    !adapter.mcp.command &&
+    !(typeof adapter.mcp.dockerImage === 'string' && adapter.mcp.dockerImage.length > 0)
+  ) {
+    return {
+      content: JSON.stringify({
+        error: 'adapter_config_invalid',
+        adapter: adapterId,
+        tool: toolName,
+        message: 'This adapter declares transport "stdio" but has no command and no docker image pin — the catalog record is incomplete.',
+      }),
+      isError: true,
+      retryCount: 0,
+      retryReasons: [],
+      outcome: 'explicit_failure',
+      errorClass: 'adapter_config_invalid',
+    };
+  }
+  if (dispatchMechanism === 'mcp' && adapter.mcp?.transport === 'streamable-http' && !mcpServerUrl) {
+    return {
+      content: JSON.stringify({
+        error: 'adapter_config_invalid',
+        adapter: adapterId,
+        tool: toolName,
+        message: 'This adapter declares transport "streamable-http" but has no url/serverUrl — the catalog record is incomplete.',
+      }),
+      isError: true,
+      retryCount: 0,
+      retryReasons: [],
+      outcome: 'explicit_failure',
+      errorClass: 'adapter_config_invalid',
+    };
   }
 
   // MCP streamable-HTTP adapter
-  const mcpServerUrl = adapter.mcp?.serverUrl ?? adapter.mcp?.url;
-  if (adapter.mcp?.transport === 'streamable-http' && mcpServerUrl) {
+  if (dispatchMechanism === 'mcp' && adapter.mcp?.transport === 'streamable-http' && mcpServerUrl) {
  // Path B: per-tool input-schema gate before streamable-http dispatch.
     const _v_sh = validateForHandlerInner(adapter, adapterId, toolName, toolCallArgs, 'mcp');
     if (!_v_sh.valid) {
@@ -2132,6 +3236,7 @@ async function handleCallInner(
     try {
       const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
       const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+      const { createMcpDispatchFetch } = await import('../federation/mcpDispatchFetch.js');
       // Phase R.3: attach Authorization header at construction so every HTTP
       // POST the transport issues — initialize, tools/list, tools/call — carries
       // the credential. Vendor MCP servers reject any of those with 401 if the
@@ -2144,7 +3249,19 @@ async function handleCallInner(
         const credValue = state.credentials[authEnvKey];
         if (typeof credValue === 'string' && credValue.length > 0) {
           const scheme = adapter.mcp.authScheme ?? 'bearer';
-          if (scheme === 'bearer') {
+          if (scheme === 'bearer' || scheme === 'oauth2') {
+            // rulings item 196: §10.5's vendor OAuth refresh job
+            // (credentials.ts:313, `apiKey: vendorResponse.access_token`)
+            // stores the OAuth access token in the SAME `apiKey` vault
+            // field a plain api-key credential uses, and
+            // credential-loader.ts:49-72 maps that `apiKey` onto the
+            // adapter's declared `authEnvKey` exactly like any other
+            // credential — so `state.credentials[authEnvKey]` IS the
+            // access token for an `authScheme: 'oauth2'` row by the time
+            // dispatch reaches here. It gets the SAME `Authorization:
+            // Bearer <token>` header a plain bearer credential gets,
+            // exactly as CustomerAuthOverlay.ts's connect path already
+            // does for the same reason.
             reqHeaders['Authorization'] = `Bearer ${credValue}`;
           } else if (scheme === 'basic') {
             reqHeaders['Authorization'] = `Basic ${Buffer.from(credValue, 'utf-8').toString('base64')}`;
@@ -2165,26 +3282,44 @@ async function handleCallInner(
             }
             reqHeaders[headerName] = credValue;
           }
-          // 'oauth2' deferred — bundle entries requiring oauth2 should declare
-          // authProvider externally; for now they dispatch without a header
-          // and either succeed against permissive endpoints or 401 cleanly.
         }
       }
+      // Suppress the SDK's standalone GET SSE listening stream (see
+      // createMcpDispatchFetch) — it otherwise starves the tools/call POST on
+      // some remote hosts and hangs dispatch until DISPATCH_TIMEOUT.
       const transport = new StreamableHTTPClientTransport(
         new URL(mcpServerUrl),
-        Object.keys(reqHeaders).length > 0 ? { requestInit: { headers: reqHeaders } } : undefined,
+        {
+          fetch: createMcpDispatchFetch(),
+          ...(Object.keys(reqHeaders).length > 0 ? { requestInit: { headers: reqHeaders } } : {}),
+        },
       );
       const client = new Client({ name: 'chariot', version: PKG_VERSION }, { capabilities: {} });
+      // CH-41: bound BOTH connect() and callTool() with a single hard
+      // wall-clock budget. The SDK's callTool default (~60s) does not cover
+      // connect(), so a server that accepts the socket but never completes the
+      // MCP handshake would hang indefinitely. raceDispatchTimeout guarantees
+      // the dispatch returns within timeoutMs; the finally reaps the transport
+      // even when the abandoned connect/call is still pending.
+      const dispatchTimeoutMs = resolveDispatchTimeoutMs(adapter.timeoutMs);
       // connect() inside the try whose finally closes — a connect failure reaps
       // the transport instead of leaking it.
       try {
-        await client.connect(transport);
-        const result = await client.callTool({ name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> }, undefined, adapter.timeoutMs !== undefined ? { timeout: adapter.timeoutMs } : undefined);
+        const result = await raceDispatchTimeout((async () => {
+          await client.connect(transport);
+          return client.callTool({ name: toolName, arguments: injectIdempotencyArg(toolCallArgs) as Record<string, string> }, undefined, { timeout: dispatchTimeoutMs });
+        })(), dispatchTimeoutMs);
         return extractAndScanMcpTextResult(result, { adapterId, toolName, dlp: _dlpCtx });
       } finally {
         await client.close().catch(() => { /* best-effort reap */ });
       }
     } catch (err: unknown) {
+      // CH-41: a timeout is a TYPED failure (outcome:'timeout', errorClass:
+      // 'timeout', code:DISPATCH_TIMEOUT) — never a 60s stall that then reports
+      // success or an undifferentiated transport error.
+      if (err instanceof DispatchTimeoutError) {
+        return dispatchTimeoutCallResult(adapterId, toolName, err.timeoutMs);
+      }
       const msg = sanitizeErrorForClient(err);
       return { content: JSON.stringify({ error: msg, adapter: adapterId, tool: toolName }), isError: true, retryCount: 0, retryReasons: [], outcome: classifyThrownOutcome(err) };
     }
@@ -2350,6 +3485,8 @@ async function handleCallInner(
         argv,
         subprocessEnv,
         timeoutMs,
+        MAX_RESPONSE_BYTES,
+        CLI_STDERR_CAP_BYTES,
       );
       // security-review blocker (LLM01) fix: every cli-bridge return path
       // that reaches model context flows through applyInjectionScanner.
@@ -2357,22 +3494,48 @@ async function handleCallInner(
       // (success path) and stderr (error path) could carry attacker-
       // controlled injection text that bypassed LLM01 entirely.
       const _scanCtx = { adapterId, toolName };
+      // OWASP LLM02 (gap #5 — Wiz 3/5): the cli-bridge branch was the one
+      // dispatch path that ran applyInjectionScanner but NEVER
+      // applyDlpInspection, so a vendor CLI's stdout/stderr could leak a
+      // credit card / SSN / AWS key / PEM / JWT / PAT etc. straight to the
+      // agent unredacted — the REST and MCP branches already run both.
+      // `runCliDlp` closes that gap for every cli-bridge return path, in
+      // the same order the other branches use: DLP first (so a secret is
+      // redacted/blocked before anything else touches the content), THEN
+      // the injection scanner. Fails closed: DlpInspector itself fails
+      // closed to `block` on a throw (see applyDlpInspection) so a
+      // malformed inspector state can never fall through to an
+      // unredacted pass-through.
+      const _dlpCliCtx = { adapterId, toolName, dlp: _dlpCtx };
+      const runCliDlp = (raw: string): { blocked: boolean; content: string } => {
+        const verdict = applyDlpInspection(raw, _dlpCliCtx);
+        return verdict.kind === 'block'
+          ? { blocked: true, content: verdict.errorContent }
+          : { blocked: false, content: verdict.content };
+      };
       if (exitCode !== 0) {
+        const _raw = JSON.stringify({
+          error: `cli-bridge subprocess exited non-zero`,
+          code: 'CLI_EXIT_NONZERO',
+          adapter: adapterId,
+          tool: toolName,
+          exitCode,
+          // Cap stderr at the call site (redactStderr no longer caps) —
+          // 4096 chars is ample for an error excerpt on this error path.
+          stderr: redactStderr(stderr, credValues).slice(0, 4096),
+        });
+        const _dlp = runCliDlp(_raw);
         return {
-          content: applyInjectionScanner(JSON.stringify({
-            error: `cli-bridge subprocess exited non-zero`,
-            code: 'CLI_EXIT_NONZERO',
-            adapter: adapterId,
-            tool: toolName,
-            exitCode,
-            stderr: redactStderr(stderr, credValues),
-          }), _scanCtx),
+          content: applyInjectionScanner(_dlp.content, _scanCtx),
           isError: true,
           retryCount: 0,
           retryReasons: [],
  // non-zero exit without a parseable error code — the
           // subprocess could have done anything; post-state is opaque.
-          outcome: 'unknown',
+          // A DLP block on this path still counts as an explicit,
+          // classified refusal rather than 'unknown'.
+          outcome: _dlp.blocked ? 'explicit_failure' : 'unknown',
+          ...(_dlp.blocked ? { errorClass: 'policy_violation' as const } : {}),
         };
       }
       // Parse stdout per declared format. Redact credentials from any text
@@ -2385,7 +3548,15 @@ async function handleCallInner(
       if (cli.stdoutFormat === 'json') {
         try {
           const parsed: unknown = JSON.parse(stdout);
-          return { content: applyInjectionScanner(redactStderr(JSON.stringify(parsed), credValues), _scanCtx), isError: false, retryCount: 0, retryReasons: [], outcome: 'success' };
+          const _dlp = runCliDlp(redactStderr(JSON.stringify(parsed), credValues));
+          return {
+            content: applyInjectionScanner(_dlp.content, _scanCtx),
+            isError: _dlp.blocked,
+            retryCount: 0,
+            retryReasons: [],
+            outcome: _dlp.blocked ? 'explicit_failure' : 'success',
+            ...(_dlp.blocked ? { errorClass: 'policy_violation' as const } : {}),
+          };
         } catch (err: unknown) {
           return {
             content: applyInjectionScanner(JSON.stringify({
@@ -2405,9 +3576,25 @@ async function handleCallInner(
         try {
           const parsed = JSON.parse(stdout) as { result?: unknown; error?: unknown };
           if (parsed.error !== undefined) {
-            return { content: applyInjectionScanner(redactStderr(JSON.stringify({ error: 'cli-bridge JSON-RPC error', code: 'CLI_JSONRPC_ERROR', detail: parsed.error }), credValues), _scanCtx), isError: true, retryCount: 0, retryReasons: [], outcome: 'explicit_failure' };
+            const _dlp = runCliDlp(redactStderr(JSON.stringify({ error: 'cli-bridge JSON-RPC error', code: 'CLI_JSONRPC_ERROR', detail: parsed.error }), credValues));
+            return {
+              content: applyInjectionScanner(_dlp.content, _scanCtx),
+              isError: true,
+              retryCount: 0,
+              retryReasons: [],
+              outcome: 'explicit_failure',
+              ...(_dlp.blocked ? { errorClass: 'policy_violation' as const } : {}),
+            };
           }
-          return { content: applyInjectionScanner(redactStderr(JSON.stringify(parsed.result ?? null), credValues), _scanCtx), isError: false, retryCount: 0, retryReasons: [], outcome: 'success' };
+          const _dlp = runCliDlp(redactStderr(JSON.stringify(parsed.result ?? null), credValues));
+          return {
+            content: applyInjectionScanner(_dlp.content, _scanCtx),
+            isError: _dlp.blocked,
+            retryCount: 0,
+            retryReasons: [],
+            outcome: _dlp.blocked ? 'explicit_failure' : 'success',
+            ...(_dlp.blocked ? { errorClass: 'policy_violation' as const } : {}),
+          };
         } catch (err: unknown) {
           return {
             content: applyInjectionScanner(JSON.stringify({
@@ -2424,9 +3611,20 @@ async function handleCallInner(
           };
         }
       } else {
-        // 'text' — redact then scan. MAX_RESPONSE_BYTES cap applied
-        // post-redaction so we don't slice through a redaction sentinel.
-        return { content: applyInjectionScanner(redactStderr(stdout.trim(), credValues).slice(0, MAX_RESPONSE_BYTES), _scanCtx), isError: false, retryCount: 0, retryReasons: [], outcome: 'success' };
+        // 'text' — DLP, then redact, then scan. Size budget is enforced
+        // by the outer capCallResult (structured RESPONSE_TOO_LARGE
+        // error), never by a silent slice that would present truncated
+        // content as success. This is the highest-risk cli-bridge path:
+        // raw, untrusted vendor-CLI stdout with no structure at all.
+        const _dlp = runCliDlp(redactStderr(stdout.trim(), credValues));
+        return {
+          content: applyInjectionScanner(_dlp.content, _scanCtx),
+          isError: _dlp.blocked,
+          retryCount: 0,
+          retryReasons: [],
+          outcome: _dlp.blocked ? 'explicit_failure' : 'success',
+          ...(_dlp.blocked ? { errorClass: 'policy_violation' as const } : {}),
+        };
       }
     } catch (err: unknown) {
       const msg = sanitizeErrorForClient(err);
@@ -2461,91 +3659,10 @@ async function handleCallInner(
   };
 }
 
-/**
- * Phase R.5 §3: minimal allowlist of host env vars passed into a CLI-bridge
- * subprocess. Layered with per-adapter `cli.envKeys` credentials. No spread
- * of `process.env` — nothing else from Chariot's parent env leaks into the
- * subprocess.
- */
-const CLI_BASE_ENV_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR', 'TEMP', 'TMP'] as const;
-
-/**
- * Phase R.5 §6: redact known credentials and common credential-shape patterns
- * from CLI stderr before returning to the caller. Stderr is the most common
- * leak surface for vendor CLIs that echo bad-credential errors.
- */
-function redactStderr(stderr: string, knownCreds: string[]): string {
-  let redacted = stderr;
-  for (const cred of knownCreds) {
-    if (cred.length > 0) {
-      redacted = redacted.split(cred).join('<REDACTED>');
-    }
-  }
-  redacted = redacted
-    .replace(/\b(ghp_|gho_|ghu_|ghs_|github_pat_)[A-Za-z0-9_]{20,}/g, '<REDACTED_GH>')
-    .replace(/\bglpat-[A-Za-z0-9_-]{20,}/g, '<REDACTED_GITLAB>')
-    .replace(/\bsk_(test|live)_[A-Za-z0-9]{20,}/g, '<REDACTED_STRIPE>')
-    .replace(/\b(AKIA|ASIA)[0-9A-Z]{16}\b/g, '<REDACTED_AWS>')
-    .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, '<REDACTED_JWT>')
-    .replace(/-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA )?PRIVATE KEY-----/g, '<REDACTED_PEM>')
-    .replace(/\b[A-Za-z0-9._-]+@[A-Za-z0-9-]+\.iam\.gserviceaccount\.com\b/g, '<REDACTED_GCP_SA>');
-  return redacted.slice(0, 4096);
-}
-
-/**
- * Phase R.5 §9: spawn a subprocess with a hard wall-clock timeout. SIGTERM
- * first; escalate to SIGKILL after a 2 000 ms grace. Resolves with the
- * captured stdout/stderr/exitCode; rejects with `CLI_TIMEOUT` after the
- * timeout elapses.
- */
-async function spawnWithTimeout(
-  binary: string,
-  argv: string[],
-  env: Record<string, string>,
-  timeoutMs: number,
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(binary, argv, {
-      env,
-      cwd: tmpdir(),
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    child.stdout?.on('data', (chunk: Buffer) => {
-      if (stdoutBytes >= MAX_RESPONSE_BYTES) return;
-      stdoutBytes += chunk.length;
-      stdout += chunk.toString('utf-8');
-    });
-    child.stderr?.on('data', (chunk: Buffer) => {
-      if (stderrBytes >= 16_384) return;
-      stderrBytes += chunk.length;
-      stderr += chunk.toString('utf-8');
-    });
-    let resolved = false;
-    const settle = (fn: () => void) => { if (!resolved) { resolved = true; fn(); } };
-    const sigtermTimer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch { /* already dead */ }
-      const sigkillTimer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already dead */ }
-        settle(() => reject(new Error('CLI_TIMEOUT')));
-      }, 2_000);
-      sigkillTimer.unref();
-    }, timeoutMs);
-    sigtermTimer.unref();
-    child.on('error', (err) => {
-      clearTimeout(sigtermTimer);
-      settle(() => reject(err));
-    });
-    child.on('close', (exitCode) => {
-      clearTimeout(sigtermTimer);
-      settle(() => resolve({ stdout, stderr, exitCode: exitCode ?? -1 }));
-    });
-  });
-}
+// CLI_BASE_ENV_ALLOWLIST, redactStderr, spawnWithTimeout (Phase R.5 §3/§6/§9)
+// hoisted to ./cliDispatch.js so `chariot query`
+// (bin/setup.ts cmdQuery) shares the exact same CLI-bridge subprocess
+// primitives instead of forking a second copy — see cliDispatch.ts header.
 
 /**
  * Cap upstream tool response payload size. Returns the original
@@ -2587,7 +3704,7 @@ export interface ListArgs {
   search?: string;
 }
 
-export function handleList(args: ListArgs, state: ChariotState): Promise<unknown> {
+export function handleList(args: ListArgs, state: ChariotState, context?: ListContext): Promise<unknown> {
   let results = state.allAdapters;
 
   if (args.category) {
@@ -2604,18 +3721,29 @@ export function handleList(args: ListArgs, state: ChariotState): Promise<unknown
 
   const categories = [...new Set(state.allAdapters.map(a => a.category).filter(Boolean))];
 
-  return Promise.resolve({
+  const result = {
     total: results.length,
     categories,
-    adapters: results.slice(0, 50).map(a => ({
-      id: a.id,
-      name: a.name,
-      category: a.category,
-      type: a.type,
-      toolCount: (a.rest?.toolNames ?? a.mcp?.toolNames ?? []).length,
-    })),
+    adapters: results.slice(0, 50).map(a => {
+      const toolNames = a.rest?.toolNames ?? a.mcp?.toolNames ?? a.cli?.toolSchemas?.map(s => s.name) ?? [];
+      // CHARIOT::§17.3::8,9,10 (CH-50) — count honesty: chariot_list's
+      // surfaced count is the authoritative bundle toolCount, never a
+      // runtime/empty name-list tally (paypal/grafana/aws showed "0 tools"
+      // while toolCount=25). Fall back to the name-list length only when
+      // the bundle did not stamp a count, mirroring handleQuery above.
+      return {
+        id: a.id,
+        name: a.name,
+        category: a.category,
+        type: a.type,
+        toolCount: a.rest?.toolCount ?? a.mcp?.toolCount ?? toolNames.length,
+      };
+    }),
     truncated: results.length > 50,
-  });
+  };
+  // CHARIOT::§16.2 step 4 (rulings item 91(2)/115) — see
+  // maybeAttachPendingAlerts's own doc comment.
+  return Promise.resolve(maybeAttachPendingAlerts(result, state, context));
 }
 
 // =============================================================================

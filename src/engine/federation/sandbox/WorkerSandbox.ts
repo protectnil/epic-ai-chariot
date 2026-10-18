@@ -25,7 +25,16 @@ interface WorkerMessage {
 
 export class WorkerSandbox {
   private worker: Worker | null = null;
-  private readonly pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  /**
+   * Each entry records the worker it was actually delivered to. Ownership is not
+   * decorative: a late `exit` from a replaced worker must reject only ITS OWN
+   * in-flight requests. Rejecting the whole map would fail requests already
+   * dispatched to the live replacement.
+   */
+  private readonly pending = new Map<
+    string,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void; worker: Worker }
+  >();
   private msgId = 0;
   /**
    * Credentials are held only long enough to hand to the Worker
@@ -47,25 +56,27 @@ export class WorkerSandbox {
 
   start(): Promise<void> {
     const workerCode = `
-      import { workerData, parentPort } from 'node:worker_threads';
-      const { adapterPath, credentials } = workerData;
-      const mod = await import(adapterPath);
-      const AdapterClass = mod.default ?? Object.values(mod)[0];
-      const adapter = new AdapterClass(credentials);
-      if (adapter.connect) await adapter.connect();
+      (async () => {
+        const { workerData, parentPort } = await import('node:worker_threads');
+        const { adapterPath, credentials } = workerData;
+        const mod = await import(adapterPath);
+        const AdapterClass = mod.default ?? Object.values(mod)[0];
+        const adapter = new AdapterClass(credentials);
+        if (adapter.connect) await adapter.connect();
 
-      parentPort.on('message', async (msg) => {
-        try {
-          if (msg.type === 'tools') {
-            parentPort.postMessage({ id: msg.id, type: 'result', tools: adapter.tools });
-          } else if (msg.type === 'callTool') {
-            const result = await adapter.callTool(msg.name, msg.args);
-            parentPort.postMessage({ id: msg.id, type: 'result', result });
+        parentPort.on('message', async (msg) => {
+          try {
+            if (msg.type === 'tools') {
+              parentPort.postMessage({ id: msg.id, type: 'result', tools: adapter.tools });
+            } else if (msg.type === 'callTool') {
+              const result = await adapter.callTool(msg.name, msg.args);
+              parentPort.postMessage({ id: msg.id, type: 'result', result });
+            }
+          } catch (err) {
+            parentPort.postMessage({ id: msg.id, type: 'error', error: err.message });
           }
-        } catch (err) {
-          parentPort.postMessage({ id: msg.id, type: 'error', error: err.message });
-        }
-      });
+        });
+      })().catch((err) => { throw err; });
     `;
 
     const credsForWorker = this.credentials;
@@ -74,7 +85,10 @@ export class WorkerSandbox {
     // structured-clone of workerData before this line returns).
     this.credentials = {};
 
-    this.worker = new Worker(workerCode, {
+    // Every handler below is bound to THIS worker instance, not to the mutable
+    // `this.worker` field. A worker that exits late must not act on its
+    // replacement: `start()` may already have installed a new one.
+    const worker = new Worker(workerCode, {
       eval: true,
       workerData: {
         adapterPath: this.adapterPath,
@@ -85,8 +99,9 @@ export class WorkerSandbox {
         maxOldGenerationSizeMb: this.config.maxMemoryMb,
       },
     });
+    this.worker = worker;
 
-    this.worker.on('message', (msg: WorkerMessage) => {
+    worker.on('message', (msg: WorkerMessage) => {
       const handler = this.pending.get(msg.id);
       if (!handler) return;
       this.pending.delete(msg.id);
@@ -98,19 +113,30 @@ export class WorkerSandbox {
       }
     });
 
-    this.worker.on('error', (err: Error) => {
-      log.error('worker error', { adapter: this.adapterPath, error: err.message });
+    worker.on('error', (err: Error) => {
+      log.error('worker error', {
+        adapter: this.adapterPath,
+        error: err.message,
+        errorStack: err.stack,
+      });
     });
 
-    this.worker.on('exit', (code) => {
+    worker.on('exit', (code) => {
       if (code !== 0) {
         log.warn('worker exited', { adapter: this.adapterPath, code });
       }
-      // Reject all pending
-      for (const [, handler] of this.pending) {
+      // Reject only the requests that belong to THIS worker. A stale exit from a
+      // replaced generation must not fail requests already in flight on its successor.
+      for (const [id, handler] of this.pending) {
+        if (handler.worker !== worker) continue;
+        this.pending.delete(id);
         handler.reject(new Error(`Worker exited with code ${code}`));
       }
-      this.pending.clear();
+      // A terminated worker must not stay addressable: postMessage() on it silently
+      // does nothing, so a later send() would hang until its own timeout instead of
+      // failing fast. Guarded on identity — a late exit from a previous worker must
+      // not null out the replacement that start() has already installed.
+      if (this.worker === worker) this.worker = null;
     });
 
     log.info('worker sandbox started', { adapter: this.adapterPath });
@@ -128,10 +154,13 @@ export class WorkerSandbox {
   }
 
   async stop(): Promise<void> {
-    if (this.worker) {
-      await this.worker.terminate();
-      this.worker = null;
-    }
+    const worker = this.worker;
+    if (!worker) return;
+    await worker.terminate();
+    // Identity-guarded: start() may have installed a replacement while the await
+    // above was outstanding. An unconditional null here orphans that live worker
+    // and every later dispatch fails "Worker not started" against a healthy thread.
+    if (this.worker === worker) this.worker = null;
   }
 
   private send(msg: Partial<WorkerMessage>): Promise<unknown> {
@@ -140,21 +169,47 @@ export class WorkerSandbox {
         reject(new Error('Worker not started'));
         return;
       }
+      // Identity, captured at send time: the timeout below must only ever terminate
+      // the worker this request was actually delivered to.
+      const worker = this.worker;
 
       const id = String(++this.msgId);
       const fullMsg = { ...msg, id };
 
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // §7.4: "wall-clock cap per tool dispatch; SIGKILL on breach." terminate() is
+        // the worker-thread equivalent; without it the thread keeps running its loop
+        // after the caller has already given up on it. Skipped when this worker has
+        // already been replaced — otherwise a stale timer kills a live replacement.
+        if (this.worker === worker) {
+          // try/catch as well as .catch(): terminate() can throw synchronously on an
+          // already-destroyed worker, and a throw from a timer callback is an uncaught
+          // exception that takes the host process down — the opposite of confinement.
+          try {
+            worker.terminate().catch((err: unknown) => {
+              log.debug('worker terminate after timeout rejected', {
+                adapter: this.adapterPath,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          } catch (err: unknown) {
+            log.debug('worker terminate after timeout threw', {
+              adapter: this.adapterPath,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
         reject(new Error(`Worker timeout after ${this.config.timeoutMs}ms`));
       }, this.config.timeoutMs);
 
       this.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
+        worker,
       });
 
-      this.worker.postMessage(fullMsg);
+      worker.postMessage(fullMsg);
     });
   }
 

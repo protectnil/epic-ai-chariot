@@ -29,7 +29,7 @@ export class LobstersMCPServer extends MCPAdapterBase {
       name: 'lobsters',
       displayName: 'Lobsters',
       version: '1.0.0',
-      category: 'news',
+      category: 'media',
       keywords: [
         'lobsters', 'lobste.rs', 'tech news', 'programming', 'hacker news',
         'stories', 'discussions', 'link aggregator', 'community', 'tags',

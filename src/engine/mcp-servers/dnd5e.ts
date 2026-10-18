@@ -23,7 +23,7 @@ export class Dnd5eMCPServer extends MCPAdapterBase {
       name: 'dnd5e',
       displayName: 'D&D 5e API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'dnd', 'd&d', 'dungeons and dragons', '5e', 'fifth edition',
         'tabletop', 'rpg', 'spells', 'monsters', 'classes',

@@ -56,7 +56,7 @@ export class AlienVaultOTXMCPServer extends MCPAdapterBase {
       name: 'alienvault-otx',
       displayName: 'AlienVault OTX (Open Threat Exchange)',
       version: '1.0.0',
-      category: 'security',
+      category: 'cybersecurity',
       keywords: [
         'alienvault', 'otx', 'open threat exchange', 'threat intelligence',
         'pulses', 'indicators of compromise', 'ioc', 'malware', 'ip reputation',

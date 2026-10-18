@@ -7,10 +7,12 @@
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { createLogger } from '../../logger.js';
 import type { Tool, ToolResult } from '../../types/index.js';
 import type { AdapterSandboxConfig } from './types.js';
+import { resolveSeccompWrapper, SECCOMP_WRAPPER_PATH } from './seccompWrapper.js';
 
 const log = createLogger('federation.sandbox.process');
 
@@ -28,7 +30,15 @@ interface IPCMessage {
 
 export class ProcessSandbox {
   private child: ReturnType<typeof spawn> | null = null;
-  private readonly pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  /**
+   * Each entry records the child it was actually written to. A late `exit` from a
+   * replaced child must reject only ITS OWN in-flight requests, never those already
+   * dispatched to the live replacement.
+   */
+  private readonly pending = new Map<
+    string,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void; child: ChildProcess }
+  >();
   private msgId = 0;
   private buffer = '';
   /**
@@ -40,6 +50,16 @@ export class ProcessSandbox {
  * (Simplify P1 finding on .)
    */
   private credentials: Record<string, string>;
+  /**
+   * §7.4: "enforce maxMemoryMb as an RSS cap with SIGKILL on breach." The
+   * `--max-old-space-size` node arg (see `start()`) only bounds the V8 JS
+   * heap — it does not cap resident set size and a breach throws inside the
+   * process rather than delivering SIGKILL. This timer polls the child's
+   * actual RSS from /proc and SIGKILLs it on breach, independent of V8's
+   * own (much narrower) heap accounting.
+   */
+  private rssMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly RSS_CHECK_INTERVAL_MS = 1000;
 
   constructor(
     private readonly adapterPath: string,
@@ -59,7 +79,29 @@ export class ProcessSandbox {
 
     const env = this.buildEnv();
 
-    this.child = spawn(process.execPath, nodeArgs, {
+    // GAP #11 — on Linux, run the adapter child under a seccomp-bpf +
+    // no_new_privs confinement wrapper instead of spawning node directly.
+    // This is the npx/no-pod path's equivalent of the helm chart's pod-level
+    // NetworkPolicy/seccomp controls (there is no pod here to apply those
+    // to). Non-Linux platforms and Linux builds where the wrapper binary
+    // hasn't been compiled both fall back to the prior, unconfined spawn —
+    // this is a WARN-and-degrade fallback, never a silent claim of
+    // confinement (see seccompWrapper.ts).
+    const wrapperPath = resolveSeccompWrapper();
+    const command = wrapperPath ?? process.execPath;
+    const spawnArgs = wrapperPath ? [process.execPath, ...nodeArgs] : nodeArgs;
+
+    if (wrapperPath) {
+      log.info('spawning adapter child under seccomp-bpf confinement', { adapter: this.adapterPath, wrapper: wrapperPath });
+    } else if (process.platform === 'linux') {
+      log.warn('seccomp confinement wrapper not found; spawning adapter child UNCONFINED', {
+        adapter: this.adapterPath,
+        expectedPath: SECCOMP_WRAPPER_PATH,
+        hint: 'run `npm run build:native` (requires a Rust toolchain) to build native/chariot-seccomp-wrapper',
+      });
+    }
+
+    this.child = spawn(command, spawnArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
     });
@@ -96,16 +138,25 @@ export class ProcessSandbox {
       log.debug('sandbox stderr', { adapter: this.adapterPath, output: chunk.toString().slice(0, 500) });
     });
 
-    this.child.on('exit', (code) => {
+    const child = this.child;
+    child.on('exit', (code) => {
       if (code !== 0) {
         log.warn('sandbox process exited', { adapter: this.adapterPath, code });
       }
-      for (const [, handler] of this.pending) {
+      // Reject only the requests that belong to THIS child. A stale exit from a
+      // replaced generation must not fail requests in flight on its successor.
+      for (const [id, handler] of this.pending) {
+        if (handler.child !== child) continue;
+        this.pending.delete(id);
         handler.reject(new Error(`Sandbox exited with code ${code}`));
       }
-      this.pending.clear();
-      this.child = null;
+      // Identity-guarded: a late exit from a previous child must not null out the
+      // replacement that start() has already installed.
+      if (this.child === child) this.child = null;
+      this.stopRssMonitor();
     });
+
+    this.startRssMonitor(child);
 
     // Send init message with credentials
     await this.send({
@@ -132,14 +183,65 @@ export class ProcessSandbox {
     return response.result ?? { content: [{ type: 'text', text: '' }], isError: true, server: '', tool: name, durationMs: 0 };
   }
 
+  /**
+   * Poll the child's actual RSS from /proc/{pid}/status and SIGKILL it the
+   * moment it exceeds `config.maxMemoryMb` (§7.4). Linux-only: /proc is not
+   * available on other platforms, so the monitor is a no-op there and the
+   * V8-heap `--max-old-space-size` bound above remains the only defense —
+   * consistent with this module's existing fail-open-with-a-WARN posture
+   * for platform-dependent confinement (see `resolveSeccompWrapper`).
+   */
+  private startRssMonitor(child: ChildProcess): void {
+    if (process.platform !== 'linux' || !child.pid) return;
+    const pid = child.pid;
+    const limitBytes = this.config.maxMemoryMb * 1024 * 1024;
+    this.rssMonitorTimer = setInterval(() => {
+      if (this.child !== child) {
+        this.stopRssMonitor();
+        return;
+      }
+      let status: string;
+      try {
+        status = readFileSync(`/proc/${pid}/status`, 'utf-8');
+      } catch {
+        // Process has likely already exited; the exit handler clears the timer.
+        return;
+      }
+      const match = /^VmRSS:\s+(\d+)\s+kB/m.exec(status);
+      if (!match) return;
+      const rssBytes = Number(match[1]) * 1024;
+      if (rssBytes > limitBytes) {
+        log.warn('sandbox_rss_limit_breach', {
+          adapter: this.adapterPath,
+          pid,
+          rssBytes,
+          limitBytes,
+        });
+        child.kill('SIGKILL');
+      }
+    }, ProcessSandbox.RSS_CHECK_INTERVAL_MS);
+    if (typeof this.rssMonitorTimer === 'object' && 'unref' in this.rssMonitorTimer) {
+      this.rssMonitorTimer.unref();
+    }
+  }
+
+  private stopRssMonitor(): void {
+    if (this.rssMonitorTimer) {
+      clearInterval(this.rssMonitorTimer);
+      this.rssMonitorTimer = null;
+    }
+  }
+
   stop(): Promise<void> {
-    if (this.child) {
-      this.child.kill('SIGTERM');
-      // Force kill after 5s if still running
+    this.stopRssMonitor();
+    const child = this.child;
+    if (child) {
+      child.kill('SIGTERM');
+      // Force kill after 5s if still running. Bound to the captured child: start()
+      // may install a replacement inside that window, and this timer must never
+      // SIGKILL a healthy successor.
       const forceKill = setTimeout(() => {
-        if (this.child) {
-          this.child.kill('SIGKILL');
-        }
+        child.kill('SIGKILL');
       }, 5_000);
       if (typeof forceKill === 'object' && 'unref' in forceKill) {
         forceKill.unref();
@@ -154,18 +256,30 @@ export class ProcessSandbox {
         reject(new Error('Sandbox not started'));
         return;
       }
+      // Identity, captured at send time: the timeout below must only ever kill the
+      // child this request was actually written to, never a replacement.
+      const child = this.child;
 
       const id = String(++this.msgId);
       const fullMsg = { ...msg, id };
 
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        // §7.4: "wall-clock cap per tool dispatch; SIGKILL on breach." Rejecting the
+        // caller's promise alone leaves the child alive, still holding its file
+        // descriptors, sockets and memory, with no remaining handle that would ever
+        // reap it. The exit handler rejects whatever else was in flight. Skipped when
+        // this child has already been replaced — a stale timer must not kill a live one.
+        if (this.child === child) {
+          child.kill('SIGKILL');
+        }
         reject(new Error(`Sandbox timeout after ${this.config.timeoutMs}ms`));
       }, this.config.timeoutMs);
 
       this.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
+        child,
       });
 
       this.child.stdin.write(JSON.stringify(fullMsg) + '\n');

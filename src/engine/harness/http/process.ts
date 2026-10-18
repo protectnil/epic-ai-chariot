@@ -25,43 +25,45 @@ function toText(content: unknown): string {
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'harness-http', version: '1.0.0' });
 
-  server.tool('echo', { message: z.string() }, async (args) => {
-    const r = await handleTool('echo', args, state);
+  // CHARIOT::§8.11::2 (CHARIOT-SPEC.md:824) — the eight canonical tools, one
+  // registration per name in CANONICAL_TOOL_NAMES (shared/toolDefs.ts).
+  server.tool('list', { offset: z.number().optional(), limit: z.number().optional() }, async (args) => {
+    const r = await handleTool('list', args, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('sleep', { ms: z.number() }, async (args) => {
-    const r = await handleTool('sleep', args, state);
+  server.tool('search', { query: z.string() }, async (args) => {
+    const r = await handleTool('search', args, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('fail', { reason: z.string().optional() }, async (args) => {
-    const r = await handleTool('fail', args, state);
+  server.tool('read', { id: z.string() }, async (args) => {
+    const r = await handleTool('read', args, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('malformed', { variant: z.number().optional() }, async (args) => {
-    const r = await handleTool('malformed', args, state);
+  server.tool('write-shadow', { id: z.string().optional(), fields: z.record(z.string(), z.unknown()) }, async (args) => {
+    const r = await handleTool('write-shadow', args, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('approval_target', { action: z.string() }, async (args) => {
-    const r = await handleTool('approval_target', args, state);
+  server.tool('delete-shadow', { id: z.string() }, async (args) => {
+    const r = await handleTool('delete-shadow', args, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('multi_step', { step: z.number() }, async (args) => {
-    const r = await handleTool('multi_step', args, state);
+  server.tool('error-handling', { variant: z.number().optional() }, async (args) => {
+    const r = await handleTool('error-handling', args, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('stateful_counter', {}, async () => {
-    const r = await handleTool('stateful_counter', {}, state);
+  server.tool('auth-failure', {}, async () => {
+    const r = await handleTool('auth-failure', {}, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 
-  server.tool('ping', {}, async () => {
-    const r = await handleTool('ping', {}, state);
+  server.tool('rate-limit', {}, async () => {
+    const r = await handleTool('rate-limit', {}, state);
     return { content: [{ type: 'text' as const, text: toText(r.content) }], isError: r.isError };
   });
 

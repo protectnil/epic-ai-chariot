@@ -1,7 +1,14 @@
 #  — Pin the toolchain so every build site uses the same rustc.
 # release.yml's RUST_VERSION env var is the operational copy of this value;
 # any change here must be matched in .github/workflows/release.yml.
+#
+# Bumped 1.94.1 -> 1.95.0 for Chariot 4.0.0: the embedded `qdrant-edge` 0.7.2
+# crate uses Rust features that stabilized in 1.95.0 (`if let` guards,
+# `cfg_select`, `ptr_as_ref_unchecked`); it fails to compile on 1.94.1 with
+# E0658. Verified: qdrant-edge + the full native crate build clean on 1.95.0.
+# NOTE: .github/workflows/release.yml RUST_VERSION must be bumped to 1.95.0 to
+# match (operational copy of this pin).
 [toolchain]
-channel = "1.94.1"
+channel = "1.95.0"
 components = ["rustc", "cargo", "rust-std"]
 profile = "minimal"

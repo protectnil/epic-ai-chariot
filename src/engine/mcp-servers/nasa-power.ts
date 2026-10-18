@@ -31,7 +31,7 @@ export class NasaPowerMCPServer extends MCPAdapterBase {
       name: 'nasa-power',
       displayName: 'NASA POWER',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'nasa', 'power', 'solar', 'meteorology', 'climate', 'weather',
         'agriculture', 'renewable energy', 'sustainable buildings',

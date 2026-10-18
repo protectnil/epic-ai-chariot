@@ -40,7 +40,7 @@ export class TinderBioMCPServer extends MCPAdapterBase {
       name: 'tinder-bio',
       displayName: 'Tinder Bio Generator',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'tinder', 'bio', 'dating', 'profile', 'dating profile',
         'bio generator', 'dating app', 'relationship', 'matchmaking',

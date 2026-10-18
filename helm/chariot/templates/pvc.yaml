@@ -1,0 +1,24 @@
+{{- /* CH-30 writable volume for EPIC_AI_DIR_OVERRIDE (/var/lib/chariot):
+       license cache, recovery store, Edge shard working copy, health file.
+       Only created when persistence is enabled and no existingClaim is given. */ -}}
+{{- if and .Values.persistence.enabled (not .Values.persistence.existingClaim) -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "chariot.fullname" . }}-data
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+  {{- if .Values.persistence.storageClass }}
+  {{- if eq .Values.persistence.storageClass "-" }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: {{ .Values.persistence.storageClass | quote }}
+  {{- end }}
+  {{- end }}
+{{- end }}

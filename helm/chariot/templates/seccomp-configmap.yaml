@@ -1,0 +1,24 @@
+{{- /* GAP #10 — hardened Localhost seccomp profile, shipped in-chart so it
+       renders as part of `helm template`/`helm install` output (verifiable),
+       and so operators have a single in-cluster source of truth to copy onto
+       every node's kubelet seccomp root instead of hunting through the chart
+       tarball. Helm/the K8s API cannot place a file directly onto a node's
+       filesystem — the kubelet reads localhostProfile from local disk — so
+       this ConfigMap is a DISTRIBUTION vehicle, not the enforcement point.
+       Operators must copy the "chariot-hardened.json" key from this
+       ConfigMap (or the source file, helm/chariot/files/seccomp/) to
+       <kubelet-root-dir>/seccomp/profiles/chariot-hardened.json on every
+       node BEFORE setting seccomp.customProfile.enabled=true — e.g. via a
+       one-shot DaemonSet init container that mounts this ConfigMap and
+       writes it to a hostPath under the kubelet seccomp root. See NOTES.txt. */ -}}
+{{- if .Values.seccomp.customProfile.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chariot.fullname" . }}-seccomp-profile
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+data:
+  chariot-hardened.json: |-
+    {{- .Files.Get "files/seccomp/chariot-hardened.json" | nindent 4 }}
+{{- end }}

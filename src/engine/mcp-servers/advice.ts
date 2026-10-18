@@ -36,7 +36,7 @@ export class AdviceMCPServer extends MCPAdapterBase {
       name: 'advice',
       displayName: 'Advice Slip API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'advice', 'advice slip', 'random advice', 'tips', 'wisdom',
         'life advice', 'motivational', 'search advice', 'advice by id',

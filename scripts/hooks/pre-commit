@@ -53,14 +53,17 @@ while IFS= read -r _SP_FILE; do
       echo ""
       echo "Staged-path rejected: $_SP_FILE"
       echo "  Paths under test/ must not be staged directly."
-      echo "  Use the eval workflow to update test baselines."
+      echo "  Durable home: the private repository protectnil/epic-ai, directory test/;"
+      echo "  test/ in this tree is a gitignored mirror of it. Use the eval workflow to"
+      echo "  update test baselines. (TES R5.2.3)"
       exit 1
       ;;
     .leak-denylist/*)
       echo ""
       echo "Staged-path rejected: $_SP_FILE"
-      echo "  .leak-denylist/ is untracked by design — patterns live in"
-      echo "  out-of-repo storage. Do not re-add these files to VCS."
+      echo "  .leak-denylist/ is untracked by design — durable home: the"
+      echo "  out-of-repo pattern store (never a git repository). Do not re-add"
+      echo "  these files to VCS. (TES R5.2.3)"
       exit 1
       ;;
   esac

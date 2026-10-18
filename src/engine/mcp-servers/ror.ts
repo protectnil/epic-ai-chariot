@@ -30,7 +30,7 @@ export class RorMCPServer extends MCPAdapterBase {
       name: 'ror',
       displayName: 'ROR (Research Organization Registry)',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'ror', 'research organization registry', 'university', 'institution',
         'affiliation', 'academic', 'research', 'organization', 'funder',

@@ -9,7 +9,7 @@
  * Tier 2: Natural language queries that don't mention vendor names — tests
  *         whether routing understands intent, not just keywords.
  *
- * Run: npm run eval
+ * Run: node dist/engine/eval/routing-eval.js (after npm run build)
  * Output: Accuracy metrics, misroutes, failures.
  *
  * Built on the Epic AI® Intelligence Platform
@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import { ToolPreFilter } from '../federation/ToolPreFilter.js';
 import type { Tool } from '../types/index.js';
 import { resolvePublishedArtifactDir } from '../federation/artifact-publication.js';
+import { assertRouteCorrectGC } from './routing-eval-gc.js';
 
 // dist/engine/eval/routing-eval.js → 3 levels up to package root
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -56,7 +57,11 @@ function unpackCatalogPayload(payload: unknown): CatalogEntry[] {
   if (payload && typeof payload === 'object' && Array.isArray((payload as { catalog?: unknown }).catalog)) {
     return (payload as { catalog: CatalogEntry[] }).catalog;
   }
-  return [];
+  // Fail closed on schema drift: silently returning [] here would let the
+  // Tier-1 gate compute 0/0 accuracy and pass vacuously.
+  throw new Error(
+    'catalog payload has an unrecognized shape (expected an array or { catalog: [...] }) — schema drift?',
+  );
 }
 
 function unpackRegistryPayload(payload: unknown): RegistryEntry[] {
@@ -64,7 +69,10 @@ function unpackRegistryPayload(payload: unknown): RegistryEntry[] {
   if (payload && typeof payload === 'object' && Array.isArray((payload as { registry?: unknown }).registry)) {
     return (payload as { registry: RegistryEntry[] }).registry;
   }
-  return [];
+  // Fail closed on schema drift (see unpackCatalogPayload).
+  throw new Error(
+    'registry payload has an unrecognized shape (expected an array or { registry: [...] }) — schema drift?',
+  );
 }
 
 function loadCatalog(): CatalogEntry[] {
@@ -104,11 +112,19 @@ function buildToolCatalog(catalog: CatalogEntry[], registry: RegistryEntry[]): T
     }
   }
 
+  // Dedupe registry entries against CATALOG server names only. This must be
+  // computed before the registry loop and checked per-entry (not per-tool):
+  // a per-tool `tools.some(...)` check would self-match the tool pushed by
+  // iteration 1 of the same registry entry and silently index only ONE tool
+  // per registry-only server (production buildToolsForRoutingChariot indexes
+  // all of them — the eval must match).
+  const catalogServers = new Set(catalog.map(e => e.name));
+
   for (const entry of registry) {
     if (entry.type !== 'mcp') continue;
+    if (catalogServers.has(entry.id)) continue; // already from catalog
     for (const toolName of entry.mcp?.toolNames || []) {
       const serverId = entry.id;
-      if (tools.some(t => t.server === serverId)) continue; // already from catalog
       tools.push({
         name: `${serverId}:${toolName}`,
         description: `${entry.name} — ${toolName.replace(/_/g, ' ')}`,
@@ -133,17 +149,22 @@ interface EvalResult {
   tier: 1 | 2;
 }
 
-function generateTier1Queries(catalog: CatalogEntry[], registry: RegistryEntry[]): { query: string; expectedServer: string }[] {
-  const queries: { query: string; expectedServer: string }[] = [];
+function generateTier1Queries(catalog: CatalogEntry[], registry: RegistryEntry[]): { query: string; expectedServer: string; expectedToolId: string }[] {
+  const queries: { query: string; expectedServer: string; expectedToolId: string }[] = [];
 
   for (const entry of catalog) {
     const tools = entry.toolNames || [];
     if (tools.length === 0) continue;
+    // Both queries below are generated FROM tools[0] (or its adapter), so it
+    // is the canonical gold tool_id for the G-C-grade assertion (§4.5) —
+    // never a fabricated/guessed label.
+    const expectedToolId = `${entry.name}:${tools[0]}`;
 
     // Query 1: vendor name + first tool
     queries.push({
       query: `${(entry.displayName || entry.name).replace(/-/g, ' ')} ${tools[0].replace(/_/g, ' ')}`,
       expectedServer: entry.name,
+      expectedToolId,
     });
 
     // Query 2: description-based (if available)
@@ -151,6 +172,7 @@ function generateTier1Queries(catalog: CatalogEntry[], registry: RegistryEntry[]
       queries.push({
         query: entry.description.slice(0, 80),
         expectedServer: entry.name,
+        expectedToolId,
       });
     }
   }
@@ -163,6 +185,7 @@ function generateTier1Queries(catalog: CatalogEntry[], registry: RegistryEntry[]
     queries.push({
       query: `${entry.name.replace(/-/g, ' ')} ${tools[0].replace(/_/g, ' ')}`,
       expectedServer: entry.id,
+      expectedToolId: `${entry.id}:${tools[0]}`,
     });
   }
 
@@ -249,6 +272,40 @@ function getTier2Corpus(): { query: string; expectedServers: string[] }[] {
   ];
 }
 
+/**
+ * G-C-grade result (CHARIOT-SPEC §4.5): exact tool_id assertion, no
+ * server-level dedup — distinct from `EvalResult`'s server-hit shape above.
+ * See routing-eval-gc.ts for the assertion function and its rationale.
+ */
+interface GCEvalResult {
+  query: string;
+  expectedToolId: string;
+  /** Full ORDERED, non-deduplicated tool-id shortlist Tier 1 returned. */
+  selectedToolIds: string[];
+  hit: boolean;
+  rank: number | null;
+}
+
+/**
+ * G-C-grade mode (§4.5): checks the exact gold tool_id against the FULL
+ * ordered, non-deduplicated Tier-1 shortlist — the fix for the flaw the spec
+ * names in routing-eval.ts's existing `runTier1`/`runTier2` (server-level
+ * dedup, expected-server-present pass condition). This is a distinct
+ * function from `runTier1`, not a patch to it, so the old (insufficient)
+ * check remains available for direct comparison.
+ */
+async function runTier1GC(
+  filter: ToolPreFilter,
+  queries: { query: string; expectedServer: string; expectedToolId: string }[],
+): Promise<GCEvalResult[]> {
+  return Promise.all(queries.map(async (q): Promise<GCEvalResult> => {
+    const selected = await filter.select(q.query, { maxTools: 8, maxPerServer: 3 });
+    const selectedToolIds = selected.map(t => t.name); // ordered, NOT deduped by server
+    const { hit, rank } = assertRouteCorrectGC(selectedToolIds, q.expectedToolId);
+    return { query: q.query, expectedToolId: q.expectedToolId, selectedToolIds, hit, rank };
+  }));
+}
+
 // ─── Run evals ──────────────────────────────────────────────
 
 async function runTier1(filter: ToolPreFilter, queries: { query: string; expectedServer: string }[]): Promise<EvalResult[]> {
@@ -312,6 +369,13 @@ async function main(): Promise<void> {
 
   // ── Tier 1 ──────────────────────────────────────────────
   const tier1Queries = generateTier1Queries(catalog, registry);
+  if (tier1Queries.length === 0) {
+    console.error(
+      '✗ FAIL — Tier 1 generated 0 queries: catalog/registry unpacked empty ' +
+        '(schema drift or empty bundle); refusing to gate on 0/0.',
+    );
+    process.exit(2);
+  }
   console.log(`Tier 1: ${tier1Queries.length} generated queries...`);
 
   const t1Start = Date.now();
@@ -358,6 +422,32 @@ async function main(): Promise<void> {
     console.log(`  ${icon} "${r.query.slice(0, 60)}" → ${r.hit ? r.returnedServers.find(s => r.expectedServer.includes(s)) : '[' + r.returnedServers.slice(0, 3).join(', ') + ']'}`);
   }
 
+  // ── G-C-grade (§4.5) ─────────────────────────────────────
+  // Exact tool_id assertion, NO server-level dedup — the fix for the flaw
+  // §4.5 names in Tier 1/Tier 2 above. Informational: the authoritative G-C
+  // release gate is eval/GateMetrics.ts's evaluateGcGate() against a real
+  // BIEN §2(e) sampling manifest + Wilson LCB per mandatory slice; this is
+  // the Tier-1-shortlist-level diagnostic, not a substitute for that gate.
+  console.log('\nG-C-grade (exact tool_id, no server dedup) — CHARIOT-SPEC §4.5 diagnostic...');
+  const gcStart = Date.now();
+  const gcResults = await runTier1GC(filter, tier1Queries);
+  const gcMs = Date.now() - gcStart;
+
+  const gcHits = gcResults.filter(r => r.hit).length;
+  const gcTotal = gcResults.length;
+  const gcAccuracy = ((gcHits / gcTotal) * 100).toFixed(1);
+
+  console.log(`  Accuracy: ${gcHits}/${gcTotal} (${gcAccuracy}%) — informational; the release gate is eval/GateMetrics.ts evaluateGcGate() against a real BIEN §2(e) manifest`);
+  console.log(`  Time: ${gcMs}ms`);
+  const gcMisses = gcResults.filter(r => !r.hit);
+  if (gcMisses.length > 0) {
+    console.log(`  G-C misses (${gcMisses.length}) — includes queries where the Tier-1 shortlist offered the RIGHT server but the WRONG tool:`);
+    for (const m of gcMisses.slice(0, 20)) {
+      console.log(`    ✗ "${m.query.slice(0, 60)}" → expected tool_id: ${m.expectedToolId}, got: [${m.selectedToolIds.slice(0, 3).join(', ')}]`);
+    }
+    if (gcMisses.length > 20) console.log(`    ... and ${gcMisses.length - 20} more`);
+  }
+
   // ── Summary + per-tier exit ─────────────────────────────
   // Tier 1 is the regression gate (deterministic ranking of vendor-name
   // queries against the actual published catalog). It exits non-zero
@@ -372,9 +462,10 @@ async function main(): Promise<void> {
   console.log('════════════════════════════════════');
   console.log(`Tier 1 (generated, deterministic):  ${t1Accuracy}% (${t1Hits}/${t1Total})`);
   console.log(`Tier 2 (natural language, info):    ${t2Accuracy}% (${t2Hits}/${t2Total})`);
+  console.log(`G-C-grade (exact tool_id, info):    ${gcAccuracy}% (${gcHits}/${gcTotal}) — never gates CI here; see eval/GateMetrics.ts`);
   console.log(`Total tools indexed:                ${tools.length}`);
   console.log(`Total queries:                      ${t1Total + t2Total}`);
-  console.log(`Total time:                         ${t1Ms + t2Ms}ms`);
+  console.log(`Total time:                         ${t1Ms + t2Ms + gcMs}ms`);
 
   const floorEnv = process.env.CHARIOT_EVAL_TIER1_FLOOR;
   const t1Floor = floorEnv ? Number(floorEnv) : 80;

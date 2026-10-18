@@ -45,7 +45,7 @@ export class ShipOnFridayMCPServer extends MCPAdapterBase {
       name: 'ship-on-friday',
       displayName: 'Ship on Friday',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'ship on friday', 'deploy', 'friday deploy', 'devops humor', 'release',
         'risk level', 'on-call', 'stupidapis', 'engineering culture', 'novelty',

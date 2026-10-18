@@ -30,9 +30,17 @@
  */
 
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
+import { existsSync } from 'node:fs';
 import type { Checkpoint, CheckpointStore } from './CheckpointStore.js';
 import { canonicalStringify } from '../../util/canonical-json.js';
-import { loadNativeBinding } from '../../license/binding.js';
+import { loadNativeBinding, type NativeBinding } from '../../license/binding.js';
+import {
+  callNativeDecrypt,
+  decryptFieldsForVaultMigration,
+  isLegacyCiphertext,
+  emptyVaultMigrateCounts,
+  type VaultMigrateCounts,
+} from '../../iam/crypto.js';
 
 interface CheckpointRow {
   step_id: string;
@@ -70,9 +78,25 @@ function getMasterKeyB64(): string {
   return raw;
 }
 
-type CryptoBinding = {
-  encryptCredential(plaintext: string, tenantId: string, masterKeyB64: string): { encrypted: string; iv: string };
-  decryptCredential(encryptedB64: string, ivB64: string, tenantId: string, masterKeyB64: string): string;
+// CH-10 (§12.2): the native binding's AAD binds tenantId ‖ adapterId. This
+// store has no adapterId, so it uses each field's own unique-within-tenant
+// identifier — `<stepId>:input` / `<stepId>:output` — as that binding, so a
+// ciphertext relocated between checkpoint rows (or between the input and
+// output column of the SAME row) fails to decrypt instead of succeeding.
+//
+// CHARIOT-SPEC.md:1237-1250 (§12.2, CH-10, amended 2026-09-02): "AAD = the
+// length-prefixed concatenation LE_u32(len(tenantId_bytes)) ‖ tenantId_bytes
+// ‖ adapterId_bytes" — this store passes `<stepId>:input`/`<stepId>:output`
+// as that `adapterId_bytes` role, so `decryptCredential`'s AAD-bound (v2:)
+// path is what verifies the relocation binding above.
+//
+// Shaped to match `NativeBinding`'s `encryptCredential`/`decryptCredential`
+// exactly (via `Pick`) plus the optional CH-10 capability probe, so both
+// the real native binding and a locally-injected test double satisfy it —
+// and so it can be passed to `callNativeDecrypt`/`hasVaultLegacyGate`
+// (crypto.ts), which accept this same narrower shape.
+type CryptoBinding = Pick<NativeBinding, 'encryptCredential' | 'decryptCredential'> & {
+  vaultProtocolVersion?(): number;
 };
 
 function resolveBinding(injected?: CryptoBinding): CryptoBinding {
@@ -179,8 +203,18 @@ export class SqliteCheckpointStore implements CheckpointStore {
 
   async record(c: Checkpoint): Promise<void> {
     const masterKey = getMasterKeyB64();
-    const inEnc = this.binding.encryptCredential(canonicalStringify(c.input), c.tenantId, masterKey);
-    const outEnc = this.binding.encryptCredential(canonicalStringify(c.output), c.tenantId, masterKey);
+    const inEnc = this.binding.encryptCredential(
+      canonicalStringify(c.input),
+      c.tenantId,
+      `${c.stepId}:input`,
+      masterKey,
+    );
+    const outEnc = this.binding.encryptCredential(
+      canonicalStringify(c.output),
+      c.tenantId,
+      `${c.stepId}:output`,
+      masterKey,
+    );
     this.recordStmt.run(
       c.stepId,
       c.parentStepId ?? null,
@@ -226,8 +260,19 @@ export class SqliteCheckpointStore implements CheckpointStore {
       iteration: row.iteration,
       toolName: row.tool_name ?? undefined,
       serverName: row.server_name ?? undefined,
-      input: safeParse(this.binding.decryptCredential(row.input_ct, row.input_iv, row.tenant_id, masterKey)),
-      output: safeParse(this.binding.decryptCredential(row.output_ct, row.output_iv, row.tenant_id, masterKey)),
+      // CHARIOT §12.2 (CH-10, rulings item 59): `legacyAllowed=false` is a
+      // FIXED constant here, never a policy lookup — this file (and its
+      // `v2:`-prefixed AAD-bound format) were both introduced together in
+      // commit 624c2b9, so no checkpoint row this store has ever written
+      // can be a legacy (pre-CH-10, empty-AAD) ciphertext; a legacy-shaped
+      // row here can only mean corruption or a foreign write, and must
+      // fail closed exactly like a genuine relocation attack would.
+      input: safeParse(
+        callNativeDecrypt(this.binding, row.input_ct, row.input_iv, row.tenant_id, `${row.step_id}:input`, masterKey, false),
+      ),
+      output: safeParse(
+        callNativeDecrypt(this.binding, row.output_ct, row.output_iv, row.tenant_id, `${row.step_id}:output`, masterKey, false),
+      ),
       timestamp: new Date(row.timestamp),
     };
   }
@@ -240,4 +285,72 @@ function safeParse(s: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/**
+ * CH-10 migration walker (CHARIOT-SPEC.md:1237-1250, §12.2, rulings item
+ * 59: "walks every stored ciphertext ... reports counts {legacy, upgraded,
+ * failed, alreadyV2}"). This store's ciphertext format has been v2/AAD-
+ * bound from the moment this file was created (commit 624c2b9, the SAME
+ * commit that introduced the `v2:` prefix) — no code path, past or
+ * present, could have written a legacy row here. This walker is STILL
+ * called by `chariot vault migrate` for every tenant it sweeps: gate
+ * finding F1 is exactly that a marker written without walking a
+ * provably-clean site is an argument, not proof — this makes it a walk,
+ * so `legacy` (and therefore the marker gate) is 0 by observation of
+ * every row, not by the argument in this paragraph.
+ */
+export async function walkLegacyCheckpointCiphertexts(
+  dbPath: string,
+  tenantId: string,
+  opts: { dryRun: boolean; binding?: CryptoBinding } = { dryRun: true },
+): Promise<VaultMigrateCounts> {
+  const counts = emptyVaultMigrateCounts();
+  if (!existsSync(dbPath)) return counts; // nothing written yet — walked, vacuously clean.
+
+  const db = new DatabaseSync(dbPath);
+  try {
+    const binding = resolveBinding(opts.binding);
+    const masterKey = getMasterKeyB64();
+    const rows = db
+      .prepare(`SELECT step_id, tenant_id, input_ct, input_iv, output_ct, output_iv FROM checkpoints WHERE tenant_id = ?`)
+      .all(tenantId) as unknown as CheckpointRow[];
+
+    const upgradeField = async (
+      recordId: string,
+      ct: string,
+      iv: string,
+      writeBack: (newCt: string, newIv: string) => void,
+    ): Promise<void> => {
+      if (!isLegacyCiphertext(ct)) {
+        counts.alreadyV2++;
+        return;
+      }
+      counts.legacy++;
+      try {
+        const { fields } = await decryptFieldsForVaultMigration(ct, iv, tenantId, recordId);
+        // Re-encrypt via the same binding this store uses at write time.
+        const encRes = binding.encryptCredential(canonicalStringify(fields), tenantId, recordId, masterKey);
+        if (!opts.dryRun) writeBack(encRes.encrypted, encRes.iv);
+        counts.upgraded++;
+      } catch {
+        counts.failed++;
+      }
+    };
+
+    for (const row of rows) {
+      await upgradeField(`${row.step_id}:input`, row.input_ct, row.input_iv, (newCt, newIv) => {
+        // CAS: only replace if the row still holds exactly the ciphertext read.
+        db.prepare(`UPDATE checkpoints SET input_ct = ?, input_iv = ? WHERE step_id = ? AND input_ct = ?`)
+          .run(newCt, newIv, row.step_id, row.input_ct);
+      });
+      await upgradeField(`${row.step_id}:output`, row.output_ct, row.output_iv, (newCt, newIv) => {
+        db.prepare(`UPDATE checkpoints SET output_ct = ?, output_iv = ? WHERE step_id = ? AND output_ct = ?`)
+          .run(newCt, newIv, row.step_id, row.output_ct);
+      });
+    }
+  } finally {
+    db.close();
+  }
+  return counts;
 }

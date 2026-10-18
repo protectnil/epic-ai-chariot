@@ -12,6 +12,7 @@
  *   node scripts/sign-integrity.mjs \
  *     --key <path-to-signing-key>.pem \
  *     --platform linux-x64=/path/to/chariot-native.node \
+ *     --platform linux-arm64=/path/to/chariot-native.node \
  *     --platform darwin-arm64=/path/to/chariot-native.node \
  *     --platform darwin-x64=/path/to/chariot-native.node \
  *     --platform win32-x64=/path/to/chariot-native.node
@@ -21,6 +22,28 @@
  *     --key <path-to-signing-key>.pem \
  *     --merge native/integrity.json \
  *     --platform darwin-arm64=/path/to/chariot-native.node
+ *
+ * CI/CD wiring (source of truth — read this, don't re-derive it):
+ *   .github/workflows/release.yml, job `sign-manifest`, step
+ *   "Sign integrity manifest" (~line 687) invokes this script once per
+ *   release, all five platforms at once, after downloading every
+ *   platform's built (or already-published-sibling, hash-cross-checked)
+ *   `chariot-native.node` binary artifact. The Ed25519 private key is
+ *   staged from the `CHARIOT_SIGNING_KEY` repo secret (job step "Stage
+ *   signing key", ~line 682) into a 0600 temp file, passed via `--key`,
+ *   and shredded immediately after signing (step "Shred signing key").
+ *   `version` and `commit` are read live from this repo's `package.json`
+ *   and `git rev-parse HEAD` at run time — never hardcoded here or in CI.
+ *   The signed manifest is uploaded as the `integrity-manifest` artifact
+ *   and consumed downstream by `publish-sibling` and `publish-main`
+ *   (which re-verifies it via `npm run prepublishOnly` before publish).
+ *
+ *   `native/integrity.json` itself is gitignored (.gitignore:21) and has
+ *   never been committed — every CI run regenerates it from scratch, so
+ *   a stale or single-platform copy on a local disk (e.g. left over from
+ *   a local `npm run integrity:sign` / test bootstrap) has no bearing on
+ *   what gets published: the real release path always uses CI's freshly
+ *   signed, all-platform, version-matched manifest.
  */
 
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';

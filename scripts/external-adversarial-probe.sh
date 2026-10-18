@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# External adversarial probe (bug-tracker-ref, 2026-05-22).
+# External adversarial probe (2026-05-22).
 #
 # Purpose:
 #   Run customer-shaped probes against the PUBLISHED @epicai/chariot tarball

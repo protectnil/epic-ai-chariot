@@ -2,20 +2,22 @@
 /**
  * @epicai/chariot — Gateway CLI
  * `chariot-gateway` — starts the Inference Gateway.
- * This is the ONLY file that calls http.createServer / https.createServer.
+ * TLS/mTLS server construction is delegated to the shared
+ * server/transports/tlsServer.js helper (also used by rest.ts/http.ts) so
+ * the http.createServer / https.createServer call sites live in one place.
  * Built on the Epic AI® Intelligence Platform
  * Copyright 2026 protectNIL Inc. Elastic-2.0
  */
 
 import http from 'node:http';
-import https from 'node:https';
-import fs from 'node:fs';
 import { InferenceGateway } from '../gateway/InferenceGateway.js';
 import { BackendRegistry } from '../gateway/BackendRegistry.js';
 import { ControlPlane } from '../gateway/ControlPlane.js';
 import { Router } from '../gateway/Router.js';
 import { DEFAULT_GATEWAY_CONFIG } from '../gateway/types.js';
 import type { GatewayConfig } from '../gateway/types.js';
+import { createHttpServer, mtlsEnabled } from '../server/transports/tlsServer.js';
+import { releaseBootEntitlement } from '../../license/boot-gate.js';
 
 function parseArgs(argv: string[]): Partial<GatewayConfig> {
   const config: Partial<GatewayConfig> = {};
@@ -40,6 +42,9 @@ function parseArgs(argv: string[]): Partial<GatewayConfig> {
         break;
       case '--tls-key':
         config.tlsKeyPath = argv[++i];
+        break;
+      case '--tls-ca':
+        config.tlsCaPath = argv[++i];
         break;
       case '--rate-limit':
         config.rateLimitPerMinute = parseInt(argv[++i], 10);
@@ -81,15 +86,16 @@ async function main(): Promise<void> {
     });
   };
 
-  const server = useTLS
-    ? https.createServer(
-        {
-          cert: fs.readFileSync(config.tlsCertPath as string),
-          key: fs.readFileSync(config.tlsKeyPath as string),
-        },
-        requestHandler,
-      )
-    : http.createServer(requestHandler);
+  const server = createHttpServer(requestHandler, {
+    certPath: config.tlsCertPath,
+    keyPath: config.tlsKeyPath,
+    caPath: config.tlsCaPath,
+  });
+  const useMTLS = mtlsEnabled({
+    certPath: config.tlsCertPath,
+    keyPath: config.tlsKeyPath,
+    caPath: config.tlsCaPath,
+  });
 
   server.listen(config.port, () => {
     const backends = registry.backends();
@@ -99,6 +105,7 @@ async function main(): Promise<void> {
     console.log('  ============================');
     console.log(`  Listening:     ${protocol}://0.0.0.0:${config.port}`);
     console.log(`  TLS:           ${useTLS ? `enabled (cert: ${config.tlsCertPath})` : 'disabled'}`);
+    console.log(`  mTLS:          ${useMTLS ? `enabled (client CA: ${config.tlsCaPath})` : 'disabled'}`);
     console.log(`  Rate limit:    ${config.rateLimitPerMinute} req/min per IP`);
     console.log(`  CORS origins:  ${config.corsOrigins.length > 0 ? config.corsOrigins.join(', ') : 'none (all cross-origin denied)'}`);
     console.log(`  Control plane: ${controlPlane.controlPlaneStatus}`);
@@ -121,6 +128,8 @@ async function main(): Promise<void> {
     console.log('\n  Shutting down...');
     server.close();
     await gateway.stop();
+    // CH-24: return the License Manager entitlement (no-op off the LM path).
+    await releaseBootEntitlement();
     process.exit(0);
   };
 

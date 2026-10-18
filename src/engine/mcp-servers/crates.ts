@@ -31,7 +31,7 @@ export class CratesMCPServer extends MCPAdapterBase {
       name: 'crates',
       displayName: 'Crates.io',
       version: '1.0.0',
-      category: 'development',
+      category: 'engineering',
       keywords: [
         'crates', 'crates.io', 'rust', 'cargo', 'packages', 'registry',
         'rust packages', 'rust crates', 'dependencies', 'rust ecosystem',

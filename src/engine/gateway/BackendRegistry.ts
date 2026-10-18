@@ -15,6 +15,9 @@ import type {
   GatewayConfig,
 } from './types.js';
 import { DISCOVERY_PORTS } from './types.js';
+// CHARIOT::§16.1 Operational (rulings item 91/105) — direct import,
+// matching this repo's established pattern.
+import { chariotEmitter } from '../../observability/emitter.js';
 
 const log = createLogger('gateway.registry');
 
@@ -82,7 +85,12 @@ export class BackendRegistry {
   }
 
   private async probeBackend(url: string, type: BackendType): Promise<BackendHealth | null> {
-    const endpoint = type === 'ollama' ? `${url}/api/version` : `${url}/v1/models`;
+    // §8.10: "GET /v1/models against each backend; healthy if 200 within five
+    // seconds." The health probe is uniform across backend types — ollama exposes
+    // the OpenAI-compatible /v1/models surface too (it is the primary detection
+    // signal in §8.6 step 1), so probing /api/version for ollama was both off-spec
+    // and left ollama backends with an empty modelIds list. One endpoint, one shape.
+    const endpoint = `${url}/v1/models`;
     const start = Date.now();
 
     try {
@@ -96,13 +104,11 @@ export class BackendRegistry {
         if (!response.ok) return null;
 
         let modelIds: string[] = [];
-        if (type !== 'ollama') {
-          try {
-            const data = await response.json() as { data?: { id: string }[] };
-            modelIds = (data.data ?? []).map(m => m.id);
-          } catch {
-            // Model list parse failure is non-fatal
-          }
+        try {
+          const data = await response.json() as { data?: { id: string }[] };
+          modelIds = (data.data ?? []).map(m => m.id);
+        } catch {
+          // Model list parse failure is non-fatal
         }
 
         return {
@@ -216,6 +222,13 @@ export class BackendRegistry {
           consecutiveFailureCount: failureCount,
         };
         await this.controlPlane.setBackendHealth(backend.url, updated);
+        // CHARIOT::§16.1 Operational (CHARIOT-SPEC.md:1353, rulings item
+        // 91/105) — fires on every probe failure that flips a backend to
+        // unhealthy, independent of whether the circuit also opens below.
+        chariotEmitter.send('gateway.backend_unhealthy', {
+          severity: 'warning',
+          data: { url: backend.url, consecutiveFailureCount: failureCount },
+        });
 
         if (shouldOpen || circuit.state === 'half-open') {
           const newCircuit: CircuitBreakerState = {
@@ -226,6 +239,14 @@ export class BackendRegistry {
           };
           await this.controlPlane.setCircuitBreaker(backend.url, newCircuit);
           log.warn('circuit breaker opened', { url: backend.url, failureCount });
+          // CHARIOT::§16.1 Operational (CHARIOT-SPEC.md:1353, rulings item
+          // 91/105) — the customer-facing counterpart to the WARN log
+          // directly above.
+          chariotEmitter.send('gateway.circuit_opened', {
+            severity: 'urgent',
+            alertWorthy: true,
+            data: { url: backend.url, failureCount },
+          });
         }
       }
     }

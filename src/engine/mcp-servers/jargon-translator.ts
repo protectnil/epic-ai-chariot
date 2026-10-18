@@ -41,7 +41,7 @@ export class JargonTranslatorMCPServer extends MCPAdapterBase {
       name: 'jargon-translator',
       displayName: 'Jargon Translator',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'jargon', 'corporate', 'translate', 'translator', 'plain english',
         'business speak', 'buzzwords', 'office jargon', 'corporate speak',

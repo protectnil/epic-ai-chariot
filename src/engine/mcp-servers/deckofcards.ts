@@ -44,7 +44,7 @@ export class DeckOfCardsMCPServer extends MCPAdapterBase {
       name: 'deckofcards',
       displayName: 'Deck of Cards',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'deck', 'cards', 'playing cards', 'shuffle', 'draw', 'poker',
         'blackjack', 'card game', 'random', 'suits', 'deck of cards',

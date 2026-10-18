@@ -56,7 +56,7 @@ export class CatFactsMCPServer extends MCPAdapterBase {
       name: 'catfacts',
       displayName: 'Cat Facts',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'cat', 'cats', 'facts', 'cat facts', 'animals', 'trivia',
         'breeds', 'feline', 'random fact', 'fun facts',

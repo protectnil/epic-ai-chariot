@@ -20,7 +20,11 @@ const MAX_DISCOVERY_FILE_BYTES: usize = 4 * 1024 * 1024;
 fn read_capped(path: &Path) -> Option<String> {
     let mut f = File::open(path).ok()?;
     let mut buf = Vec::with_capacity(8192);
-    let n = f.by_ref().take(MAX_DISCOVERY_FILE_BYTES as u64 + 1).read_to_end(&mut buf).ok()?;
+    let n = f
+        .by_ref()
+        .take(MAX_DISCOVERY_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
     if n > MAX_DISCOVERY_FILE_BYTES {
         return None;
     }
@@ -59,15 +63,31 @@ pub struct DiscoveryResult {
 /// Returns discovered services with their endpoints.
 fn scan_openapi_specs(root: &Path) -> Vec<DiscoveredService> {
     let mut services = Vec::new();
-    let openapi_patterns = ["openapi.json", "openapi.yaml", "openapi.yml",
-                            "swagger.json", "swagger.yaml", "swagger.yml"];
+    let openapi_patterns = [
+        "openapi.json",
+        "openapi.yaml",
+        "openapi.yml",
+        "swagger.json",
+        "swagger.yaml",
+        "swagger.yml",
+    ];
 
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             // Skip common non-source directories
-            !matches!(name.as_ref(), "node_modules" | ".git" | "dist" | "build" | "target" | ".next" | "__pycache__" | "vendor")
+            !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | ".git"
+                    | "dist"
+                    | "build"
+                    | "target"
+                    | ".next"
+                    | "__pycache__"
+                    | "vendor"
+            )
         })
         .filter_map(|e| e.ok())
     {
@@ -106,7 +126,13 @@ fn parse_openapi_json(content: &str, file_path: &str) -> Option<DiscoveredServic
     let mut endpoints = Vec::new();
 
     for (path, methods) in paths {
-        let methods_obj = methods.as_object()?;
+        // Skip a malformed path item (null/string/array value) instead of
+        // aborting the whole spec with `?` — one bad entry must not silently
+        // drop every valid endpoint (and with it the entire service) from
+        // the discovery result.
+        let Some(methods_obj) = methods.as_object() else {
+            continue;
+        };
         for (method, operation) in methods_obj {
             let http_methods = ["get", "post", "put", "patch", "delete", "head", "options"];
             if !http_methods.contains(&method.as_str()) {
@@ -151,7 +177,13 @@ fn parse_openapi_yaml_simple(content: &str, file_path: &str) -> Option<Discovere
     for line in content.lines() {
         // Extract title
         if line.trim().starts_with("title:") {
-            title = line.trim().trim_start_matches("title:").trim().trim_matches('"').trim_matches('\'').to_string();
+            title = line
+                .trim()
+                .trim_start_matches("title:")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
         }
 
         if line == "paths:" {
@@ -168,7 +200,9 @@ fn parse_openapi_yaml_simple(content: &str, file_path: &str) -> Option<Discovere
             // HTTP method (4 spaces or 2 tab indent)
             if let Some(ref path) = current_path {
                 let trimmed = line.trim();
-                let http_methods = ["get:", "post:", "put:", "patch:", "delete:", "head:", "options:"];
+                let http_methods = [
+                    "get:", "post:", "put:", "patch:", "delete:", "head:", "options:",
+                ];
                 for method in &http_methods {
                     if trimmed == *method {
                         endpoints.push(DiscoveredEndpoint {
@@ -183,7 +217,11 @@ fn parse_openapi_yaml_simple(content: &str, file_path: &str) -> Option<Discovere
             }
 
             // Detect end of paths section (non-indented line that isn't empty)
-            if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') && line != "paths:" {
+            if !line.is_empty()
+                && !line.starts_with(' ')
+                && !line.starts_with('\t')
+                && line != "paths:"
+            {
                 in_paths = false;
                 current_path = None;
             }
@@ -228,8 +266,13 @@ fn skip_string_backward(bytes: &[u8], i: usize, quote: u8) -> usize {
             // Count preceding backslashes; even count → unescaped.
             let mut bs = 0;
             let mut k = j;
-            while k > 0 && bytes[k - 1] == b'\\' { bs += 1; k -= 1; }
-            if bs % 2 == 0 { return j; }
+            while k > 0 && bytes[k - 1] == b'\\' {
+                bs += 1;
+                k -= 1;
+            }
+            if bs % 2 == 0 {
+                return j;
+            }
         }
     }
     0
@@ -238,15 +281,19 @@ fn skip_string_backward(bytes: &[u8], i: usize, quote: u8) -> usize {
 fn last_word_allows_regex(out: &str) -> bool {
     let bytes = out.as_bytes();
     let mut end = bytes.len();
-    while end > 0 && matches!(bytes[end - 1], b' ' | b'\t' | b'\n' | b'\r') { end -= 1; }
-    if end == 0 { return true; } // start of file → regex allowed
-    // Case A: previous non-space char is `)` — could be an `if (...)` /
-    // `while (...)` / `for (...)` head; walk back through balanced
-    // parens to the identifier before the `(`. If that identifier is
-    // a regex-allowing control-flow keyword, the following `/` is a
-    // regex literal even though `)` is normally an expression terminator.
-    // The walk skips string and template literal spans so a `)` inside
-    // a string cannot throw off the balance count.
+    while end > 0 && matches!(bytes[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        end -= 1;
+    }
+    if end == 0 {
+        return true;
+    } // start of file → regex allowed
+      // Case A: previous non-space char is `)` — could be an `if (...)` /
+      // `while (...)` / `for (...)` head; walk back through balanced
+      // parens to the identifier before the `(`. If that identifier is
+      // a regex-allowing control-flow keyword, the following `/` is a
+      // regex literal even though `)` is normally an expression terminator.
+      // The walk skips string and template literal spans so a `)` inside
+      // a string cannot throw off the balance count.
     if bytes[end - 1] == b')' {
         let mut depth: i32 = 0;
         let mut i = end;
@@ -259,11 +306,17 @@ fn last_word_allows_regex(out: &str) -> bool {
                 i = open; // continue with the byte BEFORE the opening quote
                 continue;
             }
-            if b == b')' { depth += 1; i -= 1; continue; }
+            if b == b')' {
+                depth += 1;
+                i -= 1;
+                continue;
+            }
             if b == b'(' {
                 depth -= 1;
                 i -= 1;
-                if depth == 0 { break; }
+                if depth == 0 {
+                    break;
+                }
                 continue;
             }
             i -= 1;
@@ -274,7 +327,11 @@ fn last_word_allows_regex(out: &str) -> bool {
     let mut start = end;
     while start > 0 {
         let b = bytes[start - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' { start -= 1; } else { break; }
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+            start -= 1;
+        } else {
+            break;
+        }
     }
     if start == end {
         // Previous non-space char is an operator/punctuation — almost
@@ -286,17 +343,47 @@ fn last_word_allows_regex(out: &str) -> bool {
         return true;
     }
     let word = &out[start..end];
-    matches!(word,
-        "return" | "typeof" | "instanceof" | "in" | "of" | "delete" | "void"
-        | "throw" | "new" | "do" | "else" | "case" | "yield" | "await"
-        | "if" | "while" | "for" | "switch" | "with" | "extends" | "try" | "finally")
+    matches!(
+        word,
+        "return"
+            | "typeof"
+            | "instanceof"
+            | "in"
+            | "of"
+            | "delete"
+            | "void"
+            | "throw"
+            | "new"
+            | "do"
+            | "else"
+            | "case"
+            | "yield"
+            | "await"
+            | "if"
+            | "while"
+            | "for"
+            | "switch"
+            | "with"
+            | "extends"
+            | "try"
+            | "finally"
+    )
 }
 
 fn strip_js_comments(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
-    enum State { Code, LineComment, BlockComment, StringD, StringS, Template, Regex, CharClass }
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        StringD,
+        StringS,
+        Template,
+        Regex,
+        CharClass,
+    }
     let mut state = State::Code;
     // Track the last non-space/non-newline character emitted in Code
     // state. Combined with last_word_allows_regex(), this disambiguates
@@ -347,8 +434,10 @@ fn strip_js_comments(src: &str) -> String {
                 // instead of walking the buffer backward — robust to
                 // nested template literals containing backticks.
                 let allows_after_close_paren = last_code == b')'
-                    && matches!(last_closed_paren_kw.as_str(),
-                        "if" | "while" | "for" | "switch" | "with" | "catch");
+                    && matches!(
+                        last_closed_paren_kw.as_str(),
+                        "if" | "while" | "for" | "switch" | "with" | "catch"
+                    );
                 // `]` is always an expression terminator that produces a
                 // value (index / array literal end), so `/` immediately
                 // after `]` is division — never a regex. Skip the
@@ -364,10 +453,13 @@ fn strip_js_comments(src: &str) -> String {
                     i += 1;
                     continue;
                 }
-                if c == b'"' { state = State::StringD; }
-                else if c == b'\'' { state = State::StringS; }
-                else if c == b'`' { state = State::Template; }
-                else if c == b'(' {
+                if c == b'"' {
+                    state = State::StringD;
+                } else if c == b'\'' {
+                    state = State::StringS;
+                } else if c == b'`' {
+                    state = State::Template;
+                } else if c == b'(' {
                     // Snapshot the identifier immediately preceding
                     // this `(`, if any (walk back through the OUT
                     // buffer past whitespace). This buffer is
@@ -375,22 +467,35 @@ fn strip_js_comments(src: &str) -> String {
                     // immediately-prior identifier word, not parens.
                     let ob = out.as_bytes();
                     let mut e = ob.len();
-                    while e > 0 && matches!(ob[e - 1], b' ' | b'\t' | b'\n' | b'\r') { e -= 1; }
+                    while e > 0 && matches!(ob[e - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                        e -= 1;
+                    }
                     let mut s = e;
                     while s > 0 {
                         let b = ob[s - 1];
-                        if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' { s -= 1; } else { break; }
+                        if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+                            s -= 1;
+                        } else {
+                            break;
+                        }
                     }
                     paren_kw_stack.push(out[s..e].to_string());
                 } else if c == b')' {
                     last_closed_paren_kw = paren_kw_stack.pop().unwrap_or_default();
                 }
                 out.push(c as char);
-                if c != b' ' && c != b'\t' && c != b'\n' && c != b'\r' { last_code = c; }
+                if c != b' ' && c != b'\t' && c != b'\n' && c != b'\r' {
+                    last_code = c;
+                }
             }
             State::LineComment => {
-                if c == b'\n' { state = State::Code; out.push('\n'); last_code = b'\n'; }
-                else { out.push(' '); }
+                if c == b'\n' {
+                    state = State::Code;
+                    out.push('\n');
+                    last_code = b'\n';
+                } else {
+                    out.push(' ');
+                }
             }
             State::BlockComment => {
                 if c == b'*' && next == b'/' {
@@ -404,31 +509,102 @@ fn strip_js_comments(src: &str) -> String {
                 out.push(if c == b'\n' { '\n' } else { ' ' });
             }
             State::StringD => {
-                if c == b'\\' && next != 0 { out.push(c as char); out.push(next as char); i += 2; continue; }
-                if c == b'"' { state = State::Code; last_code = b'"'; out.push(c as char); i += 1; continue; }
+                if c == b'\\' && next != 0 {
+                    out.push(c as char);
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    state = State::Code;
+                    last_code = b'"';
+                    out.push(c as char);
+                    i += 1;
+                    continue;
+                }
                 out.push(c as char);
             }
             State::StringS => {
-                if c == b'\\' && next != 0 { out.push(c as char); out.push(next as char); i += 2; continue; }
-                if c == b'\'' { state = State::Code; last_code = b'\''; out.push(c as char); i += 1; continue; }
+                if c == b'\\' && next != 0 {
+                    out.push(c as char);
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                if c == b'\'' {
+                    state = State::Code;
+                    last_code = b'\'';
+                    out.push(c as char);
+                    i += 1;
+                    continue;
+                }
                 out.push(c as char);
             }
             State::Template => {
-                if c == b'\\' && next != 0 { out.push(c as char); out.push(next as char); i += 2; continue; }
-                if c == b'`' { state = State::Code; last_code = b'`'; out.push(c as char); i += 1; continue; }
+                if c == b'\\' && next != 0 {
+                    out.push(c as char);
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                if c == b'`' {
+                    state = State::Code;
+                    last_code = b'`';
+                    out.push(c as char);
+                    i += 1;
+                    continue;
+                }
                 out.push(c as char);
             }
             State::Regex => {
-                if c == b'\\' && next != 0 { out.push(c as char); out.push(next as char); i += 2; continue; }
-                if c == b'[' { state = State::CharClass; out.push(c as char); i += 1; continue; }
-                if c == b'/' { state = State::Code; last_code = b'/'; out.push(c as char); i += 1; continue; }
-                if c == b'\n' { state = State::Code; last_code = b'\n'; out.push('\n'); i += 1; continue; }
+                if c == b'\\' && next != 0 {
+                    out.push(c as char);
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                if c == b'[' {
+                    state = State::CharClass;
+                    out.push(c as char);
+                    i += 1;
+                    continue;
+                }
+                if c == b'/' {
+                    state = State::Code;
+                    last_code = b'/';
+                    out.push(c as char);
+                    i += 1;
+                    continue;
+                }
+                if c == b'\n' {
+                    state = State::Code;
+                    last_code = b'\n';
+                    out.push('\n');
+                    i += 1;
+                    continue;
+                }
                 out.push(c as char);
             }
             State::CharClass => {
-                if c == b'\\' && next != 0 { out.push(c as char); out.push(next as char); i += 2; continue; }
-                if c == b']' { state = State::Regex; out.push(c as char); i += 1; continue; }
-                if c == b'\n' { state = State::Code; last_code = b'\n'; out.push('\n'); i += 1; continue; }
+                if c == b'\\' && next != 0 {
+                    out.push(c as char);
+                    out.push(next as char);
+                    i += 2;
+                    continue;
+                }
+                if c == b']' {
+                    state = State::Regex;
+                    out.push(c as char);
+                    i += 1;
+                    continue;
+                }
+                if c == b'\n' {
+                    state = State::Code;
+                    last_code = b'\n';
+                    out.push('\n');
+                    i += 1;
+                    continue;
+                }
                 out.push(c as char);
             }
         }
@@ -437,22 +613,127 @@ fn strip_js_comments(src: &str) -> String {
     out
 }
 
+/// After the closing quote of a matched `IDENTIFIER.METHOD('path'` call,
+/// decide whether the rest of the call argument list structurally looks
+/// like a real Express route registration — i.e. the path is followed by
+/// at least one more argument that is itself plausibly a handler/middleware
+/// function — rather than a same-shaped call to an unrelated `.get`/`.post`/
+/// etc. method (Redis/cache GET, a `Map`/DI-container `.get(key)` lookup,
+/// an HTTP client library call, or Express's own `req.get(header)` /
+/// `res.get(header)` accessor).
+///
+/// Real Express handlers observed in this codebase take one of these
+/// shapes as the argument immediately after the path: `(req, res) => …`,
+/// `async (req, res) => …`, a bare `function` expression, an unparenthesized
+/// single-param arrow (`x => …`), or a bare lowerCamelCase identifier naming
+/// a middleware/handler function reference (e.g. `entraAdminMiddleware`,
+/// `handleRecoveryRequest`) — never a PascalCase Class/Type reference (a DI
+/// container's `.get(key, SomeClass)` resolution shape) and never a `{…}`
+/// object literal (an HTTP client's request-body/payload argument, e.g.
+/// `axios.post('/x', { … })` — never a valid Express handler shape).
+/// Bounded lookahead avoids pathological scans on a 4 MiB-capped file.
+fn has_handler_argument(rest: &str) -> bool {
+    let window_end = rest
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&end| end <= 4096)
+        .last()
+        .unwrap_or(0);
+    let bytes = rest[..window_end].as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // Only one argument (the path) was ever given — not a route
+    // registration (every Express route method needs a handler too).
+    if i >= bytes.len() || bytes[i] != b',' {
+        return false;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return false;
+    }
+    let c = bytes[i];
+    if c == b'{' {
+        // Object literal (request payload/config) — never a handler.
+        return false;
+    }
+    if c == b'(' {
+        // Parenthesized arrow-function param list, e.g. `(req, res) => {…}`.
+        return true;
+    }
+    if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') {
+            i += 1;
+        }
+        let ident = &rest[start..i];
+        if ident == "async" || ident == "function" {
+            return true;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Unparenthesized single-param arrow: `x => …`.
+        if j + 1 < bytes.len() && bytes[j] == b'=' && bytes[j + 1] == b'>' {
+            return true;
+        }
+        if j < bytes.len() && (bytes[j] == b',' || bytes[j] == b')') {
+            // The whole second argument is this one bare identifier — a
+            // middleware/handler reference by JS/TS convention starts
+            // lowercase; an uppercase-first identifier here is a Class/Type
+            // token (e.g. `container.get('redis', RedisConnectionPool)`),
+            // not a handler.
+            let first = ident.as_bytes()[0];
+            return first.is_ascii_lowercase() || first == b'_' || first == b'$';
+        }
+        // Any other shape immediately after the identifier (member access,
+        // an immediate call, etc.) doesn't match a recognized handler
+        // pattern — reject rather than guess.
+        return false;
+    }
+    false
+}
+
 fn scan_express_routes(root: &Path) -> Vec<DiscoveredService> {
     // Match any identifier (1–63 [A-Za-z_][A-Za-z0-9_]* chars) calling
     // `.METHOD('path', …)`. Real Express code uses many router variable
     // names (`apiV1`, `usersRouter`, `r`, `mountPoint`); the HTTP-verb
     // method set keeps false positives like `Number.parseInt(...)` out.
+    // `\s*` (used between `.METHOD(` and the path's opening quote) matches
+    // newlines too, so a multi-line call such as
+    // `router.get(\n  '/path',\n  handler,\n)` — the actual shape used by
+    // several NILAssistApp route files — is matched when this pattern is
+    // run over the WHOLE stripped file text rather than per source line
+    // (see below; a prior per-line `.lines()` scan silently missed every
+    // multi-line registration, since neither line in isolation matched the
+    // full `identifier.method(` + `'path'` pattern).
     let route_pattern = regex::Regex::new(
-        r#"\b[A-Za-z_][A-Za-z0-9_]{0,62}\.(get|post|put|patch|delete|head|options)\s*\(\s*['"`]([^'"`]+)['"`]"#
+        r#"\b(req|res|[A-Za-z_][A-Za-z0-9_]{0,62})\.(get|post|put|patch|delete|head|options)\s*\(\s*['"`]([^'"`]+)['"`]"#
     ).unwrap();
 
-    let mut service_map: std::collections::HashMap<String, Vec<DiscoveredEndpoint>> = std::collections::HashMap::new();
+    let mut service_map: std::collections::HashMap<String, Vec<DiscoveredEndpoint>> =
+        std::collections::HashMap::new();
 
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !matches!(name.as_ref(), "node_modules" | ".git" | "dist" | "build" | "target" | ".next" | "__pycache__" | "vendor")
+            !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | ".git"
+                    | "dist"
+                    | "build"
+                    | "target"
+                    | ".next"
+                    | "__pycache__"
+                    | "vendor"
+            )
         })
         .filter_map(|e| e.ok())
     {
@@ -468,8 +749,12 @@ fn scan_express_routes(root: &Path) -> Vec<DiscoveredService> {
         };
 
         // Quick check — skip files that don't look like route files
-        if !content.contains(".get(") && !content.contains(".post(") && !content.contains(".put(")
-            && !content.contains(".patch(") && !content.contains(".delete(") {
+        if !content.contains(".get(")
+            && !content.contains(".post(")
+            && !content.contains(".put(")
+            && !content.contains(".patch(")
+            && !content.contains(".delete(")
+        {
             continue;
         }
 
@@ -478,22 +763,49 @@ fn scan_express_routes(root: &Path) -> Vec<DiscoveredService> {
         let file_path = path.to_string_lossy().to_string();
         let service_name = infer_service_name(path);
 
-        for (line_number, line) in stripped.lines().enumerate() {
-            for cap in route_pattern.captures_iter(line) {
-                let method = cap[1].to_uppercase();
-                let route_path = cap[2].to_string();
-
-                service_map
-                    .entry(service_name.clone())
-                    .or_default()
-                    .push(DiscoveredEndpoint {
-                        method,
-                        path: route_path,
-                        handler_name: None,
-                        file_path: file_path.clone(),
-                        line_number: (line_number + 1) as u32,
-                    });
+        for cap in route_pattern.captures_iter(&stripped) {
+            let receiver = &cap[1];
+            // Express documents `Request#get(field)` / `Response#get(field)`
+            // as a HEADER ACCESSOR (an entirely different API from a route
+            // method), always called on the conventional `req`/`res`
+            // parameter names — never a route registration. Excluding it by
+            // name here is a correct, spec-documented exclusion (not a
+            // router-variable-name allowlist: any OTHER identifier is still
+            // accepted, per the comment on `route_pattern` above).
+            if receiver == "req" || receiver == "res" {
+                continue;
             }
+
+            let whole = cap.get(0).unwrap();
+            // A real Express route/middleware registration always passes at
+            // least one more argument after the path (the handler, or
+            // middleware then the handler) — reject a call whose only
+            // argument is the path itself, and reject a second argument
+            // that doesn't structurally look like a handler (see
+            // `has_handler_argument`). This is what distinguishes an actual
+            // `router.get('/x', handler)` registration from a same-shaped
+            // call to an unrelated `.get`/`.post`/etc. method — e.g. a Redis
+            // client (`redisPool.get(key)`), a `Map`/DI-container lookup
+            // (`container.get('redis', RedisConnectionPool)`), or an HTTP
+            // client library call (`axios.post('/x', { … })`).
+            if !has_handler_argument(&stripped[whole.end()..]) {
+                continue;
+            }
+
+            let method = cap[2].to_uppercase();
+            let route_path = cap[3].to_string();
+            let line_number = stripped[..whole.start()].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+
+            service_map
+                .entry(service_name.clone())
+                .or_default()
+                .push(DiscoveredEndpoint {
+                    method,
+                    path: route_path,
+                    handler_name: None,
+                    file_path: file_path.clone(),
+                    line_number,
+                });
         }
     }
 
@@ -594,18 +906,51 @@ pub fn discover_internal_apis(codebase_path: String) -> DiscoveryResult {
 mod tests {
     use super::*;
 
+    /// One malformed path item (null value) must NOT abort the whole spec:
+    /// the valid endpoints around it still make it into the service.
+    #[test]
+    fn malformed_path_item_does_not_drop_service() {
+        let content = r#"{
+            "info": {"title": "svc"},
+            "paths": {
+                "/a":   {"get":  {"operationId": "getA"}},
+                "/bad": null,
+                "/b":   {"post": {"operationId": "postB"}}
+            }
+        }"#;
+        let svc = parse_openapi_json(content, "/x/openapi.json")
+            .expect("service with valid endpoints must survive a malformed path item");
+        assert_eq!(svc.endpoints.len(), 2, "both valid endpoints must be kept");
+        assert!(svc
+            .endpoints
+            .iter()
+            .any(|e| e.path == "/a" && e.method == "GET"));
+        assert!(svc
+            .endpoints
+            .iter()
+            .any(|e| e.path == "/b" && e.method == "POST"));
+    }
+
     #[test]
     fn strip_keeps_route_after_return_regex() {
         let src = "function h() { return /foo/.test(x); }\napp.get('/users', () => {});\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/users'"), "route survived regex disambig: {}", out);
+        assert!(
+            out.contains("app.get('/users'"),
+            "route survived regex disambig: {}",
+            out
+        );
     }
 
     #[test]
     fn strip_keeps_route_after_if_paren_regex() {
         let src = "if (cond) /foo/.test(x);\nrouter.post('/login', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("router.post('/login'"), "route survived if-paren regex: {}", out);
+        assert!(
+            out.contains("router.post('/login'"),
+            "route survived if-paren regex: {}",
+            out
+        );
     }
 
     #[test]
@@ -620,7 +965,11 @@ mod tests {
     fn strip_handles_regex_containing_slash() {
         let src = "const r = /[/]/;\napp.get('/x', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/x'"), "route after regex literal containing slash: {}", out);
+        assert!(
+            out.contains("app.get('/x'"),
+            "route after regex literal containing slash: {}",
+            out
+        );
     }
 
     #[test]
@@ -631,7 +980,11 @@ mod tests {
         // result), so the route on the next line must still survive.
         let src = "foo(\")\") / 2;\napp.get('/balance', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/balance'"), "route survived paren-string mix: {}", out);
+        assert!(
+            out.contains("app.get('/balance'"),
+            "route survived paren-string mix: {}",
+            out
+        );
     }
 
     #[test]
@@ -640,7 +993,11 @@ mod tests {
         // must be division, not regex-start.
         let src = "const r = arr[i] / 2;\napp.get('/idx', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/idx'"), "route after array-index division: {}", out);
+        assert!(
+            out.contains("app.get('/idx'"),
+            "route after array-index division: {}",
+            out
+        );
     }
 
     #[test]
@@ -648,7 +1005,11 @@ mod tests {
         // foo()[0] / 2 — same case via call-then-index.
         let src = "const r = foo()[0] / 2;\nrouter.post('/calldiv', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("router.post('/calldiv'"), "route after call-index division: {}", out);
+        assert!(
+            out.contains("router.post('/calldiv'"),
+            "route after call-index division: {}",
+            out
+        );
     }
 
     #[test]
@@ -658,9 +1019,14 @@ mod tests {
         // literal. Paren-balance must not get confused by interior
         // backticks because the forward-tracked paren-keyword stack
         // doesn't backward-scan strings/templates at all.
-        let src = "const s = `outer ${`inner`} end`;\nif (cond) /re/.test(x);\napp.get('/nest', h);\n";
+        let src =
+            "const s = `outer ${`inner`} end`;\nif (cond) /re/.test(x);\napp.get('/nest', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/nest'"), "route survived nested template: {}", out);
+        assert!(
+            out.contains("app.get('/nest'"),
+            "route survived nested template: {}",
+            out
+        );
     }
 
     #[test]
@@ -669,7 +1035,11 @@ mod tests {
         // string and find `if` so the `/` is recognized as regex.
         let src = "if (\")\") /re/.test(x);\napp.get('/kw', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/kw'"), "route survived if-string-paren regex: {}", out);
+        assert!(
+            out.contains("app.get('/kw'"),
+            "route survived if-string-paren regex: {}",
+            out
+        );
     }
 
     #[test]
@@ -679,6 +1049,282 @@ mod tests {
         // false. The string should pass through unchanged.
         let src = "let r = count / interval;\napp.get('/y', h);\n";
         let out = strip_js_comments(src);
-        assert!(out.contains("app.get('/y'"), "route after division: {}", out);
+        assert!(
+            out.contains("app.get('/y'"),
+            "route after division: {}",
+            out
+        );
+    }
+
+    // ── Dogfood mechanism test 2026-09-30 (mechanism-test-routes-20260930T061418Z) ──
+    // Defect 1: multi-line `router.METHOD(\n  'path', …)` registrations (the
+    // real shape used by NILAssistApp/backend/src/routes/adminAuditLogs.ts,
+    // adminCollections.ts, adminCompliance.ts, adminDashboard.ts,
+    // adminReference.ts, adminStaff.ts, adminUsers.ts, bugs.ts) were silently
+    // never discovered — 8 of 31 real route files.
+    // Defect 2: non-route `.get`/`.post`/etc. calls (Redis/cache GET, a
+    // Map/DI-container `.get(key)` lookup, an HTTP client library call, and
+    // Express's own `req.get`/`res.get` header accessor) were misclassified
+    // as Express route registrations — 7 files in this codebase's actual
+    // dogfood run (useAuth, useDeal, useEncryption, useLlamaIndex,
+    // PkceStateService, memoryMonitor, requestLogger).
+    //
+    // Governing text: CHARIOT-SPEC.md does not carry a numbered clause on
+    // discovery-scanner precision/recall — only its feature description,
+    // quoted verbatim: "OpenAPI/Express internal-API discovery scanners"
+    // (CHARIOT-SPEC.md:35) and the `discover` command table entry, "Run the
+    // OpenAPI + Express scanner over a directory tree" (CHARIOT-SPEC.md:411).
+    // No clause is misquoted or invented here in its absence.
+
+    fn scan_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chariot-discovery-scan-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("routes")).expect("mkdir");
+        dir
+    }
+
+    fn write_route_file(dir: &Path, name: &str, contents: &str) {
+        std::fs::write(dir.join("routes").join(name), contents).expect("write route file");
+    }
+
+    // ── Defect 1 fixtures: multi-line registrations must be discovered ──
+
+    #[test]
+    fn multiline_route_registration_is_discovered() {
+        // Fixture reproduces adminAuditLogs.ts's actual shape: `router.get(`
+        // on its own line, the path string on the next line.
+        let dir = scan_test_dir("multiline-basic");
+        write_route_file(
+            &dir,
+            "adminAuditLogs.ts",
+            "import { Router } from 'express';\n\
+             export function createAdminAuditLogsRoutes(): Router {\n\
+             \x20 const router = Router();\n\
+             \x20 router.get(\n\
+             \x20   '/',\n\
+             \x20   async (req, res) => { res.json({}); },\n\
+             \x20 );\n\
+             \x20 return router;\n\
+             }\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert_eq!(
+            result.len(),
+            1,
+            "multi-line router.get(...) must be discovered as one service: {:?}",
+            result
+        );
+        assert_eq!(result[0].name, "adminAuditLogs");
+        assert_eq!(result[0].endpoints.len(), 1);
+        assert_eq!(result[0].endpoints[0].method, "GET");
+        assert_eq!(result[0].endpoints[0].path, "/");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiline_route_with_middleware_chain_is_discovered() {
+        // Fixture reproduces adminCompliance.ts's actual shape: path,
+        // middleware reference, and handler each on their own line.
+        let dir = scan_test_dir("multiline-middleware");
+        write_route_file(
+            &dir,
+            "adminCompliance.ts",
+            "import { Router } from 'express';\n\
+             export function createAdminComplianceRoutes(): Router {\n\
+             \x20 const router = Router();\n\
+             \x20 router.get(\n\
+             \x20   '/dashboard',\n\
+             \x20   entraAdminMiddleware,\n\
+             \x20   async (req, res) => { res.json({}); },\n\
+             \x20 );\n\
+             \x20 return router;\n\
+             }\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert_eq!(
+            result.len(),
+            1,
+            "multi-line route with a leading middleware identifier must still be discovered: {:?}",
+            result
+        );
+        assert_eq!(result[0].endpoints[0].path, "/dashboard");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn singleline_route_with_bare_handler_reference_still_discovered() {
+        // Regression guard: a single-line registration passing a BARE
+        // lowerCamelCase function reference (no arrow, no `function`
+        // keyword) — the real shape used by
+        // NILAssistApp/backend/src/routes/auth/recovery/index.ts
+        // (`router.post('/request', handleRecoveryRequest);`) — must
+        // continue to be discovered. This is what rules out simply
+        // requiring an arrow/`function` token in the handler position.
+        let dir = scan_test_dir("bare-handler-ref");
+        write_route_file(
+            &dir,
+            "recovery.ts",
+            "router.post('/request', handleRecoveryRequest);\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert_eq!(
+            result.len(),
+            1,
+            "bare named-handler-reference registration must still be discovered: {:?}",
+            result
+        );
+        assert_eq!(result[0].endpoints[0].method, "POST");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Defect 2 fixtures: non-route calls must NOT be discovered ──
+
+    #[test]
+    fn redis_style_single_arg_get_is_not_discovered() {
+        // Fixture reproduces useAuth.ts / useDeal.ts / PkceStateService.ts:
+        // `redisPool.get(\`email_verification:${userId}\`)` — a Redis GET,
+        // single argument, no handler.
+        let dir = scan_test_dir("redis-get");
+        write_route_file(
+            &dir,
+            "useAuth.ts",
+            "async function f() {\n\
+             \x20 const storedCSRF = await redisPool.get(`email_verification_csrf:${userId}`);\n\
+             \x20 return storedCSRF;\n\
+             }\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert!(
+            result.is_empty(),
+            "single-argument redisPool.get(...) must not be discovered as a route: {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn di_container_get_with_class_reference_is_not_discovered() {
+        // Fixture reproduces useAuth.ts / PkceStateService.ts:
+        // `container.get('redis', RedisConnectionPool)` — a DI-container
+        // resolution; the second argument is a PascalCase Class/Type
+        // reference, not a handler.
+        let dir = scan_test_dir("di-container-get");
+        write_route_file(
+            &dir,
+            "PkceStateService.ts",
+            "function f() {\n\
+             \x20 const redis = container.get('redis', RedisConnectionPool) as IRedisConnectionPool;\n\
+             \x20 return redis;\n\
+             }\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert!(
+            result.is_empty(),
+            "container.get(key, ClassRef) DI resolution must not be discovered as a route: {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_client_call_with_object_payload_is_not_discovered() {
+        // Fixture reproduces useLlamaIndex.ts:
+        // `llamaindexClient.post('/search', { query })` — an outbound HTTP
+        // client call to a REMOTE service, not a local route definition;
+        // the second argument is an object-literal payload, never a valid
+        // Express handler shape.
+        let dir = scan_test_dir("http-client-payload");
+        write_route_file(
+            &dir,
+            "useLlamaIndex.ts",
+            "async function search(query: string) {\n\
+             \x20 const response = await llamaindexClient.post('/search', {\n\
+             \x20   query,\n\
+             \x20 });\n\
+             \x20 return response;\n\
+             }\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert!(
+            result.is_empty(),
+            "HTTP client call with an object-literal payload must not be discovered as a route: {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn express_request_response_header_accessor_is_not_discovered() {
+        // Fixture reproduces memoryMonitor.ts (`req.get('User-Agent')`) and
+        // requestLogger.ts (`res.get('content-length')`) — Express's OWN
+        // documented Request#get()/Response#get() header-accessor API,
+        // called on the conventional `req`/`res` parameter names — a
+        // different API from route registration, never a route definition.
+        let dir = scan_test_dir("req-res-header-accessor");
+        write_route_file(
+            &dir,
+            "memoryMonitor.ts",
+            "function log(req, res) {\n\
+             \x20 const ua = req.get('User-Agent');\n\
+             \x20 const len = res.get('content-length');\n\
+             \x20 return { ua, len };\n\
+             }\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert!(
+            result.is_empty(),
+            "req.get(header)/res.get(header) must not be discovered as a route: {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_style_single_arg_get_is_not_discovered() {
+        // Fixture reproduces useEncryption.ts: `dataKeys.get('pii')` — a
+        // plain Map lookup, single argument, no handler, and the argument
+        // doesn't even look like a route path (no leading `/`).
+        let dir = scan_test_dir("map-get");
+        write_route_file(
+            &dir,
+            "useEncryption.ts",
+            "function f() {\n  const keyId = dataKeys.get('pii');\n  return keyId;\n}\n",
+        );
+        let result = scan_express_routes(&dir);
+        assert!(
+            result.is_empty(),
+            "single-argument Map.get('pii') must not be discovered as a route: {:?}",
+            result
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── has_handler_argument direct unit coverage ──
+
+    #[test]
+    fn has_handler_argument_accepts_arrow_and_async_and_bare_lowercase_name() {
+        assert!(has_handler_argument(", (req, res) => { res.json({}); })"));
+        assert!(has_handler_argument(
+            ", async (req, res) => { res.json({}); })"
+        ));
+        assert!(has_handler_argument(", handleRecoveryRequest);"));
+        assert!(has_handler_argument(", middlewareFn, handler);"));
+        assert!(has_handler_argument(", x => x * 2)"));
+    }
+
+    #[test]
+    fn has_handler_argument_rejects_no_second_arg_object_literal_and_class_ref() {
+        assert!(!has_handler_argument(")")); // no second argument at all
+        assert!(!has_handler_argument(");")); // trailing semicolon, still no comma
+        assert!(!has_handler_argument(", { query });")); // object-literal payload
+        assert!(!has_handler_argument(", RedisConnectionPool)")); // PascalCase Class ref
+        assert!(!has_handler_argument(", RedisConnectionPool);"));
     }
 }

@@ -68,27 +68,31 @@ export class PersistentMemory {
   }
 
   /**
-   * Etch a memory — store a new entry for a user.
+   * Etch a memory — store a new entry for a user within a tenant.
    * When encryptionKey is configured, content is AES-256-GCM encrypted before storage.
+   *
+   * §8.5::1 — tenantId is a REQUIRED leading parameter. It is deliberately not
+   * optional: a default would silently re-create the cross-tenant collision
+   * (the cross-tenant memory isolation fix), whereas omission is now a compile error.
    */
-  async etch(userId: string, entry: MemoryEntry): Promise<StoredMemory> {
+  async etch(tenantId: string, userId: string, entry: MemoryEntry): Promise<StoredMemory> {
     if (this.config.encryptionKey) {
       const encrypted = encryptContent(serializeContent(entry.content), this.config.encryptionKey);
       const encryptedEntry: MemoryEntry = { ...entry, content: encrypted };
-      const stored = await this.config.store.save(userId, encryptedEntry);
+      const stored = await this.config.store.save(tenantId, userId, encryptedEntry);
       // Return the record with decrypted content so callers get the original value
       return { ...stored, content: entry.content };
     }
-    return this.config.store.save(userId, entry);
+    return this.config.store.save(tenantId, userId, entry);
   }
 
   /**
-   * Recall memories — retrieve stored entries for a user.
+   * Recall memories — retrieve stored entries for a user within a tenant.
    * Automatically updates access counts and promotes importance.
    * When encryptionKey is configured, content is decrypted transparently.
    */
-  async recall(userId: string, options?: RecallOptions): Promise<StoredMemory[]> {
-    const memories = await this.config.store.recall(userId, options ?? {});
+  async recall(tenantId: string, userId: string, options?: RecallOptions): Promise<StoredMemory[]> {
+    const memories = await this.config.store.recall(tenantId, userId, options ?? {});
     if (this.config.encryptionKey) {
       return memories.map(m => ({
         ...m,
@@ -99,16 +103,20 @@ export class PersistentMemory {
   }
 
   /**
-   * Get context summary for a user — aggregate statistics.
+   * Get context summary for a user within a tenant — aggregate statistics.
    */
-  async context(userId: string): Promise<ContextSummary> {
-    return this.config.store.context(userId);
+  async context(tenantId: string, userId: string): Promise<ContextSummary> {
+    return this.config.store.context(tenantId, userId);
   }
 
   /**
    * Forget a memory — soft delete by ID.
+   * Returns true only if a live entry existed and was just deleted; false if
+   * the id was never stored, belongs to another tenant or user, or was already
+   * forgotten — callers MUST surface this truthfully (CH-31 —
+   * CHARIOT::§23.2::44-45; ::134 names `forget` as a covered surface).
    */
-  async forget(userId: string, memoryId: string): Promise<void> {
-    return this.config.store.delete(userId, memoryId);
+  async forget(tenantId: string, userId: string, memoryId: string): Promise<boolean> {
+    return this.config.store.delete(tenantId, userId, memoryId);
   }
 }

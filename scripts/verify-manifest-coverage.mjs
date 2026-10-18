@@ -32,6 +32,7 @@ const PUBLIC_KEY_PEM =
 
 const PACKAGE_TO_PLATFORM = {
   '@epicai/chariot-bin-linux-x64-gnu': 'linux-x64',
+  '@epicai/chariot-bin-linux-arm64-gnu': 'linux-arm64',
   '@epicai/chariot-bin-darwin-arm64': 'darwin-arm64',
   '@epicai/chariot-bin-darwin-x64': 'darwin-x64',
   '@epicai/chariot-bin-win32-x64-msvc': 'win32-x64',

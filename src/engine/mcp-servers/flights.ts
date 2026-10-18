@@ -99,7 +99,7 @@ export class FlightsMCPServer extends MCPAdapterBase {
       name: 'flights',
       displayName: 'OpenSky Network Flights',
       version: '1.0.0',
-      category: 'transportation',
+      category: 'logistics',
       keywords: [
         'flights', 'aviation', 'aircraft', 'opensky', 'adsb', 'tracking',
         'airport', 'arrivals', 'departures', 'icao24', 'transponder',

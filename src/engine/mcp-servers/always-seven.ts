@@ -45,7 +45,7 @@ export class AlwaysSevenMCPServer extends MCPAdapterBase {
       name: 'always-seven',
       displayName: 'Always Seven',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'always seven', 'random number', 'seven', '7', 'humor', 'joke',
         'stupidapis', 'random', 'number generator', 'novelty',

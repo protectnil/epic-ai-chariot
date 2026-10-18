@@ -1,0 +1,85 @@
+{{- /* GAP #8 — pod egress NetworkPolicy (Wiz "isolate and sandbox").
+       Default OFF (networkPolicy.enabled=false) so this renders to nothing
+       and existing installs are byte-for-byte unaffected on upgrade. When
+       enabled: deny-by-default egress — only DNS, the gateway's own
+       in-cluster MongoDB/Redis pods (when those subcharts are enabled), and
+       the buyer-declared allowlist below are permitted. An egress
+       NetworkPolicy with no matching rule for a given destination denies
+       it, per the K8s NetworkPolicy object model — there is no separate
+       "deny" rule to write. */ -}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "chariot.fullname" . }}-egress
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "chariot.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- if .Values.networkPolicy.dns.enabled }}
+    # Cluster DNS — required for the gateway to resolve ANY name, including
+    # the buyer's own MCP/AWS endpoints below.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dns.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: {{ .Values.networkPolicy.dns.port }}
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.dns.port }}
+    {{- end }}
+    {{- if .Values.mongodb.enabled }}
+    # In-cluster MongoDB (vendored subchart, CH-28) — the gateway cannot
+    # function without its own datastore, so this is always permitted when
+    # the subchart is enabled (matches the subchart's own selector labels;
+    # see charts/mongodb/templates/_helpers.tpl chariot-mongodb.selectorLabels).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mongodb
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mongodb.service.port }}
+    {{- end }}
+    {{- if .Values.redis.enabled }}
+    # In-cluster Redis (vendored subchart, CH-28) — same rationale as MongoDB
+    # above (see charts/redis/templates/_helpers.tpl chariot-redis.selectorLabels).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.service.port }}
+    {{- end }}
+    {{- range .Values.networkPolicy.allowedEgress }}
+    {{- $entry := . }}
+    # Buyer-declared endpoint (MCP server / AWS service range / etc).
+    - to:
+        - ipBlock:
+            cidr: {{ $entry.cidr | quote }}
+            {{- if $entry.except }}
+            except:
+              {{- toYaml $entry.except | nindent 14 }}
+            {{- end }}
+      ports:
+        {{- range $entry.ports }}
+        - protocol: {{ default "TCP" $entry.protocol }}
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.extraEgressRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -6,6 +6,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+## 4.0.0 — unreleased
+
+Undated by convention: the release commit that cuts 4.0.0 dates this heading, as
+`374a7b3` did for 3.1.2. Entries below name only work that is committed on this
+release line; nothing here is a forward-looking claim.
+
+### Added
+- Embedded hybrid retrieval runtime — the BIEN dense encoder, SPLADE, and the
+  canonical serializer compiled into `chariot-native.node` alongside Qdrant Edge,
+  with the Tier-1 dense/sparse/rerank legs wired through `loadRetrieval`.
+- AWS Marketplace packaging: `Dockerfile`, the `helm/chariot` chart with vendored
+  MongoDB and Redis subcharts, and an ECS task-definition delivery option
+  (CH-24…CH-30).
+- CH-54 container-image seal — AWS Signer / Notation signing at push to ECR, a
+  Kyverno admission policy for EKS and an ECS service-lifecycle verify hook, with
+  offline verification through the Notation trust store.
+- A `pull_request` CI gate (`.github/workflows/pr-checks.yml`); before it, no
+  workflow typechecked, linted, or tested a pull request.
+
+### Changed
+- Natural-language `chariot_query` inputs now allow up to 1,024 characters and
+  the MCP server instructions tell the model to summarize longer requests;
+  adapter/tool identifiers and list filters retain the 256-character cap.
+- Retrieval moves from a bundled Qdrant local server to embedded Qdrant Edge
+  (in-process `EdgeShard`): no vector pod, no service, no port.
+  `CHARIOT_QDRANT_PORT` is obsolete; `CHARIOT_QDRANT_DATA_DIR` is repurposed as
+  the in-process shard directory.
+- Helm images carry a `registry` field as a sibling of `repository`, which is the
+  field AWS Marketplace rewrites per region; precedence is per-image `registry` >
+  `global.imageRegistry` > empty.
+- The gateway admits under OpenShift's default `restricted-v2` SCC without a
+  cluster-admin grant: `runAsUser`/`runAsGroup`/`fsGroup` are unset so the SCC can
+  allocate from the namespace range, and the image is group-0 owned and
+  group-writable with setgid on directories.
+
+### Fixed
+- **Catalog admission** — one shared §5.6 classifier replaces four mutually
+  inconsistent implementations. Restarting with an unchanged bundle no longer
+  bricks the gateway, and an absent persisted `bundleSha256` is no longer treated
+  as a wildcard matching any bundle.
+- **CH-21** — the compiled encoder path now fails closed on any dense vector that
+  violates the shipping contract: width, non-finite components, and L2 norm.
+- **Sealed-snapshot seam guard** — the NAPI anti-rollback and verify-before-use
+  guard is tracked in the repository rather than existing on a single disk.
+
+### Security
+- Stopped shipping 2,876 dangling source maps that disclosed the internal source
+  tree. `removeComments` stays `false` deliberately — it deletes the release
+  strip pass's comment sentinels.
+- Tenant-scoped memory and identity carried through dispatch.
+- Hardened the stdio supply-chain and audit verification paths.
+
+---
 ## 3.1.2 — 2026-06-24
 
 ### Security

@@ -52,7 +52,7 @@ export class AirNowMCPServer extends MCPAdapterBase {
       name: 'airnow',
       displayName: 'EPA AirNow — US Air Quality Index',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'airnow', 'aqi', 'air quality', 'epa', 'pollution', 'ozone',
         'pm2.5', 'pm10', 'particulate matter', 'smog', 'forecast',

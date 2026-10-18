@@ -476,7 +476,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/transactions${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/transactions${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list transactions: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -487,7 +487,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const id = args.transaction_id as string;
     if (!id) return { content: [{ type: 'text', text: 'transaction_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/transactions/${encodeURIComponent(id)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/transactions/${encodeURIComponent(id)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get transaction: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -501,7 +501,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/cards${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/cards${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list cards: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -512,7 +512,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const cardId = args.card_id as string;
     if (!cardId) return { content: [{ type: 'text', text: 'card_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/cards/${encodeURIComponent(cardId)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/cards/${encodeURIComponent(cardId)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get card: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -526,7 +526,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const body: Record<string, unknown> = {};
     if (args.display_name !== undefined) body.display_name = args.display_name;
     if (args.spending_restrictions !== undefined) body.spending_restrictions = args.spending_restrictions;
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/cards/${encodeURIComponent(cardId)}`, {
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/cards/${encodeURIComponent(cardId)}`, {
       method: 'PATCH',
       headers: h,
       body: JSON.stringify(body),
@@ -544,7 +544,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/users${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/users${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list users: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -555,7 +555,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const userId = args.user_id as string;
     if (!userId) return { content: [{ type: 'text', text: 'user_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/users/${encodeURIComponent(userId)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/users/${encodeURIComponent(userId)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get user: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -568,7 +568,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/departments${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/departments${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list departments: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -579,7 +579,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const deptId = args.department_id as string;
     if (!deptId) return { content: [{ type: 'text', text: 'department_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/departments/${encodeURIComponent(deptId)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/departments/${encodeURIComponent(deptId)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get department: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -592,7 +592,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/spend_programs${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/spend_programs${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list spend programs: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -603,7 +603,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const id = args.spend_program_id as string;
     if (!id) return { content: [{ type: 'text', text: 'spend_program_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/spend_programs/${encodeURIComponent(id)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/spend_programs/${encodeURIComponent(id)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get spend program: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -617,7 +617,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/reimbursements${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/reimbursements${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list reimbursements: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -628,7 +628,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const id = args.reimbursement_id as string;
     if (!id) return { content: [{ type: 'text', text: 'reimbursement_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/reimbursements/${encodeURIComponent(id)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/reimbursements/${encodeURIComponent(id)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get reimbursement: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -641,7 +641,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/bills${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/bills${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list bills: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -652,7 +652,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const id = args.bill_id as string;
     if (!id) return { content: [{ type: 'text', text: 'bill_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/bills/${encodeURIComponent(id)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/bills/${encodeURIComponent(id)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get bill: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -665,7 +665,7 @@ export class RampMCPServer extends MCPAdapterBase {
     if (args.page_size) params.set('page_size', String(args.page_size));
     if (args.start) params.set('start', args.start as string);
     const qs = params.toString();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/vendors${qs ? `?${qs}` : ''}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/vendors${qs ? `?${qs}` : ''}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to list vendors: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }
@@ -676,7 +676,7 @@ export class RampMCPServer extends MCPAdapterBase {
     const id = args.vendor_id as string;
     if (!id) return { content: [{ type: 'text', text: 'vendor_id is required' }], isError: true };
     const h = await this.headers();
-    const response = await this.fetchWithRetry(`${this.baseUrl}/developer/v1/vendors/${encodeURIComponent(id)}`, { headers: h });
+    const response = await this.fetchWithRetry(`${this.baseUrl}/v1/vendors/${encodeURIComponent(id)}`, { headers: h });
     if (!response.ok) return { content: [{ type: 'text', text: `Failed to get vendor: ${response.status} ${response.statusText}` }], isError: true };
     let data: unknown;
     try { data = await response.json(); } catch { throw new Error(`Ramp returned non-JSON response (HTTP ${response.status})`); }

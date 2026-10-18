@@ -40,7 +40,7 @@ export class ShakespeareInsultMCPServer extends MCPAdapterBase {
       name: 'shakespeare-insult',
       displayName: 'Shakespeare Insult Generator',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'shakespeare', 'insult', 'classical', 'elizabethan', 'humor',
         'comedy', 'roast', 'vintage', 'insult generator', 'bard',

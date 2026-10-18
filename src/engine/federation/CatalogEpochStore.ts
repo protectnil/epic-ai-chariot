@@ -57,10 +57,17 @@ export type LoadedEpoch = CatalogEpochState | null;
 export interface CatalogEpochStore {
   load(): Promise<LoadedEpoch>;
   /**
-   * Persist envelope unconditionally. Monotonicity is enforced by the
-   * caller (AdapterCatalog.enforceMonotonicityAndPersist) before this is
-   * invoked. Implementations are free to add a defense-in-depth CAS guard
-   * but the canonical accept path is: load() → check → persist().
+   * Persist the accepted envelope. Monotonicity is classified by the caller
+   * (`classifyCatalogAdmission`) before this is invoked; persist() is reached
+   * only on an ADVANCE.
+   *
+   * MUST THROW if the mark was not durably advanced to this envelope.
+   * CHARIOT-SPEC.md:458 requires the pair to be written "before advertising
+   * the catalog to any consumer", so a store that silently declines the write
+   * (for example a shared-backend CAS lost to a sibling replica that persisted
+   * a NEWER epoch) would leave the caller advertising a catalog whose mark
+   * never landed. Failing closed here is what makes the caller's
+   * persist-then-advertise ordering meaningful.
    */
   persist(envelope: CatalogEpochState): Promise<void>;
   /** Human-readable label for log lines (e.g. "file:/path", "mongo:default"). */
@@ -93,6 +100,8 @@ interface EpochDoc {
   _id: string;
   epoch: number;
   catalogVersion: number;
+  /** SHA-256 of the accepted bundle bytes (identity binding, §5.6). Absent on legacy rows. */
+  bundleSha256?: string;
   updatedAt: Date;
 }
 
@@ -130,7 +139,13 @@ export class MongoEpochStore implements CatalogEpochStore {
         });
         return null;
       }
-      return { epoch: doc.epoch, catalogVersion: doc.catalogVersion };
+      return {
+        epoch: doc.epoch,
+        catalogVersion: doc.catalogVersion,
+        ...(typeof doc.bundleSha256 === 'string' && doc.bundleSha256.length > 0
+          ? { bundleSha256: doc.bundleSha256 }
+          : {}),
+      };
     } catch (err) {
       log.error('adapter-catalog.mongo_epoch_read_failed', {
         key: this.key,
@@ -153,6 +168,7 @@ export class MongoEpochStore implements CatalogEpochStore {
           _id: this.key,
           epoch: envelope.epoch,
           catalogVersion: envelope.catalogVersion,
+          ...(envelope.bundleSha256 !== undefined ? { bundleSha256: envelope.bundleSha256 } : {}),
           updatedAt: new Date(),
         },
       },
@@ -161,31 +177,60 @@ export class MongoEpochStore implements CatalogEpochStore {
     if (upsert.upsertedCount === 1) return;
 
     // Row already exists. Apply a strict-newer CAS update.
+    //
+    // CHARIOT-SPEC.md:436 — "Any backing store's persistence contract SHALL
+    // state the same rule as this clause; a store MUST NOT define a looser
+    // condition (for example, admitting an equal epoch on `catalogVersion`
+    // alone, with no identity proof)."
+    //
+    // This CAS previously carried exactly that forbidden clause — an
+    // `{epoch: <equal>, catalogVersion: {$lt: …}}` arm that advanced the mark
+    // at an unchanged epoch on version alone. It is removed: persist() is only
+    // ever reached on an ADVANCE (classifyCatalogAdmission), so a strictly
+    // greater epoch is the only condition under which the mark may move, and
+    // the store must not be reachable into a state the classifier would reject.
     const cas = await coll.updateOne(
-      {
-        _id: this.key,
-        $or: [
-          { epoch: { $lt: envelope.epoch } },
-          { epoch: envelope.epoch, catalogVersion: { $lt: envelope.catalogVersion } },
-        ],
-      },
+      { _id: this.key, epoch: { $lt: envelope.epoch } },
       {
         $set: {
           epoch: envelope.epoch,
           catalogVersion: envelope.catalogVersion,
+          ...(envelope.bundleSha256 !== undefined ? { bundleSha256: envelope.bundleSha256 } : {}),
           updatedAt: new Date(),
         },
       },
     );
+    // NOTE: there is deliberately no legacy hash-stamping migration here. The
+    // removed one wrote an INCOMING bundle's hash onto an existing equal
+    // (epoch, catalogVersion) row that carried none — binding the mark to an
+    // artifact whose identity was never proven against it. CHARIOT-SPEC.md:434
+    // requires the opposite: a record with no `bundleSha256` is
+    // `identity_unproven` and fails closed, and the operator re-establishes the
+    // mark by removing it or publishing at a higher epoch.
     if (cas.modifiedCount === 0) {
-      // Another replica already persisted an equal-or-newer envelope.
-      // This is not an error — the higher water mark is correctly
-      // preserved — but we surface it as a debug event for audit.
-      log.info('adapter-catalog.mongo_epoch_cas_skipped', {
+      // A sibling replica persisted an equal-or-NEWER epoch between this
+      // replica's load() and this write, so the CAS predicate no longer held.
+      //
+      // This is NOT benign, and treating it as benign was a defect: the
+      // classifier had already returned `advance` against the epoch this
+      // replica read, so the caller is about to advertise a catalog whose
+      // high-water mark never landed — while the shared mark now names a
+      // NEWER bundle this replica has not loaded. CHARIOT-SPEC.md:458 requires
+      // the atomic write "before advertising the catalog to any consumer".
+      //
+      // Fail closed. The replica retries on its next load, reads the newer
+      // mark, and either advances past it or is correctly rejected as a replay.
+      log.warn('adapter-catalog.mongo_epoch_cas_lost', {
         key: this.key,
         candidateEpoch: envelope.epoch,
         candidateCatalogVersion: envelope.catalogVersion,
       });
+      throw new Error(
+        `adapter-catalog epoch CAS lost: a sibling replica persisted an epoch at or above ` +
+          `${envelope.epoch} in ${EPOCH_COLLECTION_NAME}:${this.key} between this replica's ` +
+          `read and its write. Refusing to advertise a catalog whose high-water mark did not ` +
+          `land (§5.6). This replica will re-read the newer mark on its next load.`,
+      );
     }
   }
 

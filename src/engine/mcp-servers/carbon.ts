@@ -29,7 +29,7 @@ export class CarbonMCPServer extends MCPAdapterBase {
       name: 'carbon',
       displayName: 'UK Carbon Intensity API',
       version: '1.0.0',
-      category: 'environment',
+      category: 'science',
       keywords: [
         'carbon', 'carbon intensity', 'co2', 'gco2', 'electricity',
         'generation mix', 'fuel type', 'renewable', 'fossil fuel',

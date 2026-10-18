@@ -38,6 +38,25 @@ const PROD_KEY_2026_05_07: ChariotCatalogPublicKey = {
 };
 
 /**
+ * Production catalog/bundle signing key custodied in AWS KMS (CH-52:
+ * key spec `ECC_NIST_EDWARDS25519`, signing mode pure `ED25519_SHA_512`
+ * / `MessageType:RAW`; the private key never leaves the HSM and
+ * verification here stays offline — CHARIOT-SPEC §5.1 "Catalog signature
+ * verification SHALL NOT contact AWS KMS at verification time"). Public
+ * half exported from the key on 2026-08-06; the SPKI below is the
+ * byte-for-byte pin of that export. Prepended per the rotation procedure
+ * in this module's header: the publisher dual-signs for one cycle, then
+ * `PROD_KEY_2026_05_07` is dropped on the following release.
+ */
+const PROD_KEY_2026_08_06_KMS: ChariotCatalogPublicKey = {
+  id: 'chariot-catalog-prod-2026-08-06-kms',
+  pem:
+    '-----BEGIN PUBLIC KEY-----\n' +
+    'MCowBQYDK2VwAyEAC5A3HFt51a9dg4jhcRA40vOCwRXi5AxDb+igChQZlbY=\n' +
+    '-----END PUBLIC KEY-----\n',
+};
+
+/**
  * Ordered list of bundled Ed25519 public keys accepted by the default
  * catalog verification path. Verification iterates this array and
  * succeeds if a signature validates against ANY entry. Order affects
@@ -45,12 +64,22 @@ const PROD_KEY_2026_05_07: ChariotCatalogPublicKey = {
  * is documented in the module-level JSDoc above.
  *
  * As of 2026-05-13 the production key (`chariot-catalog-prod-2026-05-07`)
- * is the only accepted key. The upstream catalog publisher now signs
- * with the matching production private key; every bundled catalog on
- * disk verifies against the production key and no dev-signed catalog
- * remains in the release surface. The previous dev key is dropped.
+ * replaced the development key, which is dropped; no dev-signed catalog
+ * remains in the release surface.
+ *
+ * As of 2026-09-05 the KMS-custodied production key
+ * (`chariot-catalog-prod-2026-08-06-kms`, CH-52) is prepended and both
+ * production keys are accepted for the dual-sign rotation cycle: bundles
+ * already on disk (signed with the 2026-05-07 key) keep verifying, and
+ * bundles signed by the KMS key verify against the same compiled-in set
+ * (CHARIOT-SPEC §5.1: "The Ed25519 verifying key SHALL be pinned to the
+ * compiled-in CHARIOT_CATALOG_PUBLIC_KEYS array"; §8.6: the load path
+ * verifies "against the embedded production public key, which is
+ * KMS-signed per CH-52"). The 2026-05-07 key is dropped on the release
+ * after the publisher's cut-over.
  */
 export const CHARIOT_CATALOG_PUBLIC_KEYS: ReadonlyArray<ChariotCatalogPublicKey> = [
+  PROD_KEY_2026_08_06_KMS,
   PROD_KEY_2026_05_07,
 ];
 

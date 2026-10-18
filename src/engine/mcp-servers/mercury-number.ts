@@ -42,7 +42,7 @@ export class MercuryNumberMCPServer extends MCPAdapterBase {
       name: 'mercury-number',
       displayName: 'Mercury Number',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'mercury', 'astrology', 'random', 'number', 'zodiac', 'horoscope',
         'sign', 'aries', 'taurus', 'gemini', 'cancer', 'leo', 'virgo',

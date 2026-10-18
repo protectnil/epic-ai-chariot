@@ -23,7 +23,7 @@ export class SunriseSunsetMCPServer extends MCPAdapterBase {
       name: 'sunrisesunset',
       displayName: 'Sunrise-Sunset',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'sunrise', 'sunset', 'dawn', 'dusk', 'solar noon', 'golden hour',
         'first light', 'last light', 'day length', 'sun times', 'astronomy',

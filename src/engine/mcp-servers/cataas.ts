@@ -40,7 +40,7 @@ export class CataasMCPServer extends MCPAdapterBase {
       name: 'cataas',
       displayName: 'CATAAS — Cat as a Service',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'cat', 'cats', 'cataas', 'image', 'photo', 'random', 'animal',
         'tag', 'cute', 'fun', 'pet',

@@ -40,7 +40,7 @@ export class O2CzMobilityMCPServer extends MCPAdapterBase {
       name: 'o2-cz-mobility',
       displayName: 'O2 CZ Mobility API',
       version: '1.0.0',
-      category: 'analytics',
+      category: 'data',
       keywords: [
         'o2', 'o2-cz', 'czech', 'czech republic', 'mobility', 'transit',
         'movement', 'travel', 'commute', 'origin', 'destination',

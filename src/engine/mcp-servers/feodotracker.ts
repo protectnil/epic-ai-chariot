@@ -49,7 +49,7 @@ export class FeodoTrackerMCPServer extends MCPAdapterBase {
       name: 'feodotracker',
       displayName: 'Feodo Tracker — abuse.ch',
       version: '1.0.0',
-      category: 'security',
+      category: 'cybersecurity',
       keywords: [
         'feodo', 'feodotracker', 'abuse.ch', 'botnet', 'c2', 'c&c',
         'command and control', 'blocklist', 'ip blocklist', 'malware',

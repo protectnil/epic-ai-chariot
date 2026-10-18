@@ -20,7 +20,7 @@ export class MarineMCPServer extends MCPAdapterBase {
       name: 'marine',
       displayName: 'Marine Weather',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'marine', 'wave', 'ocean', 'sea', 'forecast', 'wave height',
         'wave period', 'wave direction', 'coastal', 'open-meteo',

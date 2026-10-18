@@ -28,8 +28,13 @@ import { getCollection } from '../db.js';
 import { encryptFields } from '../crypto.js';
 import * as audit from '../services/audit.js';
 import type { AdapterCredentialDocument } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
+import { CREDENTIAL_VALUE_CONTROL_CHAR_RE } from '../../cli/credentials.js';
 
-const router = Router();
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.adapters-routes');
+
+const router = Router({ mergeParams: true });
 
 // All adapter routes require authentication
 router.use(enterpriseAuthMiddleware());
@@ -51,6 +56,31 @@ function getStringParam(req: Request, name: string): string | null {
 // Request body schemas
 // ---------------------------------------------------------------------------
 
+/**
+ * §10.5 (rulings item 106) — optional confidential-client fields for the
+ * per-user OAuth vendor-token refresh call (src/iam/services/credentials.ts).
+ * `clientId`/`clientSecret` are the TENANT's own vendor OAuth app
+ * registration (distinct from `apiKey`/`apiSecret`, the per-user token
+ * pair). Same `min(1).max(4096)` bound as `apiKey`/`apiSecret` above, PLUS
+ * a control-char rejection using this codebase's established credential-
+ * value pattern (`CREDENTIAL_VALUE_CONTROL_CHAR_RE`, `src/cli/credentials.ts`
+ * — the same regex the local `.env` credential loader and the CLI env-file
+ * writer already enforce): a client_id/secret carrying a CR/LF or other
+ * control byte must never reach an HTTP Basic Authorization header
+ * (`buildClientAuthHeader` in credentials.ts) unsanitized. NOTE: `apiKey`/
+ * `apiSecret` immediately above do NOT currently have this same check —
+ * verified against this file's source before writing this comment, not
+ * assumed; flagged in the build report rather than silently left
+ * inconsistent or silently "fixed" as an unauthorized scope expansion.
+ */
+const credentialFieldSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine((v) => !CREDENTIAL_VALUE_CONTROL_CHAR_RE.test(v), {
+    message: 'must not contain control characters',
+  });
+
 const connectAdapterSchema = z.object({
   apiKey: z.string().min(1).max(4096),
   apiSecret: z.string().min(1).max(4096).optional(),
@@ -59,6 +89,28 @@ const connectAdapterSchema = z.object({
     .optional()
     .default('api_key'),
 });
+
+/**
+ * §10.5 (rulings item 106) scoped `POST /:id/connect` (per-user) ONLY —
+ * deliberately NOT applied to `connectAdapterSchema` (shared by
+ * `/admin/:id/connect-shared` below too), since the ruling's build scope
+ * names `/:id/connect` specifically and a shared org-wide credential's
+ * confidential-client story was not ruled on. Using a single extended
+ * schema for both routes would have silently accepted-and-then-dropped
+ * `clientId`/`clientSecret` on the shared-connect path (validated by zod,
+ * then never read by that handler) — worse than not accepting them at
+ * all. `.extend()` keeps `connectAdapterSchema`'s own fields/messages
+ * byte-identical for every existing caller of either route.
+ */
+export const connectAdapterSchemaWithClientAuth = connectAdapterSchema
+  .extend({
+    clientId: credentialFieldSchema.optional(),
+    clientSecret: credentialFieldSchema.optional(),
+  })
+  .refine((data) => (data.clientId === undefined) === (data.clientSecret === undefined), {
+    message: 'clientId and clientSecret must both be provided or both omitted',
+    path: ['clientId'],
+  });
 
 // ---------------------------------------------------------------------------
 // User-facing routes
@@ -82,7 +134,7 @@ router.get(
       });
     } catch (err) {
        
-      console.error('[iam/adapters] /available failed', err);
+      moduleLog.error('[iam/adapters] /available failed', { error: err instanceof Error ? err.message : String(err) });
       res.status(500).json({ error: 'Failed to list available adapters' });
     }
   },
@@ -114,7 +166,7 @@ router.get('/connected', async (req: Request, res: Response): Promise<void> => {
     res.json({ adapters: credentials });
   } catch (err) {
      
-    console.error('[iam/adapters] /connected failed', err);
+    moduleLog.error('[iam/adapters] /connected failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to list connected adapters' });
   }
 });
@@ -128,7 +180,7 @@ router.post('/:id/connect', async (req: Request, res: Response): Promise<void> =
   if (!auth) return;
   const { tenantId, user } = auth;
 
-  const parsed = connectAdapterSchema.safeParse(req.body);
+  const parsed = connectAdapterSchemaWithClientAuth.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({
       error: 'Invalid request body',
@@ -136,7 +188,7 @@ router.post('/:id/connect', async (req: Request, res: Response): Promise<void> =
     });
     return;
   }
-  const { apiKey, apiSecret, credentialType } = parsed.data;
+  const { apiKey, apiSecret, credentialType, clientId, clientSecret } = parsed.data;
   const adapterId = getStringParam(req, 'id');
   if (!adapterId) {
     res.status(400).json({ error: 'Missing adapter id' });
@@ -144,9 +196,18 @@ router.post('/:id/connect', async (req: Request, res: Response): Promise<void> =
   }
 
   try {
-    // Encrypt using the crypto module
-    const fields: Record<string, string | undefined> = { apiKey, apiSecret };
-    const { encrypted, iv } = encryptFields(fields, tenantId);
+    // Encrypt using the crypto module. CH-10 (§12.2): bind the AAD to this
+    // adapterId so the ciphertext cannot be relocated to a different
+    // adapter's row within the same tenant and still decrypt.
+    //
+    // §10.5 (rulings item 106): clientSecret rides in the SAME fields
+    // object as apiKey/apiSecret — encrypted into the SAME `encrypted`/
+    // `iv` blob via this ONE encryptFields call — never a plaintext
+    // document field (see AdapterCredentialDocument's `clientId` doc
+    // comment, types.ts, for why this shape was chosen over a second
+    // encrypted:iv field pair). `clientId` alone is plain (types.ts).
+    const fields: Record<string, string | undefined> = { apiKey, apiSecret, clientSecret };
+    const { encrypted, iv } = encryptFields(fields, tenantId, adapterId);
 
     const col = await getCollection<AdapterCredentialDocument>('iam_adapter_credentials');
     const now = new Date();
@@ -158,14 +219,28 @@ router.post('/:id/connect', async (req: Request, res: Response): Promise<void> =
       encrypted,
       iv,
       connectedBy: user.email,
+      userId: user.sub, // §10.5::3: per-user credential is owned by this user
       connectedAt: now,
       status: 'active' as const,
     };
 
-    // Upsert: allow reconnecting an existing adapter
+    // Upsert: allow reconnecting an existing adapter. `clientSecret` (inside
+    // `fields` above) is folded into `encrypted`/`iv`, which are ALWAYS
+    // fully replaced by every connect call — a reconnect that omits
+    // clientSecret correctly drops it, since the whole ciphertext blob is
+    // rebuilt from just this call's fields, never merged with the old one.
+    // `clientId` is a PLAIN top-level field, outside that blob, so it needs
+    // its own explicit clear: a reconnect that provides apiKey but omits
+    // clientId must $unset the prior clientId, or a stale client_id would
+    // survive paired with a blob that no longer has a matching
+    // clientSecret — an inconsistent, silently-broken confidential-client
+    // credential. $set alone (conditionally spreading clientId in only
+    // when present) does NOT clear it when absent, so this is $set+$unset.
     await col.updateOne(
       { tenantId, adapterId, connectedBy: user.email },
-      { $set: doc },
+      clientId !== undefined
+        ? { $set: { ...doc, clientId } }
+        : { $set: doc, $unset: { clientId: '' } },
       { upsert: true },
     );
 
@@ -174,15 +249,24 @@ router.post('/:id/connect', async (req: Request, res: Response): Promise<void> =
       actorEmail: user.email,
       targetType: 'credential',
       targetId: adapterId,
-      detail: { credentialType },
+      // §10.5 (rulings item 106): the audit record carries only a
+      // presence flag for confidential-client auth (hasClientAuth), never
+      // clientId or clientSecret themselves — a hash-chained audit record
+      // is durable and reviewable (src/iam/services/audit.ts), so a
+      // secret written here would be a permanent plaintext leak distinct
+      // from (and worse than) the vault's own encrypted-at-rest storage.
+      detail: { credentialType, hasClientAuth: clientId !== undefined },
       ip: req.ip ?? 'unknown',
       userAgent: req.headers['user-agent'] ?? 'unknown',
     });
 
+    // §10.5 (rulings item 106): the response never echoes clientSecret (or
+    // apiKey/apiSecret, which this route already never echoed) — only the
+    // fields it echoed before this unit.
     res.status(201).json({ success: true, adapterId, status: 'active' });
   } catch (err) {
-     
-    console.error('[iam/adapters] connect failed', err);
+
+    moduleLog.error('[iam/adapters] connect failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to connect adapter' });
   }
 });
@@ -225,7 +309,7 @@ router.delete('/:id/disconnect', async (req: Request, res: Response): Promise<vo
     res.status(204).send();
   } catch (err) {
      
-    console.error('[iam/adapters] disconnect failed', err);
+    moduleLog.error('[iam/adapters] disconnect failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to disconnect adapter' });
   }
 });
@@ -261,8 +345,10 @@ router.post(
     }
 
     try {
+      // CH-10 (§12.2): bind the AAD to this adapterId — see the per-user
+      // connect route above for the relocation-attack rationale.
       const fields: Record<string, string | undefined> = { apiKey, apiSecret };
-      const { encrypted, iv } = encryptFields(fields, tenantId);
+      const { encrypted, iv } = encryptFields(fields, tenantId, adapterId);
 
       const col = await getCollection<AdapterCredentialDocument>('iam_adapter_credentials');
       const now = new Date();
@@ -274,6 +360,7 @@ router.post(
         encrypted,
         iv,
         connectedBy: user.email,
+        userId: null, // §10.5::3: org-wide shared credentials carry userId:null
         connectedAt: now,
         status: 'active' as const,
         shared: true, // marker for org-wide credentials
@@ -299,7 +386,7 @@ router.post(
       res.status(201).json({ success: true, adapterId, shared: true, status: 'active' });
     } catch (err) {
        
-      console.error('[iam/adapters] connect-shared failed', err);
+      moduleLog.error('[iam/adapters] connect-shared failed', { error: err instanceof Error ? err.message : String(err) });
       res.status(500).json({ error: 'Failed to connect shared adapter' });
     }
   },
@@ -345,7 +432,7 @@ router.delete(
       res.status(204).send();
     } catch (err) {
        
-      console.error('[iam/adapters] disconnect-shared failed', err);
+      moduleLog.error('[iam/adapters] disconnect-shared failed', { error: err instanceof Error ? err.message : String(err) });
       res.status(500).json({ error: 'Failed to disconnect shared adapter' });
     }
   },

@@ -2,29 +2,36 @@
  * `chariot license renew-now` client per portal spec §10.3 +
  * chariot-billing-service-april-2026.md §6.
  *
- * POSTs the renewal proof to https://epic-ai.io/api/license/renew with:
+ * POSTs the renewal proof to https://license.epic-ai.io/renew with:
  *   { company_id, current_jti, nonce, ts, proof }
  *   proof = HMAC-SHA256(renewal_secret, company_id || current_jti || nonce || ts)
  * (NUL-separated fields per the renewal-token primitive on the server side.)
  *
- * The JWT `iss` claim stays `license.epic-ai.io` (identity, not URL).
+ * CHARIOT §19::2 / §1.4::12: in connected mode this is the SOLE outbound
+ * network destination Chariot contacts — the host must be license.epic-ai.io,
+ * not just the JWT `iss` claim identity string.
  *
  * Response handling:
- *   200 + { jwt, renewal_secret } → atomic write, return new claims
+ *   200 + { jwt, renewal_secret } → atomic write (the held envelope's
+ *                                   optional seal_secret carried forward
+ *                                   verbatim), return new claims
  *   304                           → no new billing yet, leave file unchanged
  *   401 / 404 / 410               → distinct outcomes for clear CLI messages
  *   anything else                 → kind=server_error, surface status text
  */
 
 import { createHmac, randomBytes } from 'node:crypto';
-import { writeLicenseEnvelopeAtomic } from './activate.js';
+import { writeLicenseEnvelopeAtomic, type RawEnvelope } from './activate.js';
 import {
   verifyAndDecode,
   readLicenseEnvelope,
   licenseFilePath,
   revalidateLicense,
+  readPersistedLicenseEpoch,
+  type LicenseEnvelope,
   type VerifiedClaims,
 } from './loader.js';
+import { chariotEmitter } from '../observability/emitter.js';
 
 export type RenewOutcome =
   | { kind: 'renewed'; status: 200; claims: VerifiedClaims; writtenPath: string }
@@ -33,6 +40,7 @@ export type RenewOutcome =
   | { kind: 'unknown_company'; status: 404; message: string }
   | { kind: 'jwt_stale'; status: 410; message: string }
   | { kind: 'no_local_license'; status: 0; message: string }
+  | { kind: 'epoch_rollback'; status: 200; message: string }
   | { kind: 'server_error'; status: number; message: string }
   | { kind: 'network_error'; status: 0; message: string }
   | { kind: 'invalid_response'; status: number; message: string };
@@ -71,14 +79,37 @@ export function generateNonce(): string {
   return randomBytes(32).toString('base64url');
 }
 
-export const DEFAULT_RENEW_URL = 'https://epic-ai.io/api/license/renew';
+/**
+ * Build the envelope a renewal (or its rollback) writes: `base`'s licence
+ * half plus the HELD envelope's optional §5.7 `seal_secret`, carried
+ * forward verbatim. The seal secret is issued once and NEVER rotated by
+ * renewal — the renew response carries none, and `base` deliberately has
+ * no `seal_secret` slot, so a value a server did send is ignored. The held
+ * value is the validated string or, when malformed, the raw JSON value:
+ * dropping it would silently flip the sealed consumer to the
+ * ENTERPRISE_MASTER_KEY fallback, and "repairing" it is not renewal's job.
+ */
+export function envelopeWithHeldSealSecret(
+  base: { jwt: string; renewal_secret: string },
+  held: LicenseEnvelope,
+): RawEnvelope {
+  const carried: unknown =
+    held.seal_secret !== undefined ? held.seal_secret : held.seal_secret_error?.raw;
+  return {
+    jwt: base.jwt,
+    renewal_secret: base.renewal_secret,
+    ...(carried !== undefined ? { seal_secret: carried } : {}),
+  };
+}
+
+export const DEFAULT_RENEW_URL = 'https://license.epic-ai.io/renew';
 
 function defaultRenewUrl(): string {
   return process.env.CHARIOT_LICENSE_URL || DEFAULT_RENEW_URL;
 }
 
 export interface RenewNowOptions {
-  /** Override the renew URL; defaults to env CHARIOT_LICENSE_URL or https://epic-ai.io/api/license/renew. */
+  /** Override the renew URL; defaults to env CHARIOT_LICENSE_URL or https://license.epic-ai.io/renew. */
   url?: string;
   /** Inject a fetch implementation (tests). Default: globalThis.fetch. */
   fetchImpl?: typeof fetch;
@@ -92,7 +123,39 @@ export interface RenewNowOptions {
   nonceFn?: () => string;
 }
 
+/**
+ * CHARIOT::§16.1 (rulings item 91) — thin wrapper around `renewNowInner`
+ * that emits the pinned `license.renewed`/`license.renew_failed` events
+ * based on the real `RenewOutcome.kind`, at the ONE point every caller of
+ * `renewNow` (CLI `chariot license renew-now`, any background renewal
+ * scheduler) passes through — never duplicated at each of the function's
+ * ~10 internal return points. Mapping: `kind === 'renewed'` ->
+ * `license.renewed`. `kind === 'no_new_billing'` (HTTP 304 — "nothing new
+ * to fetch") is NOT a failure, so it emits neither pinned event; every
+ * OTHER kind (`unauthorized`/`unknown_company`/`jwt_stale`/
+ * `no_local_license`/`epoch_rollback`/`server_error`/`network_error`/
+ * `invalid_response`) is a genuine renewal failure -> `license.renew_failed`.
+ */
 export async function renewNow(
+  options: RenewNowOptions = {},
+): Promise<RenewOutcome> {
+  const outcome = await renewNowInner(options);
+  if (outcome.kind === 'renewed') {
+    chariotEmitter.send('license.renewed', {
+      data: { companyId: outcome.claims.companyId, writtenPath: outcome.writtenPath },
+    });
+  } else if (outcome.kind !== 'no_new_billing') {
+    chariotEmitter.send('license.renew_failed', {
+      severity: 'warning',
+      alertWorthy: true,
+      data: { kind: outcome.kind, status: outcome.status },
+      message: 'message' in outcome ? outcome.message : undefined,
+    });
+  }
+  return outcome;
+}
+
+async function renewNowInner(
   options: RenewNowOptions = {},
 ): Promise<RenewOutcome> {
   const envelope = readLicenseEnvelope();
@@ -244,10 +307,42 @@ export async function renewNow(
         message: 'New JWT signature did not verify against embedded keys.',
       };
     }
+    // Bind the renewed license to the SAME company as the license we hold.
+    // A signature-valid JWT for a DIFFERENT company (e.g. a replayed/confused
+    // control-plane response) must never overwrite this host's license.
+    if (newClaims.companyId !== claims.companyId) {
+      return {
+        kind: 'invalid_response',
+        status: 200,
+        message:
+          `Renewed JWT companyId (${newClaims.companyId}) does not match the ` +
+          `current license companyId (${claims.companyId}); refusing to overwrite.`,
+      };
+    }
+    // Anti-rollback floor MUST be enforced BEFORE the envelope is written to
+    // disk (mirrors activate.ts:149-164). Writing first and validating after
+    // would clobber the working license AND its renewal_secret with a
+    // stale/replayed-but-signed JWT, dropping the host to unlicensed with no
+    // way to self-heal (the old renewal_secret is gone). Guard first, write
+    // second.
+    const epochFloor = readPersistedLicenseEpoch(newClaims.companyId);
+    if (newClaims.licenseEpoch < epochFloor) {
+      return {
+        kind: 'epoch_rollback',
+        status: 200,
+        message:
+          `Renewed license_epoch=${newClaims.licenseEpoch} is below the ` +
+          `persisted anti-rollback floor (${epochFloor}) for company ` +
+          `${newClaims.companyId}. Refusing to overwrite the current license ` +
+          'with a rolled-back JWT.',
+      };
+    }
     const destPath = options.destPath ?? licenseFilePath();
+    // The §5.7 per-licence `seal_secret` is never rotated by renewal: carry
+    // the held envelope's value forward (see envelopeWithHeldSealSecret).
     try {
       writeLicenseEnvelopeAtomic(
-        { jwt: r.jwt, renewal_secret: r.renewal_secret },
+        envelopeWithHeldSealSecret({ jwt: r.jwt, renewal_secret: r.renewal_secret }, envelope),
         destPath,
       );
     } catch (err) {
@@ -270,6 +365,27 @@ export async function renewNow(
     // outcome as a failed renewal so operators see and fix it now.
     const post = revalidateLicense();
     if (post.mode !== 'licensed' && post.mode !== 'grace') {
+      // The renewed envelope did not validate. Restore the prior (working)
+      // envelope so a failed renewal never leaves the host worse off than
+      // before — the previous license and its renewal_secret are put back and
+      // the cache re-primed. Best-effort: a restore failure is folded into the
+      // returned message rather than masking the original outcome.
+      let restoreNote = '';
+      try {
+        writeLicenseEnvelopeAtomic(
+          envelopeWithHeldSealSecret(
+            { jwt: envelope.jwt, renewal_secret: envelope.renewal_secret },
+            envelope,
+          ),
+          destPath,
+        );
+        revalidateLicense();
+      } catch (restoreErr) {
+        restoreNote =
+          ' Additionally, restoring the previous license failed: ' +
+          (restoreErr instanceof Error ? restoreErr.message : String(restoreErr)) +
+          ' — re-activate from the portal to recover.';
+      }
       return {
         kind: 'invalid_response',
         status: 200,
@@ -277,7 +393,8 @@ export async function renewNow(
           'Renewed JWT was written to disk but post-renewal validation ' +
           `returned mode=${post.mode}: ${post.reason ?? 'no reason given'}. ` +
           'The renewal is NOT considered committed until the validation ' +
-          'returns licensed/grace. Remediate and retry.',
+          'returns licensed/grace. The previous license was restored.' +
+          restoreNote,
       };
     }
     return {

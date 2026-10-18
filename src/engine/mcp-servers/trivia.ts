@@ -78,7 +78,7 @@ export class TriviaMCPServer extends MCPAdapterBase {
       name: 'trivia',
       displayName: 'Open Trivia Database',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'trivia', 'quiz', 'questions', 'categories', 'multiple choice',
         'true false', 'difficulty', 'open trivia', 'opentdb', 'general knowledge',

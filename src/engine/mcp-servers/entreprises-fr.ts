@@ -29,7 +29,7 @@ export class EntreprisesFrMCPServer extends MCPAdapterBase {
       name: 'entreprises-fr',
       displayName: 'Entreprises FR (French Companies)',
       version: '1.0.0',
-      category: 'business',
+      category: 'commerce',
       keywords: [
         'france', 'french companies', 'entreprises', 'siren', 'siret', 'sirene',
         'insee', 'inpi', 'rge', 'ape', 'naf', 'legal entity', 'business registry',

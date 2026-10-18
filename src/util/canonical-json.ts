@@ -87,17 +87,24 @@ export function canonicalStringify(value: unknown): string {
   // canonicalStringify a stable answer for fast-check inputs like
   // `Object.defineProperty(obj, '__proto__', { enumerable: true, value: false })`.
   const obj = value as Record<string, unknown>;
-  const allKeys: string[] = [];
+  const entries: Array<[string, PropertyDescriptor]> = [];
   for (const k of Reflect.ownKeys(obj)) {
     if (typeof k !== 'string') continue; // symbols ignored, same as JSON.stringify
     const desc = Object.getOwnPropertyDescriptor(obj, k);
     if (!desc || !desc.enumerable) continue;
-    allKeys.push(k);
+    entries.push([k, desc]);
   }
-  allKeys.sort();
+  entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const parts: string[] = [];
-  for (const k of allKeys) {
-    const v = (Object.getOwnPropertyDescriptor(obj, k) as PropertyDescriptor).value as unknown;
+  for (const [k, desc] of entries) {
+    // Enumerable accessor (getter) properties are serialized by
+    // JSON.stringify, so canonicalStringify must invoke them too —
+    // reading `desc.value` alone would silently drop the key and
+    // produce a different hash before vs after a storage round-trip
+    // (where the getter materializes as a data property), yielding a
+    // spurious chain-broken result. Setter-only accessors yield
+    // undefined and are dropped, matching JSON.stringify.
+    const v = desc.get ? (desc.get.call(obj) as unknown) : (desc.value as unknown);
     if (v === undefined) continue;
     parts.push(JSON.stringify(k) + ':' + canonicalStringify(v));
   }

@@ -41,7 +41,7 @@ export class StartupOracleMCPServer extends MCPAdapterBase {
       name: 'startup-oracle',
       displayName: 'Startup Oracle',
       version: '1.0.0',
-      category: 'business',
+      category: 'commerce',
       keywords: [
         'startup', 'startup idea', 'evaluate', 'startup evaluation',
         'pivot', 'yc', 'y combinator', 'rejection', 'tam', 'venture capital',

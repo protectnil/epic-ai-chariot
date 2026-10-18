@@ -26,7 +26,7 @@ export class TranslateMCPServer extends MCPAdapterBase {
       name: 'translate',
       displayName: 'LibreTranslate',
       version: '1.0.0',
-      category: 'language',
+      category: 'communication',
       keywords: [
         'translate', 'translation', 'language', 'libretranslate', 'detect language',
         'multilingual', 'text translation', 'language detection', 'natural language',

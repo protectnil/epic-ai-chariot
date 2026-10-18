@@ -22,12 +22,20 @@
 // Combined coverage: ~13 logical operations (MCP: 6 + REST: 11 — shared: 4)
 //
 // Base URL: https://redshift-data.{region}.amazonaws.com
-// Auth: AWS Signature Version 4 (SigV4). The adapter accepts a signRequest callback
-//       so callers supply their own SigV4 signer (e.g. @aws-sdk/signature-v4, aws4).
+// Auth: AWS Signature Version 4 (SigV4), service=redshift-data. The adapter signs
+//       requests itself from accessKeyId/secretAccessKey(+optional sessionToken)
+//       — the SAME pattern as the sibling AWS adapters (aws-cloudwatch.ts,
+//       aws-dynamodb.ts, aws-cost-explorer.ts: hmac/sha256/getSigningKey over
+//       AWS4<secret> -> date -> region -> service -> aws4_request). A caller
+//       may still inject its own `signRequest` callback (e.g. to use
+//       @aws-sdk/signature-v4, aws4, or an STS-assumed-role signer that
+//       refreshes credentials per call) — when supplied, it takes priority
+//       over the internal signer.
 //       All requests POST to the regional endpoint with X-Amz-Target header.
 // Docs: https://docs.aws.amazon.com/redshift-data/latest/APIReference/Welcome.html
 // Rate limits: Not publicly documented; subject to AWS service limits per account/region.
 
+import { createHmac, createHash } from 'node:crypto';
 import { ToolDefinition, ToolResult } from './types.js';
 import { MCPAdapterBase } from './base.js';
 
@@ -38,13 +46,24 @@ interface RedshiftConfig {
    * Caller-supplied SigV4 signer. Returns headers needed for a signed request.
    * target: X-Amz-Target action string (e.g. "RedshiftData.ExecuteStatement")
    * body: JSON-serialized request body string
+   * Optional — when omitted, the adapter builds its own SigV4 signer from
+   * accessKeyId/secretAccessKey(+sessionToken), the same way the sibling AWS
+   * adapters do. Takes priority over accessKeyId/secretAccessKey when both
+   * are supplied, so existing callers that inject their own signer are
+   * unaffected.
    */
-  signRequest: (target: string, body: string) => Promise<Record<string, string>>;
+  signRequest?: (target: string, body: string) => Promise<Record<string, string>>;
+  /** IAM access key id — required when signRequest is not supplied. */
+  accessKeyId?: string;
+  /** IAM secret access key — required when signRequest is not supplied. */
+  secretAccessKey?: string;
+  /** STS temporary-credential session token — optional, only meaningful alongside accessKeyId/secretAccessKey. */
+  sessionToken?: string;
 }
 
 export class RedshiftMCPServer extends MCPAdapterBase {
   private readonly endpoint: string;
-  private readonly signRequest: RedshiftConfig['signRequest'];
+  private readonly signRequest: (target: string, body: string) => Promise<Record<string, string>>;
 
   constructor(config: RedshiftConfig) {
     super();
@@ -54,11 +73,97 @@ export class RedshiftMCPServer extends MCPAdapterBase {
     if (config.region === undefined || config.region === null || config.region === '') {
       throw new Error('AWS Redshift: region is required');
     }
-    if (config.signRequest === undefined || config.signRequest === null) {
-      throw new Error('AWS Redshift: signRequest is required');
-    }
     this.endpoint = `https://redshift-data.${config.region}.amazonaws.com`;
-    this.signRequest = config.signRequest;
+
+    if (config.signRequest !== undefined && config.signRequest !== null) {
+      // Injected callback (existing behavior, unchanged) takes priority.
+      this.signRequest = config.signRequest;
+      return;
+    }
+
+    const hasAccessKeyId = typeof config.accessKeyId === 'string' && config.accessKeyId.length > 0;
+    const hasSecretAccessKey = typeof config.secretAccessKey === 'string' && config.secretAccessKey.length > 0;
+    if (!hasAccessKeyId || !hasSecretAccessKey) {
+      throw new Error('AWS Redshift: either signRequest, or accessKeyId + secretAccessKey, is required');
+    }
+    const accessKeyId = config.accessKeyId as string;
+    const secretAccessKey = config.secretAccessKey as string;
+    const sessionToken = config.sessionToken;
+    const region = config.region;
+    const endpoint = this.endpoint;
+
+    // Internal default signer — mirrors aws-dynamodb.ts's JSON-API SigV4
+    // implementation exactly (service='redshift-data' instead of 'dynamodb';
+    // Content-Type application/x-amz-json-1.1 to match post()'s outgoing
+    // request instead of dynamodb's 1.0). Bound as an arrow so `this` is
+    // never needed inside — keeps it a pure function of the captured
+    // credentials, consistent with the injected-callback contract.
+    this.signRequest = async (target: string, body: string): Promise<Record<string, string>> => {
+      const parsed = new URL(endpoint);
+      const now = new Date();
+      const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '').slice(0, 15) + 'Z';
+      const dateStamp = amzDate.slice(0, 8);
+      const payloadHash = createHash('sha256').update(body, 'utf8').digest('hex');
+
+      // 'Content-Type'/'X-Amz-Target' use the SAME casing post() sets them
+      // with explicitly (see below) — post() does
+      // `{'Content-Type':..., 'X-Amz-Target':..., Accept:..., ...sigHeaders}`,
+      // and a plain-object key differing only in case (e.g. 'content-type'
+      // vs 'Content-Type') would sit alongside the original as a SEPARATE
+      // object property, not overwrite it, until whatever consumes the
+      // object normalizes header names — matching casing here removes that
+      // ambiguity outright rather than relying on downstream normalization.
+      const allHeaders: Record<string, string> = {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': target,
+        host: parsed.host,
+        'x-amz-date': amzDate,
+        'x-amz-content-sha256': payloadHash,
+      };
+      if (sessionToken) {
+        allHeaders['x-amz-security-token'] = sessionToken;
+      }
+
+      const sortedHeaderKeys = Object.keys(allHeaders).sort((a, b) => { const x = a.toLowerCase(), y = b.toLowerCase(); return x < y ? -1 : x > y ? 1 : 0; });
+      const canonicalHeaders = sortedHeaderKeys
+        .map(k => `${k.toLowerCase()}:${allHeaders[k].trim()}`)
+        .join('\n') + '\n';
+      const signedHeaders = sortedHeaderKeys.map(k => k.toLowerCase()).join(';');
+
+      const canonicalRequest = [
+        'POST',
+        parsed.pathname || '/',
+        '', // no query string on the Redshift Data API POST endpoint
+        canonicalHeaders,
+        signedHeaders,
+        payloadHash,
+      ].join('\n');
+
+      const hmac = (key: Buffer | string, data: string): Buffer => createHmac('sha256', key).update(data, 'utf8').digest();
+      const sha256 = (data: string): string => createHash('sha256').update(data, 'utf8').digest('hex');
+
+      const credentialScope = `${dateStamp}/${region}/redshift-data/aws4_request`;
+      const stringToSign = [
+        'AWS4-HMAC-SHA256',
+        amzDate,
+        credentialScope,
+        sha256(canonicalRequest),
+      ].join('\n');
+
+      const kDate = hmac(`AWS4${secretAccessKey}`, dateStamp);
+      const kRegion = hmac(kDate, region);
+      const kService = hmac(kRegion, 'redshift-data');
+      const signingKey = hmac(kService, 'aws4_request');
+      const signature = hmac(signingKey, stringToSign).toString('hex');
+
+      const authorization = [
+        `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}`,
+        `SignedHeaders=${signedHeaders}`,
+        `Signature=${signature}`,
+      ].join(', ');
+
+      return { ...allHeaders, Authorization: authorization };
+    };
   }
 
   static catalog() {

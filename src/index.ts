@@ -36,6 +36,30 @@ export type {
   PendingAlert,
 } from './observability/index.js';
 
+// Chariot-specific: real-time anomaly detection + dispatch-layer wiring.
+// reportToolDispatch() is the entry point the tool-dispatch layer calls
+// per tool call to feed the detector (rate-spike, destructive-burst,
+// cross-tenant-drift, and scope-violation rules); findings flow into the
+// AlertQueue/ChariotEmitter above via anomalyAlertQueue/anomalyEmitter.
+export {
+  AnomalyDetector,
+  ToolCallRateSpikeRule,
+  DestructiveToolBurstRule,
+  CrossTenantDriftRule,
+  ScopeViolationRule,
+  reportToolDispatch,
+  anomalyDetector,
+  anomalyAlertQueue,
+  anomalyEmitter,
+} from './observability/index.js';
+export type {
+  AnomalyRule,
+  AnomalySignal,
+  AnomalyFinding,
+  AnomalySeverity,
+  ToolDispatchReport,
+} from './observability/index.js';
+
 // Chariot-specific: Adapter catalog trust & verification
 export { VerifiedCatalog, DEFAULT_CATALOG_TRUST_CONFIG } from './catalog/index.js';
 export type {

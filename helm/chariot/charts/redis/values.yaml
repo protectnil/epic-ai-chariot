@@ -1,0 +1,92 @@
+# Defaults for the vendored Redis subchart. The umbrella chart's `redis:` block
+# overrides these. Image ref lives here / in the umbrella values (CH-29).
+enabled: true
+
+image:
+  # AWS Marketplace rewrites this field per region. Empty → global.imageRegistry.
+  registry: ""
+  repository: redis
+  tag: "8.10.2"   # pinned glibc base; never "latest" (CH-26)
+  digest: "sha256:2c2dff791878316e3b083188be0d578423b24813cdda5de0e80ea4f7b3e6bfd6"
+  pullPolicy: IfNotPresent
+
+auth:
+  enabled: true
+  # CH-28 fail-closed: supply via operator Secret (key: redis-password)…
+  existingSecret: ""
+  # …or inline. Blank / weak / default is REFUSED — never auto-generated.
+  password: ""
+
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 8Gi
+
+service:
+  port: 6379
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "1Gi"
+
+nodeSelector:
+  kubernetes.io/arch: amd64   # CH-30 single-arch
+tolerations: []
+affinity: {}
+
+# CH-30 non-root least-privilege. uid/gid 999 = the `redis` image's redis user.
+#
+# runAsUser IS PINNED HERE AND MUST STAY PINNED for the default (EKS-primary,
+# §23.2::1) install. `redis:7.4.1-bookworm` does NOT declare a USER: `podman
+# inspect` reports `Config.User` empty and `podman run redis:7.4.1-bookworm id`
+# reports `uid=0(root)`. With `runAsNonRoot: true` and no `runAsUser`, the kubelet
+# has nothing to assert uid != 0 against and admission rejects the pod with
+# "container has runAsNonRoot and image will run as root". The gateway is the
+# opposite case and is safe to leave unset -- its own Dockerfile:152 declares
+# `USER 1000:1000` numerically. Do not "harmonize" the three workloads without
+# re-inspecting the images; they are not alike.
+#
+# For OpenShift, use values-openshift.yaml, which unsets all three fields. There
+# the `restricted-v2` SCC MUTATES the pod with a UID from the namespace's
+# `openshift.io/sa.scc.uid-range` before validating, so runAsNonRoot is satisfied
+# by the injected value and no `nonroot-v2` / `anyuid` grant is needed. That is
+# safe for this container because every path redis-server writes is a MOUNTED
+# VOLUME -- /data (the `data` PVC) and /tmp (an emptyDir),
+# templates/statefulset.yaml:48-52 -- and Kubernetes applies fsGroup ownership to
+# both, so whatever supplemental group the SCC allocates can write them. Nothing
+# is written to an image-owned directory.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# CH-30 arbitrary-UID compatibility. Set true ONLY on OpenShift (or any platform
+# whose admission allocates the UID itself). When true the templates OMIT
+# runAsUser/runAsGroup/fsGroup so the restricted-v2 SCC can allocate them from the
+# namespace range; runAsNonRoot is then satisfied by the injected UID. It MUST stay
+# false on vanilla Kubernetes: this is a Docker Official image that declares no
+# USER and runs as root (verified -- `podman inspect` reports Config.User empty and
+# `podman run <image> id` reports uid=0), so with the fields absent the kubelet has
+# nothing to assert uid != 0 against and admission rejects the pod. The umbrella's
+# values-openshift.yaml flips this.
+openshift:
+  arbitraryUid: false

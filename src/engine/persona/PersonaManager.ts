@@ -8,6 +8,16 @@
 import type { PersonaConfig, ConversationContext } from '../types/index.js';
 import { SystemPromptBuilder } from './SystemPromptBuilder.js';
 
+// CHARIOT::§8.4.1::1 — the spec text (§8.4.1) names `INJECTION_PATTERNS` as
+// "a line-prefix sanitizer in `PersonaManager.ts`". The implementation lives
+// in the sibling module `injection-defense.ts` (shared by SystemPromptBuilder
+// and Orchestrator to avoid duplicating the pattern set — see that file's
+// header comment) rather than being defined inline here. Re-exporting it
+// from this module makes `PersonaManager.ts` the on-disk home the spec cites
+// (`import { INJECTION_PATTERNS } from './PersonaManager.js'` resolves) while
+// keeping the single-source-of-truth definition the multiple consumers share.
+export { INJECTION_PATTERNS, sanitizeInjectedContent } from './injection-defense.js';
+
 export class PersonaManager {
   private readonly personas = new Map<string, PersonaConfig>();
   private activeName: string | null = null;

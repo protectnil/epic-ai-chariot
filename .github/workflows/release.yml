@@ -21,12 +21,18 @@ on:
   push:
     tags:
       - 'v*.*.*'
+      - 'engine-v*.*.*'
   workflow_dispatch:
     inputs:
       version:
         description: 'Version to release (e.g. 1.0.6). Must match package.json.'
         required: true
         type: string
+      publish_gateway_image:
+        description: 'Set true only when this release explicitly publishes/signs a chariot-gateway image.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write   # GitHub release creation
@@ -48,9 +54,9 @@ env:
   # workflow uses plain token-based publish and must never emit provenance.
   NPM_CONFIG_PROVENANCE: 'false'
   # Must be >= 1.85.0 (edition2024 feature, required by transitively-
-  # resolved base64ct >= 1.8.3). Pinned to 1.94.1 to match the version
-  # that generated Cargo.lock so CI and local builds stay in sync.
-  RUST_VERSION: '1.94.1'
+  # resolved base64ct >= 1.8.3). Pinned to 1.95.0 to match
+  # native/rust-toolchain.toml and the qdrant-edge feature floor.
+  RUST_VERSION: '1.95.0'
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
@@ -63,6 +69,8 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       commit: ${{ steps.resolve.outputs.commit }}
+      sign_image: ${{ steps.sign-gate.outputs.sign_image }}
+      publish_gateway_image: ${{ steps.publish-gateway-image.outputs.publish_gateway_image }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,7 +106,22 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "push" ]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+            # REPO-AND-RELEASE-SCHEMA.md:46 mandates the engine tag be
+            # namespaced (`engine-vX.Y.Z`), never bare `v*.*.*`. Strip the
+            # namespaced prefix first so an engine-v4.0.0 tag resolves to
+            # VERSION=4.0.0; fall back to stripping the legacy bare `v`
+            # prefix so existing v3.1.1/v3.1.2-style tags keep working.
+            case "${GITHUB_REF_NAME}" in
+              engine-v*)
+                VERSION="${GITHUB_REF_NAME#engine-v}"
+                ;;
+              v*)
+                VERSION="${GITHUB_REF_NAME#v}"
+                ;;
+              *)
+                VERSION="${GITHUB_REF_NAME}"
+                ;;
+            esac
           else
             VERSION="${INPUT_VERSION}"
           fi
@@ -144,6 +167,15 @@ jobs:
           echo "Target version: ${VERSION}"
           echo "Target commit:  ${COMMIT}"
 
+      - name: Resolve gateway image publish signal
+        id: publish-gateway-image
+        env:
+          PUBLISH_GATEWAY_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_gateway_image || 'false' }}
+        run: |
+          set -euo pipefail
+          echo "publish_gateway_image=${PUBLISH_GATEWAY_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Gateway image publish signal: ${PUBLISH_GATEWAY_IMAGE}"
+
       - name: Verify package.json version matches target
         run: |
           set -euo pipefail
@@ -163,6 +195,7 @@ jobs:
             const deps = pkg.optionalDependencies || {};
             const siblings = [
               "@epicai/chariot-bin-linux-x64-gnu",
+              "@epicai/chariot-bin-linux-arm64-gnu",
               "@epicai/chariot-bin-darwin-arm64",
               "@epicai/chariot-bin-darwin-x64",
               "@epicai/chariot-bin-win32-x64-msvc",
@@ -220,37 +253,101 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Resolve sibling versions into lock
-        # npm/cli#8320 + napi-rs/napi-rs#3174: platform-specific
-        # optionalDependencies are written to package-lock.json without
-        # version strings when the lock is generated on a platform that
-        # doesn't match the sibling. `npm ci` then fails strict-check
-        # BEFORE the install phase decides what to skip — so
-        # `--omit=optional` alone cannot bypass it. Running
-        # `npm install --package-lock-only --include=optional` against
-        # the live registry resolves all four sibling versions into the
-        # lock without touching node_modules; the subsequent `npm ci`
-        # then satisfies strict-check and `--omit=optional` skips the
-        # actual binary downloads we don't need on the publisher runner.
-        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+      - name: Install dependencies (siblings not yet published at this version)
+        # This job runs BEFORE publish-sibling (needs: [validate, build,
+        # sign-manifest]), so the five @epicai/chariot-bin-* platform
+        # packages do NOT yet exist on the registry at the target version.
+        # Resolving them via `npm install --package-lock-only
+        # --include=optional` against the live registry — the approach
+        # publish-main uses AFTER publish-sibling has run — cannot work
+        # here: npm leaves the lock's stale sibling entries untouched
+        # (npm/cli#8320 + napi-rs/napi-rs#3174) and the following `npm ci`
+        # then fails strict-check with "lock file's
+        # @epicai/chariot-bin-*@<stale> does not satisfy
+        # @epicai/chariot-bin-*@<target>".
+        # Neither this job nor build ever needs the sibling binaries — they
+        # are end-user-only, resolved via optionalDependencies on the
+        # CONSUMER's platform at install time — so strip
+        # optionalDependencies from the WORKING COPY of package.json,
+        # regenerate the lock without them, and `npm ci` that. The next
+        # step restores package.json/package-lock.json from git before any
+        # step that reads their content, so this mutation never reaches
+        # typecheck, build, SBOM, the notices check, or publish.
+        run: |
+          set -euo pipefail
+          npm pkg delete optionalDependencies
+          npm install --package-lock-only --no-audit --no-fund
 
       - name: Install dependencies
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         with:
           timeout_minutes: 10
           max_attempts: 3
           retry_wait_seconds: 30
-          # --omit=optional: the four platform-sibling optionalDependencies
-          # are end-user-only. The preceding lock-resolution step ensures
-          # this passes strict-check; --omit=optional then skips the
-          # downloads themselves.
-          command: npm ci --omit=optional
+          command: npm ci
+
+      - name: Restore package.json and package-lock.json from git
+        # Undo the optionalDependencies strip above so every subsequent
+        # step (SBOM generation, the notices-check, and any future step)
+        # sees the real, committed dependency graph — including the five
+        # sibling pins at the target version — not the stripped working
+        # copy used only to make `npm ci` possible before those siblings
+        # exist on the registry. The explicit diff check is a hard
+        # assertion, not just a restore: a `git checkout` that silently no-
+        # ops (e.g. wrong path) must fail this job rather than let a
+        # mutated package.json/package-lock.json flow into SBOM/notices.
+        run: |
+          set -euo pipefail
+          git checkout -- package.json package-lock.json
+          if ! git diff --quiet -- package.json package-lock.json; then
+            echo "::error::package.json/package-lock.json did not restore cleanly to the committed version after the optionalDependencies strip"
+            git diff -- package.json package-lock.json
+            exit 1
+          fi
 
       - name: Typecheck
         run: npm run typecheck
 
       - name: Build TypeScript
         run: npm run build
+
+      # Third-party licence inventory + npm SBOM. Required for AWS/IBM
+      # Marketplace listing review (an OSS bill of materials with licence
+      # classification for every shipped dependency). `--check` fails the
+      # release if THIRD-PARTY-NOTICES.md does not match a fresh generation
+      # from the just-installed package-lock.json — a stale notices file is
+      # a release blocker, not a warning.
+      #
+      # This step MUST run after "Restore package.json and package-lock.json
+      # from git" above: the generator reads package-lock.json content
+      # directly (not the installed node_modules tree), so it must see the
+      # COMMITTED lock — with all five @epicai/chariot-bin-* siblings listed
+      # — not the working copy with optionalDependencies stripped, or it
+      # reports the committed THIRD-PARTY-NOTICES.md as stale.
+      - name: Verify THIRD-PARTY-NOTICES.md is current
+        run: node scripts/generate-third-party-notices.mjs --check
+
+      # `npm sbom` walks the actually-installed node_modules tree, not the
+      # lock file. The five @epicai/chariot-bin-* platform siblings are
+      # optionalDependencies that this job never installs — `npm ci` above
+      # ran with no optionalDependencies present at all — so they are
+      # legitimately absent from this SBOM. This is unchanged from the
+      # pre-existing production behavior: `npm ci --omit=optional` (this
+      # job's flag before this patch) skips installing them too, so the
+      # committed release flow's SBOM has never included the five sibling
+      # packages either. This is the only SBOM this workflow generates; it
+      # is uploaded here and re-used unmodified as the release asset in the
+      # `release` job (no second, later SBOM generation exists).
+      - name: Generate CycloneDX SBOM (npm production dependencies)
+        run: npm sbom --sbom-format cyclonedx --omit dev > sbom.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
+          if-no-files-found: error
 
       # Catalog signature pre-publish gate.
       # Verifies every committed catalog artifact (bundle, catalog,
@@ -289,6 +386,71 @@ jobs:
           done
           exit $bad
 
+      # CH-54 image-signing activation gate. The `secrets` context is NOT
+      # available in a job-level `if:` (GitHub rejects the workflow with
+      # "Unrecognized named-value: 'secrets'", which dead-letters EVERY release
+      # run at trigger time). Evaluate the seven signing prerequisites HERE, at
+      # step level where `secrets` IS available, and expose the result as a job
+      # output that the sign-image job's `if:` consumes. All must be non-empty:
+      # CHARIOT_ECR_IMAGE_REPOSITORY, CHARIOT_IMAGE_DIGEST,
+      # CHARIOT_SIGNING_PROFILE_ARN, CHARIOT_SIGNING_AWS_ROLE_ARN,
+      # AWS_SIGNER_NOTATION_PLUGIN_URL, AWS_SIGNER_NOTATION_PLUGIN_SHA256,
+      # AWS_REGION.
+      - name: Resolve CH-54 image-signing activation gate
+        id: sign-gate
+        env:
+          ECR_REPO: ${{ secrets.CHARIOT_ECR_IMAGE_REPOSITORY }}
+          DIGEST: ${{ secrets.CHARIOT_IMAGE_DIGEST }}
+          PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+          ROLE_ARN: ${{ secrets.CHARIOT_SIGNING_AWS_ROLE_ARN }}
+          PLUGIN_URL: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_URL }}
+          PLUGIN_SHA: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_SHA256 }}
+          SIGN_AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ECR_REPO}" ] && [ -n "${DIGEST}" ] && [ -n "${PROFILE_ARN}" ] \
+            && [ -n "${ROLE_ARN}" ] && [ -n "${PLUGIN_URL}" ] && [ -n "${PLUGIN_SHA}" ] \
+            && [ -n "${SIGN_AWS_REGION}" ]; then
+            echo "sign_image=true" >> "$GITHUB_OUTPUT"
+            echo "CH-54 image signing ACTIVE (all signing secrets present)."
+          else
+            echo "sign_image=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CH-54 image signing inactive — one or more signing secrets are unset."
+          fi
+
+      # Wiz practice 1 fail-closed guard: "CI/CD must reject unsigned build
+      # artifacts." The gate above computes `sign_image` from all seven
+      # secrets and silently degrades to inert (job SKIPPED, not failed) when
+      # any is missing — correct for the package-only (npm-only) release path,
+      # where no image exists to sign. It is NOT correct for a release that
+      # actually published a chariot-gateway image: CHARIOT_ECR_IMAGE_REPOSITORY
+      # and CHARIOT_IMAGE_DIGEST are the only evidence, in this workflow, that
+      # an image was pushed to ECR for this release (they are populated by the
+      # external image-push pipeline specifically to hand this release a real
+      # digest to sign). If EITHER is set — i.e. an image-publish was
+      # attempted or intended for this release — the remaining signing
+      # prerequisites MUST also all be present, or this step fails the
+      # workflow outright instead of letting it complete with the sign-image
+      # job quietly skipped and an unsigned image left in ECR.
+      #
+      # Package-only releases are unaffected: when neither secret is set,
+      # this step is a no-op and the workflow proceeds exactly as before.
+      - name: Fail closed if an image-publishing release lacks complete signing config
+        env:
+          PUBLISH_GATEWAY_IMAGE: ${{ steps.publish-gateway-image.outputs.publish_gateway_image }}
+          SIGN_IMAGE: ${{ steps.sign-gate.outputs.sign_image }}
+        run: |
+          set -euo pipefail
+          if [ "${PUBLISH_GATEWAY_IMAGE}" = "true" ]; then
+            if [ "${SIGN_IMAGE}" != "true" ]; then
+              echo "::error::CH-54 fail-closed gate: this release explicitly set publish_gateway_image=true, but one or more of the CH-54 signing prerequisites (CHARIOT_ECR_IMAGE_REPOSITORY, CHARIOT_IMAGE_DIGEST, CHARIOT_SIGNING_PROFILE_ARN, CHARIOT_SIGNING_AWS_ROLE_ARN, AWS_SIGNER_NOTATION_PLUGIN_URL, AWS_SIGNER_NOTATION_PLUGIN_SHA256, AWS_REGION) is unset. Refusing to let this release succeed with the sign-image job skipped and an unsigned image left in ECR. Set publish_gateway_image=false for package-only releases, or populate all seven CH-54 signing secrets for an image-publishing release."
+              exit 1
+            fi
+            echo "CH-54 fail-closed gate OK: publish_gateway_image=true and all signing prerequisites present."
+          else
+            echo "CH-54 fail-closed gate OK: publish_gateway_image=false — package-only release, signing not required."
+          fi
+
       # `npm whoami` step removed: in 2026 the npm registry rejects this
       # endpoint for any token type that lacks user-identity scope, including
       # Granular Access Tokens scoped only to packages. The publish steps
@@ -314,6 +476,10 @@ jobs:
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary_name: chariot-native.linux-x64-gnu.node
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary_name: chariot-native.linux-arm64-gnu.node
           - platform: darwin-x64
             runner: macos-15-intel
             target: x86_64-apple-darwin
@@ -336,7 +502,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: ${{ env.RUST_VERSION }}
           target: ${{ matrix.target }}
@@ -354,31 +520,69 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (no versioned release tag for this commit)
         with:
           workspaces: native -> target
           key: ${{ matrix.target }}-rust-${{ env.RUST_VERSION }}
           shared-key: native-${{ matrix.target }}
 
-      - name: Resolve sibling versions into lock
-        # See validate job for full rationale (npm/cli#8320 +
-        # napi-rs/napi-rs#3174). The build runner only needs THIS
-        # platform's native toolchain; --omit=optional skips the sibling
-        # downloads after strict-check passes.
+      - name: Verify vendored conformance corpus matches BIEN (CH-23 drift gate)
         shell: bash
-        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+        run: |
+          # Dual-repo lockstep: the comment-stripped vendored corpus MUST hash to
+          # the canonical BIEN corpus. Bump this pin only when re-syncing from
+          # /opt/bien/src/bien/serializer/conformance/expected.jsonl in lockstep.
+          EXPECTED='8ae6beef058bb1d55fd225d6612c35c8b281e1aaf49877c3e8e56632aa289600'
+          ACTUAL="$(grep -v '^#' native/tests/conformance/expected.jsonl | sha256sum | cut -d' ' -f1)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "CH-23 corpus drift: native/tests/conformance/expected.jsonl (data, comments stripped)"
+            echo "  sha256=$ACTUAL != pinned BIEN sha=$EXPECTED"
+            echo "Re-sync from /opt/bien/src/bien/serializer/conformance/expected.jsonl and update this pin together."
+            exit 1
+          fi
+          echo "CH-23 corpus drift gate OK ($ACTUAL)"
+
+      - name: Run native serializer conformance tests
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: /tmp/chariot-target
+        run: cargo test --manifest-path native/Cargo.toml
+
+      - name: Install dependencies (siblings not yet published at this version)
+        # See validate job for full rationale (npm/cli#8320 +
+        # napi-rs/napi-rs#3174 combined with this job running BEFORE
+        # publish-sibling, so the target-version siblings do not exist on
+        # the registry yet). The build runner only needs THIS platform's
+        # native toolchain (cargo + napi) — never the published sibling
+        # binaries — so stripping optionalDependencies from the working
+        # copy before resolving the lock is safe here too.
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pkg delete optionalDependencies
+          npm install --package-lock-only --no-audit --no-fund
 
       - name: Install dependencies
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         with:
           timeout_minutes: 10
           max_attempts: 3
           retry_wait_seconds: 30
-          # --omit=optional: same rationale as validate / publish-main.
-          # Each per-platform build runner does not need the OTHER platforms'
-          # native binaries; the build process for THIS platform's binary
-          # uses cargo + napi, not the published sibling binaries.
-          command: npm ci --omit=optional
+          command: npm ci
+
+      - name: Restore package.json and package-lock.json from git
+        # See validate job for full rationale. This job never publishes,
+        # but the working tree should not carry a stripped
+        # optionalDependencies section past the install step.
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout -- package.json package-lock.json
+          if ! git diff --quiet -- package.json package-lock.json; then
+            echo "::error::package.json/package-lock.json did not restore cleanly to the committed version after the optionalDependencies strip"
+            git diff -- package.json package-lock.json
+            exit 1
+          fi
 
       - name: Build native binary
         shell: bash
@@ -423,7 +627,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   # 3. SIGN MANIFEST — single source of truth for all downstream packages
   # ─────────────────────────────────────────────────────────────────────
-  # Builds the signed integrity.json once, from all four platform
+  # Builds the signed integrity.json once, from all five platform
   # binaries. For any sibling already published at this version (partial-
   # failure retry case), fetches its canonical binary from npm — with a
   # retry loop to tolerate registry propagation lag — so the manifest
@@ -457,9 +661,10 @@ jobs:
           VERSION="${{ needs.validate.outputs.version }}"
           mkdir -p platform-binaries
 
-          for plat in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
+          for plat in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
             case "${plat}" in
               linux-x64)    PKG="@epicai/chariot-bin-linux-x64-gnu"   ;;
+              linux-arm64)  PKG="@epicai/chariot-bin-linux-arm64-gnu" ;;
               darwin-x64)   PKG="@epicai/chariot-bin-darwin-x64"      ;;
               darwin-arm64) PKG="@epicai/chariot-bin-darwin-arm64"    ;;
               win32-x64)    PKG="@epicai/chariot-bin-win32-x64-msvc"  ;;
@@ -473,17 +678,45 @@ jobs:
             # sign against the fresh build bytes instead of the canonical
             # bytes, producing a manifest that doesn't match what npm
             # actually serves.
+            # Classify the registry probe. A bare `npm view … >/dev/null 2>&1`
+            # conflates a transport failure (5xx / DNS / throttle) with a genuine
+            # E404 "not published", which would let us silently sign fresh-build
+            # bytes that diverge from what npm actually serves. Capture the exit
+            # code + output: rc=0 → published; E404 → not-yet-published (keep
+            # polling for CDN propagation); any other failure → INDETERMINATE.
             found=0
+            transport_err=""
             for attempt in 1 2 3 4 5; do
-              if npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
+              set +e
+              view_out="$(npm view "${PKG}@${VERSION}" version 2>&1)"
+              rc=$?
+              set -e
+              if [ "${rc}" -eq 0 ]; then
                 found=1
+                transport_err=""
                 break
               fi
-              if [ "${attempt}" -lt 5 ]; then
-                echo "  ${PKG}@${VERSION} not yet visible (attempt ${attempt}/5) — waiting..."
-                sleep 15
+              if printf '%s' "${view_out}" | grep -qi 'E404'; then
+                transport_err=""
+                if [ "${attempt}" -lt 5 ]; then
+                  echo "  ${PKG}@${VERSION} not yet visible (attempt ${attempt}/5) — waiting..."
+                  sleep 15
+                fi
+              else
+                transport_err="${view_out}"
+                if [ "${attempt}" -lt 5 ]; then
+                  echo "  ${PKG}@${VERSION} registry query failed (attempt ${attempt}/5, non-404) — retrying..."
+                  sleep 15
+                fi
               fi
             done
+
+            # Fail closed on indeterminate registry state — never sign against
+            # ambiguous bytes just because the registry was unreachable.
+            if [ "${found}" -eq 0 ] && [ -n "${transport_err}" ]; then
+              echo "::error::Cannot determine registry state for ${PKG}@${VERSION} (transport error, not E404); refusing to sign against ambiguous bytes: ${transport_err}"
+              exit 1
+            fi
 
             if [ "${found}" -eq 1 ]; then
               echo "Fetching canonical binary for ${PKG}@${VERSION} from registry"
@@ -492,8 +725,26 @@ jobs:
               tar -xzf "${tmp}"/*.tgz -C "${tmp}"
               cp "${tmp}/package/chariot-native.node" "platform-binaries/${plat}.node"
               rm -rf "${tmp}"
-              HASH="$(sha256sum "platform-binaries/${plat}.node" | awk '{print $1}')"
-              echo "${plat}: ${HASH} (fetched from npm)"
+              FETCHED="$(sha256sum "platform-binaries/${plat}.node" | awk '{print $1}')"
+              # Provenance guard (anti-laundering): the registry bytes MUST equal
+              # THIS run's freshly built artifact before we sign them into the
+              # integrity manifest. A published sibling whose bytes differ is
+              # either registry tampering (a trojaned sibling published ahead of
+              # this run) or a non-reproducible build — in both cases signing it
+              # would cryptographically endorse content this pipeline did not
+              # produce. Fail closed.
+              built="build-binaries/binary-${plat}/chariot-native.node"
+              if [ ! -f "${built}" ]; then
+                echo "::error::No fresh build artifact for ${plat} to cross-check registry bytes against; refusing to sign unverified registry content"
+                exit 1
+              fi
+              BUILT="$(sha256sum "${built}" | awk '{print $1}')"
+              if [ "${FETCHED}" != "${BUILT}" ]; then
+                echo "::error::${PKG}@${VERSION} on npm (${FETCHED}) does not match this run's build (${BUILT}) — possible registry tampering; refusing to sign"
+                exit 1
+              fi
+              HASH="${FETCHED}"
+              echo "${plat}: ${HASH} (fetched from npm; matches fresh build)"
             else
               src="build-binaries/binary-${plat}/chariot-native.node"
               if [ ! -f "${src}" ]; then
@@ -525,6 +776,7 @@ jobs:
           node scripts/sign-integrity.mjs \
             --key "${RUNNER_TEMP}/chariot-sign.pem" \
             --platform linux-x64=platform-binaries/linux-x64.node \
+            --platform linux-arm64=platform-binaries/linux-arm64.node \
             --platform darwin-x64=platform-binaries/darwin-x64.node \
             --platform darwin-arm64=platform-binaries/darwin-arm64.node \
             --platform win32-x64=platform-binaries/win32-x64.node
@@ -582,6 +834,11 @@ jobs:
             package: chariot-bin-linux-x64-gnu
             os_json: '["linux"]'
             cpu_json: '["x64"]'
+            libc_json: '["glibc"]'
+          - platform: linux-arm64
+            package: chariot-bin-linux-arm64-gnu
+            os_json: '["linux"]'
+            cpu_json: '["arm64"]'
             libc_json: '["glibc"]'
           - platform: darwin-x64
             package: chariot-bin-darwin-x64
@@ -655,7 +912,7 @@ jobs:
           set -euo pipefail
 
           # Generate package.json via Node so we can conditionally include
-          # `libc` only for linux-x64 (where it constrains install to glibc
+          # `libc` only for linux (x64 and arm64; where it constrains install to glibc
           # and prevents npm from trying to install on musl/Alpine, which
           # would defer the failure to runtime load).
           node -e '
@@ -749,7 +1006,7 @@ jobs:
 
       - name: Publish sibling package
         if: steps.check.outputs.already == 'false'
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         with:
           timeout_minutes: 5
           max_attempts: 3
@@ -836,23 +1093,23 @@ jobs:
         if: steps.check.outputs.already == 'false'
         # See validate job for full rationale (npm/cli#8320 +
         # napi-rs/napi-rs#3174). Runs against the live registry so the
-        # four sibling-package versions are populated into the lock
+        # five sibling-package versions are populated into the lock
         # without touching node_modules — strict-check then passes and
         # --omit=optional skips the actual sibling binary downloads.
         run: npm install --package-lock-only --include=optional --no-audit --no-fund
 
       - name: Install dependencies
         if: steps.check.outputs.already == 'false'
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         with:
           timeout_minutes: 10
           max_attempts: 3
           retry_wait_seconds: 30
-          # --omit=optional: skip the 4 platform-sibling optionalDependencies.
+          # --omit=optional: skip the 5 platform-sibling optionalDependencies.
           # This publisher runner does not consume any platform native binary
           # — those are for end users. The preceding lock-resolution step
           # populates the sibling versions so strict-check passes; this
-          # flag then skips the actual ~4×1.6MB downloads.
+          # flag then skips the actual ~5×1.6MB downloads.
           command: npm ci --omit=optional
 
       - name: Build TypeScript
@@ -965,28 +1222,18 @@ jobs:
         if: steps.check.outputs.already == 'false'
         run: git checkout -- package-lock.json
 
-      # Clone the private eval suite (sparse: evals/chariot only) so the
+      # Clone the private eval suite (sparse: test/ai-evals only) so the
       # prepublish gate can run the full eval battery against the built dist.
       # The test/ directory is intentionally absent from this public repo;
-      # evals live in the private companion repo and are fetched here at
-      # gate time using a deploy token scoped to that repo.
-      - name: Ensure leak denylist materialized from secrets
-        if: steps.check.outputs.already == 'false'
-        env:
-          LEAK_DENYLIST_REGEX: ${{ secrets.LEAK_DENYLIST_REGEX }}
-          LEAK_DENYLIST_REGEX_RESTRICTED: ${{ secrets.LEAK_DENYLIST_REGEX_RESTRICTED }}
-        run: |
-          set -euo pipefail
-          if [ -z "${LEAK_DENYLIST_REGEX}" ] || [ -z "${LEAK_DENYLIST_REGEX_RESTRICTED}" ]; then
-            echo "::error::LEAK_DENYLIST_REGEX / LEAK_DENYLIST_REGEX_RESTRICTED secret(s) not set"; exit 1
-          fi
-          DL_DIR="${RUNNER_TEMP}/leak-denylist"
-          mkdir -p "${DL_DIR}"
-          printf '%s\n' "${LEAK_DENYLIST_REGEX}" > "${DL_DIR}/patterns.txt"
-          printf '%s\n' "${LEAK_DENYLIST_REGEX_RESTRICTED}" > "${DL_DIR}/patterns-restricted.txt"
-          echo "LEAK_DENYLIST_DIR=${DL_DIR}" >> "$GITHUB_ENV"
-          echo "Denylist materialized from secrets (prepublish gate)."
-
+      # evals live in the private companion repo (protectnil/epic-ai — the
+      # Chariot engine test/eval suite's durable home per TES §2.2 row 1)
+      # and are fetched here at gate time using a deploy token scoped to
+      # that repo.
+      #
+      # NOTE: the leak denylist was already materialized earlier in THIS job
+      # ("Materialize leak denylist from secrets"); RUNNER_TEMP contents and the
+      # LEAK_DENYLIST_DIR GITHUB_ENV export persist across steps within a job, so
+      # a third re-materialization here would be a pure no-op and was removed.
       - name: Run deterministic eval gate (fail-closed)
         id: eval_gate
         # The publish path previously ran only `prepublishOnly`, whose
@@ -1007,12 +1254,12 @@ jobs:
           fi
           EVAL_ROOT="${RUNNER_TEMP}/eval-suite"
           rm -rf "${EVAL_ROOT}"
-          # Sparse, blobless clone of the private eval suite (evals/chariot only).
+          # Sparse, blobless clone of the private eval suite (test/ai-evals only).
           git clone --depth 1 --filter=blob:none --sparse \
-            "https://x-access-token:${EVAL_REPO_TOKEN}@github.com/protectnil/protectnil-agents.git" \
+            "https://x-access-token:${EVAL_REPO_TOKEN}@github.com/protectnil/epic-ai.git" \
             "${EVAL_ROOT}"
-          git -C "${EVAL_ROOT}" sparse-checkout set evals/chariot
-          EVAL_DIR="${EVAL_ROOT}/evals/chariot/test/ai-evals"
+          git -C "${EVAL_ROOT}" sparse-checkout set test/ai-evals
+          EVAL_DIR="${EVAL_ROOT}/test/ai-evals"
           if [ ! -f "${EVAL_DIR}/run-all.mjs" ]; then
             echo "::error::eval runner not found at ${EVAL_DIR}/run-all.mjs — refusing to publish"; exit 1
           fi
@@ -1031,12 +1278,74 @@ jobs:
           printf 'attestation_sha256=%s\n' "${ATTESTATION_SHA256}" >> "${GITHUB_OUTPUT}"
           printf 'attestation_sig=%s\n' "${ATTESTATION_SIG}" >> "${GITHUB_OUTPUT}"
 
+      - name: Stage governed SPLADE artifact for release gate
+        if: steps.check.outputs.already == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SPLADE_DIR="${RUNNER_TEMP}/splade-artifact"
+          SPLADE_REVISION="efcd182bc7eb351e81a9445752d4388c2bab500b"
+          SPLADE_BASE="https://huggingface.co/Qdrant/Splade_PP_en_v1/resolve/${SPLADE_REVISION}"
+          mkdir -p "${SPLADE_DIR}"
+          chmod 700 "${SPLADE_DIR}"
+
+          fetch_and_verify() {
+            local name="$1"
+            local expected_size="$2"
+            local expected_sha256="$3"
+            local destination="${SPLADE_DIR}/${name}"
+            curl --fail --location --retry 4 --retry-all-errors \
+              --output "${destination}.partial" \
+              "${SPLADE_BASE}/${name}?download=true"
+            local actual_size
+            actual_size="$(stat -c '%s' "${destination}.partial")"
+            if [ "${actual_size}" != "${expected_size}" ]; then
+              echo "::error::${name} size mismatch: expected ${expected_size}, got ${actual_size}"
+              exit 1
+            fi
+            printf '%s  %s\n' "${expected_sha256}" "${destination}.partial" | sha256sum -c -
+            mv "${destination}.partial" "${destination}"
+          }
+
+          # CHARIOT-SPEC §5.6 delegates sparse-artifact identity to the
+          # shared SPLADE pin manifest. Keep these five size/hash assertions
+          # byte-for-byte aligned with SPLADE_PINNED_FILES there; a mutable
+          # model name or successful HTTP response is not release evidence.
+          fetch_and_verify model.onnx 532091260 65adbad0d7e1bc882c867d534821d52e60d6f666a91662be3f58457d08d25bf3
+          fetch_and_verify config.json 755 017fde19abff1131c9c747fbd71f8348173409ac6d3d350fd122fd33341ecd85
+          fetch_and_verify special_tokens_map.json 695 5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a
+          fetch_and_verify tokenizer.json 711649 91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854
+          fetch_and_verify tokenizer_config.json 1381 55dc51676b13f29b34f3edfb55092a1947dd24ac3ef0200608a0cc66f1da2628
+
+      - name: Stage ONNX Runtime for SPLADE release gate
+        if: steps.check.outputs.already == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ORT_VERSION="1.24.4"
+          ORT_ROOT="${RUNNER_TEMP}/onnxruntime"
+          ORT_ARCHIVE="${RUNNER_TEMP}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          ORT_MEMBER="onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so.${ORT_VERSION}"
+          mkdir -p "${ORT_ROOT}"
+          curl --fail --location --retry 4 --retry-all-errors \
+            --output "${ORT_ARCHIVE}" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          tar -xzf "${ORT_ARCHIVE}" -C "${ORT_ROOT}" --strip-components=2 "${ORT_MEMBER}"
+          test "$(stat -c '%s' "${ORT_ROOT}/libonnxruntime.so.${ORT_VERSION}")" = 22159232
+          printf '%s  %s\n' \
+            2d518e11c7767f9fdc4413bdbeb45acf30db504ff76a82fc19d9238a3f9f6c24 \
+            "${ORT_ROOT}/libonnxruntime.so.${ORT_VERSION}" | sha256sum -c -
+
       - name: Run prepublish gate
         if: steps.check.outputs.already == 'false'
         env:
           CHARIOT_LICENSE_SIGNING_KEY_PATH: ${{ runner.temp }}/chariot-license.private.pem
           CHARIOT_LICENSE_SIGNING_KID: ${{ secrets.CHARIOT_SIGNING_KID }}
           CHARIOT_DISCOVERY_FIXTURE_DIR: ${{ runner.temp }}/test-fixture
+          CHARIOT_SPLADE_ARTIFACT_DIR: ${{ runner.temp }}/splade-artifact
+          ORT_DYLIB_PATH: ${{ runner.temp }}/onnxruntime/libonnxruntime.so.1.24.4
           NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/.npmrc
           # Tamper-evident proof the deterministic eval gate ran and passed,
           # bound to HEAD + version and hash-verified inside prepublishOnly.
@@ -1059,7 +1368,7 @@ jobs:
         # Prepublish checks already ran once in the dedicated gate step.
         # `--ignore-scripts` prevents npm from invoking prepublishOnly a
         # second time, which would otherwise re-run the stateful test suite.
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         with:
           timeout_minutes: 10
           max_attempts: 3
@@ -1126,6 +1435,12 @@ jobs:
           name: integrity-manifest
           path: manifest-stage
 
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom-stage
+
       - name: Stage release assets
         run: |
           set -euo pipefail
@@ -1135,17 +1450,18 @@ jobs:
           # describes — not the raw build artifacts. This matters when a
           # sibling was already on npm and sign-manifest pulled its bytes
           # back to keep the manifest consistent with the registry.
-          for plat in linux-x64 darwin-x64 darwin-arm64 win32-x64; do
+          for plat in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
             src="canonical-binaries/${plat}.node"
             dst="release-assets/chariot-native-${plat}-v${VERSION}.node"
             cp "${src}" "${dst}"
             sha256sum "${dst}" > "${dst}.sha256"
           done
           cp manifest-stage/integrity.json "release-assets/integrity-v${VERSION}.json"
+          cp sbom-stage/sbom.cdx.json "release-assets/sbom-v${VERSION}.cdx.json"
           ls -la release-assets/
 
       - name: Create or update GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: v${{ needs.validate.outputs.version }}
           name: v${{ needs.validate.outputs.version }}
@@ -1159,7 +1475,134 @@ jobs:
             release-assets/*.node
             release-assets/*.sha256
             release-assets/integrity-*.json
+            release-assets/sbom-*.cdx.json
           fail_on_unmatched_files: true
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 6b. SIGN IMAGE — digest-pinned ECR image seal (CH-54)
+  #
+  # This job is intentionally conditional. It runs only when the release
+  # pipeline has been supplied with the digest of the pushed chariot-gateway
+  # image plus the ECR repository and signer profile ARN. The job resolves the
+  # immutable digest reference via scripts/release.mjs (reusing CH-26) and
+  # signs the exact digest-pinned image ref with Notation / AWS Signer.
+  #
+  # The workflow config stays inert in the current package-only release path;
+  # a real image-push pipeline can reuse it by populating the three secrets.
+  # ─────────────────────────────────────────────────────────────────────
+  sign-image:
+    name: Sign chariot-gateway image
+    needs: [validate, publish-main]
+    # Activation prerequisites (evaluated in the `validate` job's `sign-gate`
+    # step, because the `secrets` context is NOT permitted in a job-level `if:` —
+    # referencing it there makes GitHub reject the whole workflow at trigger time
+    # with "Unrecognized named-value: 'secrets'", killing every release run). The
+    # gate requires all seven signing secrets non-empty: ECR repo + image digest
+    # + signing-profile ARN + the AWS role for OIDC credentials + the aws-signer
+    # notation plugin URL/sha256 + a region (secrets.AWS_REGION != '' guards
+    # against a wrong-region OIDC assume). See validate.outputs.sign_image.
+    if: ${{ needs.validate.outputs.sign_image == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve digest-pinned image reference
+        id: image-ref
+        env:
+          CHARIOT_ECR_IMAGE_REPOSITORY: ${{ secrets.CHARIOT_ECR_IMAGE_REPOSITORY }}
+          CHARIOT_IMAGE_DIGEST: ${{ secrets.CHARIOT_IMAGE_DIGEST }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="$(node scripts/release.mjs --emit-image-ref --repository "${CHARIOT_ECR_IMAGE_REPOSITORY}" --digest "${CHARIOT_IMAGE_DIGEST}")"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image ref: ${IMAGE_REF}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.CHARIOT_SIGNING_AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up notation CLI
+        uses: notaryproject/notation-action/setup@b6fee73110795d6793253c673bd723f12bcf9bbb # v1.2.2
+
+      - name: Install AWS Signer notation plugin
+        env:
+          AWS_SIGNER_PLUGIN_URL: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_URL }}
+          AWS_SIGNER_PLUGIN_SHA256: ${{ secrets.AWS_SIGNER_NOTATION_PLUGIN_SHA256 }}
+        run: |
+          set -euo pipefail
+          # notation-action/setup installs the CLI only. The AWS Signer plugin is
+          # installed from its operator-supplied release binary per the plugin's
+          # documented `--file` path (aws/aws-signer-notation-plugin). URL + sha256
+          # are secrets (no baked artifact); raw `notation sign` is used below.
+          curl -fsSL "$AWS_SIGNER_PLUGIN_URL" -o /tmp/notation-aws-signer-plugin
+          echo "${AWS_SIGNER_PLUGIN_SHA256}  /tmp/notation-aws-signer-plugin" | sha256sum -c -
+          chmod +x /tmp/notation-aws-signer-plugin
+          notation plugin install --file /tmp/notation-aws-signer-plugin
+
+      - name: Sign image with Notation / AWS Signer
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+          CHARIOT_SIGNING_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+        run: |
+          set -euo pipefail
+          # Single source of truth for the notation argv: scripts/image-seal.mjs
+          # (shared with the verify path) via release.mjs --emit-sign-args.
+          mapfile -t SIGN_ARGS < <(node scripts/release.mjs --emit-sign-args \
+            --image-ref "${{ steps.image-ref.outputs.image_ref }}" \
+            --id "${CHARIOT_SIGNING_PROFILE_ARN}" \
+            --aws-region "${AWS_REGION}" \
+            ${AWS_PROFILE:+--aws-profile "${AWS_PROFILE}"})
+          notation "${SIGN_ARGS[@]}"
+
+      - name: Verify image signature with Notation (post-sign)
+        # Fail-closed confirmation that the signature landed in ECR.
+        # An empty-region OIDC session or a plugin mis-install would cause sign
+        # to silently succeed (exit 0) while writing no verifiable signature;
+        # this step catches that by independently verifying via the AWS Signer
+        # plugin before the job exits. Shares the same argv source of truth as
+        # the sign step (scripts/image-seal.mjs via release.mjs --emit-verify-args).
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_PROFILE: ${{ secrets.AWS_PROFILE }}
+          CHARIOT_SIGNING_PROFILE_ARN: ${{ secrets.CHARIOT_SIGNING_PROFILE_ARN }}
+        run: |
+          set -euo pipefail
+          # Configure a notation trust policy that binds verification to the
+          # exact signing profile ARN used above. NOTATION_CONFIG must point to
+          # a directory containing trustpolicy.json; we render it ephemerally so
+          # the ARN is never baked into a static file in the repository.
+          NOTATION_CFG="${RUNNER_TEMP}/notation-cfg"
+          mkdir -p "${NOTATION_CFG}"
+          node -e "
+            const fs = require('fs');
+            const policy = {
+              version: '1.0',
+              trustPolicies: [{
+                name: 'aws-signer-tp',
+                registryScopes: ['*'],
+                signatureVerification: { level: 'strict' },
+                trustStores: ['signingAuthority:aws-signer-ts', 'signingAuthority:aws-us-gov-signer-ts'],
+                trustedIdentities: [process.env.CHARIOT_SIGNING_PROFILE_ARN],
+              }],
+            };
+            fs.writeFileSync(process.env.NOTATION_CFG + '/trustpolicy.json', JSON.stringify(policy, null, 2) + '\n');
+          "
+          export NOTATION_CONFIG="${NOTATION_CFG}"
+          mapfile -t VERIFY_ARGS < <(node scripts/release.mjs --emit-verify-args \
+            --image-ref "${{ steps.image-ref.outputs.image_ref }}" \
+            --aws-region "${AWS_REGION}" \
+            ${AWS_PROFILE:+--aws-profile "${AWS_PROFILE}"})
+          notation "${VERIFY_ARGS[@]}"
 
   # ─────────────────────────────────────────────────────────────────────
   # 7. POST-PUBLISH PROBE — install from npm, exercise customer flow

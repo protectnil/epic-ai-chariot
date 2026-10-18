@@ -40,7 +40,7 @@ export class ExcuseMCPServer extends MCPAdapterBase {
       name: 'excuse',
       displayName: 'Excuse Generator',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'excuse', 'excuses', 'late', 'missed deadline', 'ghosted',
         'funny', 'humor', 'creative writing', 'generator', 'plausible deniability',

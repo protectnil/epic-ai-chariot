@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 .env
 *.log
@@ -7,6 +7,11 @@ dist/
 # Rust build artifacts
 native/target/
 native/*.node
+
+# GAP #11 — chariot-seccomp-wrapper compiled binary (Linux-only artifact,
+# built by scripts/build-seccomp-wrapper.mjs into this flat location, same
+# convention as native/*.node above).
+native/chariot-seccomp-wrapper
 
 # @napi-rs/cli generated JS bindings (built in CI, not committed)
 native/index.js
@@ -61,6 +66,9 @@ docs/*
 # egg: the gate runs the verifier which generates the file which then
 # fails the gate on the next publish attempt).
 scripts/.dep-provenance-last.json
+
+# Offline release inputs; sealed snapshots and model bytes are release assets.
+/artifacts/
 
 # Sensitive internal detection patterns — stored outside the repo;
 # resolved at commit time via the hook's fallback chain.

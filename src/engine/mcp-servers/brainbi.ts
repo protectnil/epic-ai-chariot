@@ -44,7 +44,7 @@ export class BrainBIMCPServer extends MCPAdapterBase {
       name: 'brainbi',
       displayName: 'BrainBI',
       version: '1.0.0',
-      category: 'analytics',
+      category: 'data',
       keywords: [
         'brainbi', 'analytics', 'ecommerce', 'pricing', 'repricing', 'pricing rules',
         'products', 'customers', 'orders', 'order lines', 'seo', 'ranking',

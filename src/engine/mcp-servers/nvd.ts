@@ -30,7 +30,7 @@ export class NvdMCPServer extends MCPAdapterBase {
       name: 'nvd',
       displayName: 'NVD — NIST National Vulnerability Database',
       version: '1.0.0',
-      category: 'security',
+      category: 'cybersecurity',
       keywords: [
         'nvd', 'nist', 'cve', 'vulnerability', 'security', 'cvss',
         'national vulnerability database', 'exploit', 'patch', 'severity',

@@ -17,7 +17,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { decodeProtectedHeader, SignJWT, importPKCS8, jwtVerify, createRemoteJWKSet } from 'jose';
 
 import { getCollection } from '../db.js';
-import { decryptFields } from '../crypto.js';
+import { decryptFields, splitEncryptedIv, VaultUpgradePersistFailedError } from '../crypto.js';
 import { ensureHttps } from '../utils/url.js';
 import type { IdJagIdpClientDocument } from '../types.js';
 
@@ -170,18 +170,53 @@ export const idpClientRegistry: IdpRegistryPort = {
     };
     if (doc.authMethod !== 'private_key_jwt' && doc.clientSecretEncrypted) {
       // The credential-loader encryption uses combined-blob format
-      // {encrypted, iv}; decrypt via the same crypto.ts seam.
-      const [encrypted, iv] = doc.clientSecretEncrypted.split(':');
-      if (encrypted && iv) {
-        const decrypted = decryptFields(encrypted, iv, tenantId);
-        if (typeof decrypted.value === 'string') view.clientSecret = decrypted.value;
+      // {encrypted, iv}; decrypt via the same crypto.ts seam. `split(':')`
+      // is WRONG for a v2-prefixed `encrypted` (its own internal colon) —
+      // see crypto.ts `splitEncryptedIv`.
+      const parts = splitEncryptedIv(doc.clientSecretEncrypted);
+      if (parts) {
+        // CH-10 (§12.2) AAD binding: this row has no adapterId, so use its
+        // own unique-within-tenant identity (issuer) plus a field-scope
+        // suffix — must match registerIdpClient's write-side identifier.
+        const recordId = `${doc.issuer}:client-secret`;
+        const result = await decryptFields(parts.encrypted, parts.iv, tenantId, recordId);
+        if (typeof result.fields.value === 'string') view.clientSecret = result.fields.value;
+        // CH-10 upgrade-on-decrypt (§12.2, rulings item 59, "the caller
+        // MUST persist {encrypted, iv} back to the SAME record, in the
+        // SAME operation"). CAS on the legacy combined blob just read —
+        // a concurrent upgrader's already-written value makes this an
+        // idempotent no-op, never a clobber. A genuine write error is NOT
+        // swallowed; it fails this lookup.
+        if (result.upgraded) {
+          try {
+            await col.updateOne(
+              { tenantId, issuer: idpIssuer, clientSecretEncrypted: doc.clientSecretEncrypted },
+              { $set: { clientSecretEncrypted: `${result.upgraded.encrypted}:${result.upgraded.iv}` } },
+            );
+          } catch (writeBackErr) {
+            throw new VaultUpgradePersistFailedError('id-jag-client', recordId, writeBackErr);
+          }
+        }
       }
     }
     if (doc.authMethod === 'private_key_jwt' && doc.clientPrivateKeyEncrypted) {
-      const [encrypted, iv] = doc.clientPrivateKeyEncrypted.split(':');
-      if (encrypted && iv) {
-        const decrypted = decryptFields(encrypted, iv, tenantId);
-        if (typeof decrypted.value === 'string') view.clientPrivateKey = decrypted.value;
+      const parts = splitEncryptedIv(doc.clientPrivateKeyEncrypted);
+      if (parts) {
+        const recordId = `${doc.issuer}:client-private-key`;
+        const result = await decryptFields(parts.encrypted, parts.iv, tenantId, recordId);
+        if (typeof result.fields.value === 'string') view.clientPrivateKey = result.fields.value;
+        // See the clientSecretEncrypted branch above for the CAS + fail-
+        // hard rationale (CH-10, rulings item 59).
+        if (result.upgraded) {
+          try {
+            await col.updateOne(
+              { tenantId, issuer: idpIssuer, clientPrivateKeyEncrypted: doc.clientPrivateKeyEncrypted },
+              { $set: { clientPrivateKeyEncrypted: `${result.upgraded.encrypted}:${result.upgraded.iv}` } },
+            );
+          } catch (writeBackErr) {
+            throw new VaultUpgradePersistFailedError('id-jag-client', recordId, writeBackErr);
+          }
+        }
       }
     }
     return view;
@@ -727,11 +762,21 @@ export async function registerIdpClient(
     active: true,
   };
   if (input.authMethod !== 'private_key_jwt' && input.clientSecret !== undefined) {
-    const { encrypted, iv } = encryptFields({ value: input.clientSecret }, input.tenantId);
+    // CH-10 (§12.2) AAD binding — must match idpClientRegistry.getIdpClient's
+    // read-side identifier above.
+    const { encrypted, iv } = encryptFields(
+      { value: input.clientSecret },
+      input.tenantId,
+      `${input.issuer}:client-secret`,
+    );
     setFields.clientSecretEncrypted = `${encrypted}:${iv}`;
   }
   if (input.authMethod === 'private_key_jwt' && input.clientPrivateKey !== undefined) {
-    const { encrypted, iv } = encryptFields({ value: input.clientPrivateKey }, input.tenantId);
+    const { encrypted, iv } = encryptFields(
+      { value: input.clientPrivateKey },
+      input.tenantId,
+      `${input.issuer}:client-private-key`,
+    );
     setFields.clientPrivateKeyEncrypted = `${encrypted}:${iv}`;
   }
 

@@ -1,0 +1,98 @@
+# Defaults for the vendored MongoDB subchart. The umbrella chart's `mongodb:`
+# block overrides these. Image ref lives here / in the umbrella values (CH-29).
+enabled: true
+
+image:
+  # AWS Marketplace rewrites this field per region. Empty → global.imageRegistry.
+  registry: ""
+  repository: mongo
+  tag: "8.0.34"
+  digest: "sha256:4a4ab5d4834207389e0d7270fac988e21ffedccecba77991a552f755df229907"
+  pullPolicy: IfNotPresent
+
+auth:
+  enabled: true
+  database: "epicai"
+  username: "chariot"
+  # CH-28 fail-closed: supply via operator Secret (key: mongodb-root-password)…
+  existingSecret: ""
+  # …or inline. Blank / weak / default is REFUSED — never auto-generated.
+  rootPassword: ""
+  password: ""
+
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 20Gi
+
+service:
+  port: 27017
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+nodeSelector:
+  kubernetes.io/arch: amd64   # CH-30 single-arch
+tolerations: []
+affinity: {}
+
+# CH-30 non-root least-privilege. uid/gid 999 = the `mongo` image's mongodb user.
+#
+# runAsUser IS PINNED HERE AND MUST STAY PINNED for the default (EKS-primary,
+# §23.2::1) install. `mongo:7.0.14` does NOT declare a USER: `podman inspect`
+# reports `Config.User` empty and `podman run mongo:7.0.14 id` reports
+# `uid=0(root)`. With `runAsNonRoot: true` and no `runAsUser`, the kubelet has
+# nothing to assert uid != 0 against and admission rejects the pod with
+# "container has runAsNonRoot and image will run as root". The gateway is the
+# opposite case and is safe to leave unset -- its own Dockerfile:152 declares
+# `USER 1000:1000` numerically. Do not "harmonize" the three workloads without
+# re-inspecting the images; they are not alike.
+#
+# For OpenShift, use values-openshift.yaml, which unsets all three fields. There
+# the `restricted-v2` SCC MUTATES the pod with a UID from the namespace's
+# `openshift.io/sa.scc.uid-range` before validating, so runAsNonRoot is satisfied
+# by the injected value and no `nonroot-v2` / `anyuid` grant is needed. That is
+# safe for this container because every path mongod writes is a MOUNTED VOLUME --
+# /data/db (the `data` PVC) and /tmp (an emptyDir), templates/statefulset.yaml:47-51
+# -- and Kubernetes applies fsGroup ownership to both, so whatever supplemental
+# group the SCC allocates can write them. Nothing is written to an image-owned
+# directory.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  allowPrivilegeEscalation: false
+  # mongod manages its own data dir / sockets; root FS stays writable for it but
+  # all other hardening (non-root, dropped caps, no priv-escalation) applies.
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+# Propagated from the umbrella (CH-29 registry override).
+global:
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# CH-30 arbitrary-UID compatibility. Set true ONLY on OpenShift (or any platform
+# whose admission allocates the UID itself). When true the templates OMIT
+# runAsUser/runAsGroup/fsGroup so the restricted-v2 SCC can allocate them from the
+# namespace range; runAsNonRoot is then satisfied by the injected UID. It MUST stay
+# false on vanilla Kubernetes: this is a Docker Official image that declares no
+# USER and runs as root (verified -- `podman inspect` reports Config.User empty and
+# `podman run <image> id` reports uid=0), so with the fields absent the kubelet has
+# nothing to assert uid != 0 against and admission rejects the pod. The umbrella's
+# values-openshift.yaml flips this.
+openshift:
+  arbitraryUid: false

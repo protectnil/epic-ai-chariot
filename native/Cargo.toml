@@ -1,12 +1,23 @@
 [package]
 name = "chariot-native"
-version = "1.0.0"
+version = "4.0.0"
 edition = "2021"
 license = "Elastic-2.0"
 description = "Epic AI® Chariot — compiled enterprise module (IAM enforcement, credential vault, license validation, internal API discovery)"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+# GAP #11 — seccomp-bpf + no_new_privs confinement wrapper for spawned
+# adapter child processes on the npx self-hosted path (no pod there, so the
+# helm NetworkPolicy/PSA controls don't apply). See
+# native/src/bin/seccomp_wrapper.rs and
+# src/engine/federation/sandbox/ProcessSandbox.ts. Linux/x86_64 only; a
+# separate, dependency-light binary target (libc only) so it builds fast and
+# does NOT pull in the heavy onnx/qdrant-edge lib dependency graph.
+name = "chariot-seccomp-wrapper"
+path = "src/bin/seccomp_wrapper.rs"
 
 [dependencies]
 napi = { version = "2", features = ["napi9", "serde-json"] }
@@ -21,16 +32,69 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 rand = "0.9"
 
+# CH-23 BIEN canonical serializer — NFC normalization. The Python build froze
+# the conformance corpus against UCD 15.0.0 (PORTING.md §2). qdrant-edge's
+# transitive `charabia` requires unicode-normalization ^0.1.24, so the tree
+# cannot resolve a UCD-15.0 build. 0.1.25 ships UCD **17.0.0** tables
+# (`unicode_normalization::UNICODE_VERSION == (17, 0, 0)`). Single-codepoint
+# NFC is stable across UCD versions, but sequences containing codepoints
+# assigned AFTER 15.0 (e.g. U+0897, U+1ACF..U+1ADB combining marks) canonical-
+# reorder here and not in Python — a known, accepted residual divergence
+# surface documented in bien_serializer.rs. The version is pinned EXACTLY so
+# any future table bump is a deliberate, reviewed change, and two fail-closed
+# gates break the build on drift: the vendored-corpus byte-equality test
+# (tests/serializer_conformance.rs) and the UNICODE_VERSION + reordering
+# sentinel tests in bien_serializer.rs.
+unicode-normalization = "=0.1.25"
+
+# Phase 3 — embedded vector runtime (CHARIOT §2.2/§4.3/§8.6). In-process
+# Qdrant Edge shard (no server, no port). Pinned to 0.7.2 (Apache-2.0);
+# checksum is verified against the vendored build artifact at release time.
+qdrant-edge = "=0.7.2"
+
+# Phase 3 — in-process dense encoder (CHARIOT §8.6 step 2). fastembed-rs with
+# default features OFF: no HuggingFace-hub download path is compiled (air-gap,
+# CH-29/CH-30) and ONNX Runtime is loaded dynamically at runtime
+# (`ort/load-dynamic` — the container ships libonnxruntime; no build-time
+# binary download). The BIEN 768-d model is loaded from bytes via
+# `try_new_from_user_defined`.
+fastembed = { version = "=5.17.2", default-features = false, features = ["ort-load-dynamic"] }
+
+# Phase 3.2 (SPLADE — option (b) selected) — drive
+# Splade_PP_en_v1 directly through ort + tokenizers, the SAME crates fastembed
+# already links transitively. Versions/features are pinned to match fastembed's
+# resolution so Cargo unifies to a single compiled crate each — ZERO new crates
+# in the dependency tree, and byte-identical tokenization/inference vs a
+# fastembed-based publisher (lockstep contract). ort uses load-dynamic (no
+# build-time onnxruntime download); tokenizers uses the onig backend (matches
+# fastembed) so pre-tokenization is identical.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["ndarray", "std", "api-24", "load-dynamic"] }
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
+
 # Internal API discovery
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 regex = "1"
 walkdir = "2"
 glob = "0.3"
 
+# GAP #11 — chariot-seccomp-wrapper bin target only. Raw prctl/sock_filter
+# bindings for hand-rolled seccomp-bpf installation (see
+# src/bin/seccomp_wrapper.rs). Already resolved elsewhere in this dependency
+# graph (napi -> libc), so pinning it directly here adds no new version to
+# the lockfile.
+libc = "0.2"
+
 [build-dependencies]
 napi-build = "2"
 
 [profile.release]
-lto = true
+# ThinLTO (not fat `lto = true`): once the embedded vector stack (qdrant-edge +
+# fastembed/ort/tokenizers/onig) is linked in, fat LTO's whole-program merge
+# exhausts memory and the linker is OOM-killed on a 16 GB host. ThinLTO keeps
+# nearly all the cross-crate optimization with a fraction of the peak link
+# memory. `opt-level = "z"` (size) is retained — the dominant size cost is the
+# qdrant-edge/ort object code, not our code, so keep optimizing for size.
+lto = "thin"
 strip = "symbols"
 opt-level = "z"
+codegen-units = 16

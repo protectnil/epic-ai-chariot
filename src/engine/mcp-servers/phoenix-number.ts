@@ -41,7 +41,7 @@ export class PhoenixNumberMCPServer extends MCPAdapterBase {
       name: 'phoenix-number',
       displayName: 'Phoenix Number API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'phoenix', 'phoenix number', 'random number', 'temperature', 'arizona',
         'stupidapis', 'random', 'novelty',

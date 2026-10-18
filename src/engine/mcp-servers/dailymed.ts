@@ -28,7 +28,7 @@ export class DailyMedMCPServer extends MCPAdapterBase {
       name: 'dailymed',
       displayName: 'DailyMed',
       version: '1.0.0',
-      category: 'health',
+      category: 'healthcare',
       keywords: [
         'dailymed', 'fda', 'drug', 'drugs', 'medication', 'medications',
         'spl', 'structured product label', 'nlm', 'pharmacology',

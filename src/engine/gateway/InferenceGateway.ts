@@ -16,6 +16,7 @@ import type { Router } from './Router.js';
 import { OllamaShim } from './OllamaShim.js';
 import type { GatewayConfig } from './types.js';
 import { DEFAULT_GATEWAY_CONFIG } from './types.js';
+import type { ObservabilityInfoSink } from '../types/index.js';
 
 // ---------------------------------------------------------------------------
 // Token-bucket rate limiter (per client IP, in-process)
@@ -29,9 +30,20 @@ interface TokenBucket {
 class RateLimiter {
   private readonly buckets = new Map<string, TokenBucket>();
   private readonly limitPerMinute: number;
+  private readonly emitter?: ObservabilityInfoSink;
 
-  constructor(limitPerMinute: number) {
+  /**
+   * CHARIOT::§8.12::1 (W34-4b) — a SEPARATE, file-local resilience
+   * mechanism from `src/engine/resilience/RateLimiter.ts` (different
+   * subsystem: this one gates the Inference Gateway's per-client-IP HTTP
+   * request rate, not per-server adapter dispatch — different shape too,
+   * `allow(clientIp)` only, no penalize()/waitForAllowance()). Wired with
+   * the SAME optional-emitter, default-disabled convention as the other
+   * resilience-layer instance.
+   */
+  constructor(limitPerMinute: number, emitter?: ObservabilityInfoSink) {
     this.limitPerMinute = limitPerMinute;
+    this.emitter = emitter;
   }
 
   /** Returns true if the request is allowed, false if rate-limited. */
@@ -54,6 +66,8 @@ class RateLimiter {
       bucket.tokens -= 1;
       return true;
     }
+    // CHARIOT::§8.12::1 emit site — gateway-layer request rejected.
+    this.emitter?.info('gateway_rate_limit_exceeded', { clientIp }, 'resilience');
     return false;
   }
 }
@@ -73,10 +87,19 @@ export class InferenceGateway {
     private readonly controlPlane: ControlPlane,
     private readonly router: Router,
     config?: Partial<GatewayConfig>,
+    // CHARIOT::§8.12::1 (W34-4b) — optional, additive 5th constructor
+    // param; not threaded from any live caller today (both call sites —
+    // OrchestratorProvider.ts's module-singleton getOllamaGateway() and
+    // bin/gateway.ts's standalone CLI — construct with 4 args; see the
+    // W34-4b build report for why threading further was judged
+    // disproportionate: it would require a GatewayConfig/OrchestratorConfig
+    // schema change plus re-keying the singleton, which is currently keyed
+    // by baseUrl alone).
+    emitter?: ObservabilityInfoSink,
   ) {
     this.config = { ...DEFAULT_GATEWAY_CONFIG, ...config };
     this.ollamaShim = new OllamaShim(this.config.ollamaShim);
-    this.rateLimiter = new RateLimiter(this.config.rateLimitPerMinute);
+    this.rateLimiter = new RateLimiter(this.config.rateLimitPerMinute, emitter);
   }
 
   // ---------------------------------------------------------------------------

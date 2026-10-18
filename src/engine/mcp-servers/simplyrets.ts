@@ -45,7 +45,7 @@ export class SimplyRetsMCPServer extends MCPAdapterBase {
       name: 'simplyrets',
       displayName: 'SimplyRETS',
       version: '1.0.0',
-      category: 'realestate',
+      category: 'real-estate',
       keywords: [
         'simplyrets', 'mls', 'real-estate', 'listings', 'properties',
         'openhouses', 'rets', 'residential', 'rental', 'realty',

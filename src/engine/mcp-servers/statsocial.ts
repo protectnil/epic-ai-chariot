@@ -292,7 +292,7 @@ export class StatSocialMCPServer extends MCPAdapterBase {
       name: 'statsocial',
       displayName: 'StatSocial',
       version: '1.0.0',
-      category: 'analytics' as const,
+      category: 'data' as const,
       keywords: ['statsocial', 'analytics', 'audience', 'social', 'twitter', 'demographics', 'affinity', 'report', 'influencer'],
       toolNames: ['get_application_status', 'get_report', 'get_report_dates', 'get_report_status', 'create_custom_report', 'create_tweet_report', 'create_twitter_report'],
       description: 'StatSocial audience analytics platform: generate and retrieve demographic, affinity, and social audience reports from Twitter/X data.',

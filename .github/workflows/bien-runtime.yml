@@ -1,0 +1,59 @@
+name: BIEN runtime parity
+
+on:
+  pull_request:
+    paths:
+      - 'native/**'
+      - 'src/engine/retrieval/**'
+      - 'src/engine/eval/GateMetrics.ts'
+      - 'test/retrieval-hybrid.mjs'
+      - 'test/gc-gate-metrics.mjs'
+      - '.github/workflows/bien-runtime.yml'
+  push:
+    # `master` is this repo's default branch (`origin/HEAD -> origin/master`)
+    # and no `main` branch exists on origin, so the previous `[main]` filter
+    # meant this workflow's push trigger never fired once. Matches the
+    # `[main, master]` pattern leak-pattern-check.yml already uses.
+    branches: [main, master]
+    paths:
+      - 'native/**'
+      - 'src/engine/retrieval/**'
+      - 'src/engine/eval/GateMetrics.ts'
+      - 'test/retrieval-hybrid.mjs'
+      - 'test/gc-gate-metrics.mjs'
+      - '.github/workflows/bien-runtime.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Resolve sibling versions into lock
+        # npm/cli#8320 + napi-rs/napi-rs#3174: the four platform-specific
+        # @epicai/chariot-bin-* optionalDependencies resolve in
+        # package-lock.json to whatever version the lock was last generated
+        # against, so a bare `npm ci` fails strict-check when package.json
+        # has moved on (observed: lock 3.1.1 vs package.json 3.1.2 —
+        # "Invalid: lock file's @epicai/chariot-bin-darwin-arm64@3.1.1 does
+        # not satisfy ...@3.1.2"). strict-check runs BEFORE the install phase
+        # decides what to skip, so `--omit=optional` alone cannot bypass it.
+        # `npm install --package-lock-only --include=optional` resolves all
+        # four siblings into the lock without touching node_modules; the
+        # subsequent `npm ci` then satisfies strict-check. Mirrors the
+        # identical, proven step in release.yml.
+        run: npm install --package-lock-only --include=optional --no-audit --no-fund
+      - name: Install dependencies
+        # --omit=optional: the four platform-sibling optionalDependencies are
+        # end-user binaries; this parity job builds the native crate from
+        # source via cargo and never needs them.
+        run: npm ci --omit=optional
+      - run: npm run typecheck
+      - run: cargo test --locked --manifest-path native/Cargo.toml

@@ -47,7 +47,7 @@ export class XkcdMCPServer extends MCPAdapterBase {
       name: 'xkcd',
       displayName: 'XKCD Comics',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'xkcd', 'comic', 'comics', 'webcomic', 'humor', 'geek', 'tech humor',
         'randall munroe', 'stick figure', 'science', 'math', 'random comic',

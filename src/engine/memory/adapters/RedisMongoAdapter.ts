@@ -99,13 +99,14 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
     this.connected = true;
   }
 
-  async save(userId: string, entry: MemoryEntry, actor?: MemoryActor): Promise<StoredMemory> {
+  async save(tenantId: string, userId: string, entry: MemoryEntry, actor?: MemoryActor): Promise<StoredMemory> {
     await this.ensureConnected();
 
  // Actor capability check (parity with InMemoryStore)
     let effectiveImportance: MemoryImportance = entry.importance;
     if (effectiveImportance === 'high' && !canSetHighImportance(actor)) {
       log.warn('importance downgrade: actor lacks memory:high capability', {
+        tenantId,
         userId,
         from: 'high',
         to: 'medium',
@@ -113,9 +114,12 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
       effectiveImportance = 'medium';
     }
 
- // Per-scope high-importance cap (parity with InMemoryStore)
+ // Per-scope high-importance cap (parity with InMemoryStore).
+ // §8.5::1 — the scope is (tenantId, userId); a userId-only count would
+ // charge one tenant's cap against another tenant's entries.
     if (effectiveImportance === 'high') {
       const highCount = await this.collection().countDocuments({
+        tenantId,
         userId,
         isDeleted: false,
         importance: 'high',
@@ -123,11 +127,12 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
       if (highCount >= this.maxHighImportancePerScope) {
         const err = Object.assign(
           new Error(
-            `[RedisMongoAdapter] high-importance cap exceeded: scope "${userId}" already holds ` +
+            `[RedisMongoAdapter] high-importance cap exceeded: scope "${tenantId}/${userId}" already holds ` +
             `${highCount} high-importance entries (cap: ${this.maxHighImportancePerScope})`,
           ),
           {
             code: CHARIOT_ERROR_CODES.HIGH_IMPORTANCE_CAP_EXCEEDED as ChariotErrorCode,
+            tenantId,
             userId,
             cap: this.maxHighImportancePerScope,
           },
@@ -140,6 +145,7 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
       ...entry,
       importance: effectiveImportance,
       id: randomUUID(),
+      tenantId,
       userId,
       createdAt: new Date(),
       accessCount: 0,
@@ -148,18 +154,18 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
     };
 
     await this.collection().insertOne(memory);
-    await this.invalidateCache(userId);
+    await this.invalidateCache(tenantId, userId);
     return memory;
   }
 
-  async recall(userId: string, options: RecallOptions): Promise<StoredMemory[]> {
+  async recall(tenantId: string, userId: string, options: RecallOptions): Promise<StoredMemory[]> {
     await this.ensureConnected();
 
-    const cacheKey = this.cacheKey(userId, options);
+    const cacheKey = this.cacheKey(tenantId, userId, options);
     const cached = await this.getCache(cacheKey);
     if (cached) return cached;
 
-    const filter: Record<string, unknown> = { userId, isDeleted: false };
+    const filter: Record<string, unknown> = { tenantId, userId, isDeleted: false };
     if (options.type) filter['type'] = options.type;
     if (options.importance) filter['importance'] = options.importance;
     if (options.since) filter['createdAt'] = { $gte: options.since };
@@ -176,15 +182,15 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
 
  // recall() is now read-only. Access tracking must go through
     // recordAccess() and importance promotion through promoteImportance().
-    await this.setCache(cacheKey, results);
+    await this.setCache(cacheKey, results, tenantId);
     return results;
   }
 
-  async context(userId: string): Promise<ContextSummary> {
+  async context(tenantId: string, userId: string): Promise<ContextSummary> {
     await this.ensureConnected();
 
     const memories: StoredMemory[] = await this.collection()
-      .find({ userId, isDeleted: false })
+      .find({ tenantId, userId, isDeleted: false })
       .toArray();
 
     const memoryTypes = new Map<string, number>();
@@ -205,32 +211,46 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
     return { totalMemories: memories.length, memoryTypes, lastInteraction, importantMemories, oldestMemory, newestMemory };
   }
 
-  async delete(userId: string, memoryId: string): Promise<void> {
+  async delete(tenantId: string, userId: string, memoryId: string): Promise<boolean> {
     await this.ensureConnected();
-    await this.collection().updateOne({ id: memoryId, userId }, { $set: { isDeleted: true, deletedAt: new Date() } });
-    await this.invalidateCache(userId);
+    // Only match live (non-deleted) entries so a bogus id or an
+    // already-deleted id truthfully reports no-op, per CH-31
+    // (CHARIOT::§23.2::44-45; ::134 names `forget` as a covered surface).
+    // CHARIOT::§8.5::1 — tenantId is part of the match so one tenant can never
+    // soft-delete another tenant's row by guessing/reusing a memoryId.
+    const result = await this.collection().updateOne(
+      { id: memoryId, tenantId, userId, isDeleted: false },
+      { $set: { isDeleted: true, deletedAt: new Date() } },
+    );
+    const deleted = result.modifiedCount > 0;
+    if (deleted) {
+      await this.invalidateCache(tenantId, userId);
+    }
+    return deleted;
   }
 
   /**
    * Increment accessCount for the given memoryId in MongoDB.
  * explicit access tracking mutator — recall() must not call this.
    */
-  async recordAccess(memoryId: string): Promise<void> {
+  async recordAccess(tenantId: string, memoryId: string): Promise<void> {
     await this.ensureConnected();
     // Fetch the owning userId before the write so we can invalidate the
-    // correct per-user cache slice after the Mongo update commits.
+    // correct per-scope cache slice after the Mongo update commits.
+    // §8.5::1 — both the read and the write are tenant-scoped, so a memoryId
+    // from one tenant cannot bump access metadata on another tenant's row.
     const entry = await this.collection().findOne(
-      { id: memoryId, isDeleted: false },
-      { projection: { userId: 1 } },
+      { id: memoryId, tenantId, isDeleted: false },
+      { projection: { tenantId: 1, userId: 1 } },
     );
     await this.collection().updateOne(
-      { id: memoryId, isDeleted: false },
+      { id: memoryId, tenantId, isDeleted: false },
       { $inc: { accessCount: 1 }, $set: { lastAccessed: new Date() } },
     );
- // cache invalidation: after mutating accessCount the per-user
+ // cache invalidation: after mutating accessCount the per-scope
     // recall cache must be dropped so the next recall() returns fresh data.
     if (entry?.userId) {
-      await this.invalidateCache(entry.userId as string);
+      await this.invalidateCache(tenantId, entry.userId as string);
     }
   }
 
@@ -242,17 +262,18 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
    * If the scope is already at capacity for high-importance entries, rejects with
    * { code: 'HIGH_IMPORTANCE_CAP_EXCEEDED' }.
    */
-  async promoteImportance(memoryId: string, newImportance: MemoryImportance): Promise<void> {
+  async promoteImportance(tenantId: string, memoryId: string, newImportance: MemoryImportance): Promise<void> {
     await this.ensureConnected();
 
-    // Get the current entry to check its scope (userId)
-    const entry = await this.collection().findOne({ id: memoryId, isDeleted: false });
-    if (!entry) return; // No-op if entry not found or is deleted
+    // Get the current entry to check its scope. §8.5::1 — tenant-scoped read.
+    const entry = await this.collection().findOne({ id: memoryId, tenantId, isDeleted: false });
+    if (!entry) return; // No-op if entry not found, is deleted, or is another tenant's
 
     // If promoting to 'high' and entry is not already high, check cap
     if (newImportance === 'high' && entry.importance !== 'high') {
       const userId = entry.userId;
       const highCount = await this.collection().countDocuments({
+        tenantId,
         userId,
         isDeleted: false,
         importance: 'high',
@@ -261,11 +282,12 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
         const err = Object.assign(
           new Error(
             `[RedisMongoAdapter] high-importance cap exceeded: ` +
-            `scope "${userId}" already holds ${highCount} high-importance entries ` +
+            `scope "${tenantId}/${userId}" already holds ${highCount} high-importance entries ` +
             `(cap: ${this.maxHighImportancePerScope})`,
           ),
           {
             code: CHARIOT_ERROR_CODES.HIGH_IMPORTANCE_CAP_EXCEEDED as ChariotErrorCode,
+            tenantId,
             userId,
             cap: this.maxHighImportancePerScope,
           },
@@ -275,24 +297,24 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
     }
 
     await this.collection().updateOne(
-      { id: memoryId, isDeleted: false },
+      { id: memoryId, tenantId, isDeleted: false },
       { $set: { importance: newImportance } },
     );
- // cache invalidation: after mutating importance the per-user
+ // cache invalidation: after mutating importance the per-scope
     // recall cache must be dropped so the next recall() returns fresh data.
     if (entry?.userId) {
-      await this.invalidateCache(entry.userId as string);
+      await this.invalidateCache(tenantId, entry.userId as string);
     }
   }
 
   /**
-   * Return capacity metrics for a userId scope.
+   * Return capacity metrics for a (tenantId, userId) scope.
    * MongoDB has no fixed cap — entries and cap are reported as live counts
    * and Infinity respectively. nearCap is always false.
    */
-  async getCapacityStatus(userId: string): Promise<CapacityStatus> {
+  async getCapacityStatus(tenantId: string, userId: string): Promise<CapacityStatus> {
     await this.ensureConnected();
-    const entries = await this.collection().countDocuments({ userId, isDeleted: false });
+    const entries = await this.collection().countDocuments({ tenantId, userId, isDeleted: false });
     return { entries, cap: Infinity, nearCap: false };
   }
 
@@ -311,8 +333,12 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
     return this.db.collection<StoredMemory>(this.collectionName);
   }
 
-  private cacheKey(userId: string, options: RecallOptions): string {
-    return `${this.keyPrefix}${userId}:${JSON.stringify(options)}`;
+  /**
+   * §8.5::1 — the recall cache key is scoped by tenant AND user. A userId-only
+   * key let two tenants sharing a userId serve each other's cached rows.
+   */
+  private cacheKey(tenantId: string, userId: string, options: RecallOptions): string {
+    return `${this.keyPrefix}mem:${tenantId}:${userId}:${JSON.stringify(options)}`;
   }
 
   private async getCache(key: string): Promise<StoredMemory[] | null> {
@@ -323,37 +349,38 @@ export class RedisMongoAdapter implements MemoryStoreAdapter {
     } catch { return null; }
   }
 
-  private async setCache(key: string, data: StoredMemory[]): Promise<void> {
+  private async setCache(key: string, data: StoredMemory[], tenantId: string): Promise<void> {
     if (!this.redis) return;
     try {
       await this.redis.set(key, JSON.stringify(data), { EX: this.cacheTTL });
-      // Track the key in a per-user set so we can invalidate without KEYS scan
-      const userId = this.userIdFromKey(key);
-      if (userId) {
-        const setKey = `${this.keyPrefix}keys:${userId}`;
-        await this.redis.sAdd(setKey, key);
-        await this.redis.expire(setKey, this.cacheTTL * 2);
-      }
-    } catch { /* non-fatal */ }
-  }
-
-  private async invalidateCache(userId: string): Promise<void> {
-    if (!this.redis) return;
-    try {
-      // Use the per-user tracking set instead of KEYS scan
-      const setKey = `${this.keyPrefix}keys:${userId}`;
-      const keys: string[] = await this.redis.sMembers(setKey);
-      if (keys.length > 0) await this.redis.del(keys);
-      await this.redis.del(setKey);
+      // §8.5::1 — track the key in a PER-TENANT set (`mem:keys:{tenantId}`, with
+      // the configured keyPrefix) so invalidation never needs a KEYS scan and
+      // never spans tenants. The tenant is passed in rather than parsed back out
+      // of the key, so the tracking set cannot drift from the key that was set.
+      const setKey = `${this.keyPrefix}mem:keys:${tenantId}`;
+      await this.redis.sAdd(setKey, key);
+      await this.redis.expire(setKey, this.cacheTTL * 2);
     } catch { /* non-fatal */ }
   }
 
   /**
-   * Extract userId from a cache key of the form `{keyPrefix}{userId}:{options}`.
+   * §8.5::1 — invalidate only the (tenantId, userId) slice. The tracking set is
+   * per-tenant, so members are filtered down to this user's key prefix before
+   * deletion: invalidating one user MUST NOT flush another user's cache, and
+   * MUST NOT touch any other tenant at all. Deleted members are removed from
+   * the set so it cannot grow unbounded with dead keys.
    */
-  private userIdFromKey(key: string): string | null {
-    const withoutPrefix = key.slice(this.keyPrefix.length);
-    const colonIdx = withoutPrefix.indexOf(':');
-    return colonIdx !== -1 ? withoutPrefix.slice(0, colonIdx) : null;
+  private async invalidateCache(tenantId: string, userId: string): Promise<void> {
+    if (!this.redis) return;
+    try {
+      const setKey = `${this.keyPrefix}mem:keys:${tenantId}`;
+      const keys: string[] = await this.redis.sMembers(setKey);
+      const scopedPrefix = `${this.keyPrefix}mem:${tenantId}:${userId}:`;
+      const scopedKeys = keys.filter(k => k.startsWith(scopedPrefix));
+      if (scopedKeys.length > 0) {
+        await this.redis.del(scopedKeys);
+        await this.redis.sRem(setKey, scopedKeys);
+      }
+    } catch { /* non-fatal */ }
   }
 }

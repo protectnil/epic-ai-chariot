@@ -41,7 +41,7 @@ export class IPInfoMCPServer extends MCPAdapterBase {
       name: 'ipinfo',
       displayName: 'IPInfo',
       version: '1.0.0',
-      category: 'networking',
+      category: 'devops',
       keywords: [
         'ipinfo', 'ip', 'geolocation', 'ip address', 'ip lookup',
         'network', 'geo', 'location', 'city', 'country', 'region',

@@ -35,7 +35,13 @@ import { scimAuthMiddleware } from '../middleware.js';
 import { getCollection } from '../db.js';
 import * as audit from '../services/audit.js';
 import { revokeAllUserSessions, revokeAllUserRefreshTokens } from '../services/session.js';
+import { revokeUserAdapterCredentials } from '../services/scim.js';
 import type { EnterpriseUserDocument, EnterpriseGroupDocument } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
+import { chariotEmitter } from '../../observability/emitter.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.scim-routes');
 
 const router = Router({ mergeParams: true });
 
@@ -249,7 +255,7 @@ router.get('/Users', async (req: Request, res: Response): Promise<void> => {
     });
   } catch (err) {
      
-    console.error('[iam/scim] list users failed', err);
+    moduleLog.error('[iam/scim] list users failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to list users');
   }
 });
@@ -311,7 +317,7 @@ router.post('/Users', async (req: Request, res: Response): Promise<void> => {
     res.status(201).json(toScimUser(created, getBaseUrl(req)));
   } catch (err) {
      
-    console.error('[iam/scim] create user failed', err);
+    moduleLog.error('[iam/scim] create user failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to create user');
   }
 });
@@ -339,7 +345,7 @@ router.get('/Users/:id', async (req: Request, res: Response): Promise<void> => {
     res.json(toScimUser(doc, getBaseUrl(req)));
   } catch (err) {
      
-    console.error('[iam/scim] get user failed', err);
+    moduleLog.error('[iam/scim] get user failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to get user');
   }
 });
@@ -405,7 +411,7 @@ router.put('/Users/:id', async (req: Request, res: Response): Promise<void> => {
     res.json(toScimUser(result, getBaseUrl(req)));
   } catch (err) {
      
-    console.error('[iam/scim] replace user failed', err);
+    moduleLog.error('[iam/scim] replace user failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to replace user');
   }
 });
@@ -464,11 +470,18 @@ router.patch('/Users/:id', async (req: Request, res: Response): Promise<void> =>
             const a = toActive(val.active);
             if (a !== undefined) setFields.active = a;
           }
-          if ('userName' in val) {
+          // Type-guard the string fields, mirroring the path-branch above
+          // (op.path === 'userName' && typeof op.value === 'string'). Without
+          // this, a payload like { value: { userName: 42 } } writes a non-string
+          // into the unique-indexed email field and silently corrupts the
+          // identity key (subsequent string-keyed login/JIT lookups never match).
+          if ('userName' in val && typeof val.userName === 'string') {
             setFields.email = val.userName;
             setFields.userName = val.userName;
           }
-          if ('displayName' in val) setFields.displayName = val.displayName;
+          if ('displayName' in val && typeof val.displayName === 'string') {
+            setFields.displayName = val.displayName;
+          }
         }
       } else if (op.op === 'remove') {
         // SCIM PATCH `remove` removes the named attribute. For
@@ -479,6 +492,18 @@ router.patch('/Users/:id', async (req: Request, res: Response): Promise<void> =>
           setFields.active = false;
         }
       }
+    }
+
+    // When deactivating, capture the CURRENT email BEFORE the update so that a
+    // rename-and-deactivate in the same PATCH still revokes adapter credentials
+    // keyed on the PRIOR email (§10.4::4) — result.email below is the new one.
+    let priorEmail: string | undefined;
+    if (setFields.active === false) {
+      const prior = await collection.findOne(
+        { _id: objectId, tenantId },
+        { projection: { email: 1 } },
+      );
+      priorEmail = typeof prior?.email === 'string' ? prior.email : undefined;
     }
 
     const result = await collection.findOneAndUpdate(
@@ -496,8 +521,16 @@ router.patch('/Users/:id', async (req: Request, res: Response): Promise<void> =>
     // Refresh tokens survive access-token revocation otherwise, allowing
     // a deprovisioned user to mint a new session via /refresh.
     if (setFields.active === false) {
-      await revokeAllUserSessions(tenantId, id);
+      // §10.4 deprovisioning. ::3 sessions invalidated (revokeAllUserSessions
+      // bumps the per-user epoch); ::4 refresh tokens AND all adapter OAuth
+      // credentials revoked; ::6 emit user_deactivated plus one
+      // session_force_revoked per session actually revoked.
+      const revokedJtis = await revokeAllUserSessions(tenantId, id);
       await revokeAllUserRefreshTokens(tenantId, id);
+      const emails = [result.email, priorEmail].filter(
+        (e): e is string => typeof e === 'string' && e.length > 0,
+      );
+      await revokeUserAdapterCredentials(tenantId, id, emails);
 
       await audit.log(tenantId, 'user_deactivated', {
         actorId: 'scim',
@@ -507,6 +540,17 @@ router.patch('/Users/:id', async (req: Request, res: Response): Promise<void> =>
         ip: req.ip ?? 'unknown',
         userAgent: req.headers['user-agent'] ?? 'unknown',
       });
+      for (const jti of revokedJtis) {
+        await audit.log(tenantId, 'session_force_revoked', {
+          actorId: 'scim',
+          actorEmail: 'scim',
+          targetType: 'user',
+          targetId: id,
+          detail: { sessionJti: jti },
+          ip: req.ip ?? 'unknown',
+          userAgent: req.headers['user-agent'] ?? 'unknown',
+        });
+      }
     } else {
       await audit.log(tenantId, 'user_updated', {
         actorId: 'scim',
@@ -522,7 +566,7 @@ router.patch('/Users/:id', async (req: Request, res: Response): Promise<void> =>
     res.json(toScimUser(result, getBaseUrl(req)));
   } catch (err) {
      
-    console.error('[iam/scim] patch user failed', err);
+    moduleLog.error('[iam/scim] patch user failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to patch user');
   }
 });
@@ -558,18 +602,8 @@ router.delete('/Users/:id', async (req: Request, res: Response): Promise<void> =
     await revokeAllUserSessions(tenantId, id);
     await revokeAllUserRefreshTokens(tenantId, id);
 
-    // revoke adapter credentials by BOTH userId and email.
-    {
-      const credCol = await getCollection<{ tenantId: string; connectedBy: string; status: string; revokedAt?: Date; revokedBy?: string }>(
-        'iam_adapter_credentials',
-      );
-      const orClauses: Record<string, unknown>[] = [{ connectedBy: id }];
-      if (userEmail) orClauses.push({ connectedBy: userEmail });
-      await credCol.updateMany(
-        { tenantId, status: 'active', $or: orClauses },
-        { $set: { status: 'revoked', revokedAt: new Date(), revokedBy: 'scim' } },
-      );
-    }
+    // Revoke adapter credentials by BOTH userId and email (§10.4::4).
+    await revokeUserAdapterCredentials(tenantId, id, userEmail ? [userEmail] : []);
 
     await audit.log(tenantId, 'user_deleted', {
       actorId: 'scim',
@@ -583,7 +617,7 @@ router.delete('/Users/:id', async (req: Request, res: Response): Promise<void> =
     res.status(204).send();
   } catch (err) {
      
-    console.error('[iam/scim] delete user failed', err);
+    moduleLog.error('[iam/scim] delete user failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to delete user');
   }
 });
@@ -631,7 +665,7 @@ router.get('/Groups', async (req: Request, res: Response): Promise<void> => {
     });
   } catch (err) {
      
-    console.error('[iam/scim] list groups failed', err);
+    moduleLog.error('[iam/scim] list groups failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to list groups');
   }
 });
@@ -680,7 +714,7 @@ router.post('/Groups', async (req: Request, res: Response): Promise<void> => {
     res.status(201).json(toScimGroup(created, getBaseUrl(req)));
   } catch (err) {
      
-    console.error('[iam/scim] create group failed', err);
+    moduleLog.error('[iam/scim] create group failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to create group');
   }
 });
@@ -708,7 +742,7 @@ router.get('/Groups/:id', async (req: Request, res: Response): Promise<void> => 
     res.json(toScimGroup(doc, getBaseUrl(req)));
   } catch (err) {
      
-    console.error('[iam/scim] get group failed', err);
+    moduleLog.error('[iam/scim] get group failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to get group');
   }
 });
@@ -765,11 +799,17 @@ router.put('/Groups/:id', async (req: Request, res: Response): Promise<void> => 
       ip: req.ip ?? 'unknown',
       userAgent: req.headers['user-agent'] ?? 'unknown',
     });
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) — a
+    // SCIM PUT is a full group-state resync from the IdP (membership +
+    // displayName), the customer-facing meaning of "group synced".
+    chariotEmitter.send('scim.group_synced', {
+      data: { tenantId, groupId: id, method: 'put', memberCount: memberIds.length },
+    });
 
     res.json(toScimGroup(result, getBaseUrl(req)));
   } catch (err) {
-     
-    console.error('[iam/scim] replace group failed', err);
+
+    moduleLog.error('[iam/scim] replace group failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to replace group');
   }
 });
@@ -816,7 +856,9 @@ router.patch('/Groups/:id', async (req: Request, res: Response): Promise<void> =
         const memberId = eqMatch[1];
         const prev = (updateOps.$pull as { members?: { $in: string[] } } | undefined)?.members?.$in ?? [];
         updateOps.$pull = { members: { $in: [...prev, memberId] } };
-      } else if (op.path === 'displayName' && op.op === 'replace') {
+      } else if (op.path === 'displayName' && op.op === 'replace' && typeof op.value === 'string') {
+        // Type-guard: op.value is z.unknown(); only persist a string into the
+        // displayName field (same class as the Users no-path fix).
         setOps.displayName = op.value;
       }
     }
@@ -842,11 +884,17 @@ router.patch('/Groups/:id', async (req: Request, res: Response): Promise<void> =
       ip: req.ip ?? 'unknown',
       userAgent: req.headers['user-agent'] ?? 'unknown',
     });
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) — a
+    // SCIM PATCH (membership add/remove or displayName rename) is an
+    // incremental group-state resync from the IdP.
+    chariotEmitter.send('scim.group_synced', {
+      data: { tenantId, groupId: id, method: 'patch', patchOps: parsed.data.Operations.length },
+    });
 
     res.json(toScimGroup(result, getBaseUrl(req)));
   } catch (err) {
-     
-    console.error('[iam/scim] patch group failed', err);
+
+    moduleLog.error('[iam/scim] patch group failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to patch group');
   }
 });
@@ -884,7 +932,7 @@ router.delete('/Groups/:id', async (req: Request, res: Response): Promise<void> 
     res.status(204).send();
   } catch (err) {
      
-    console.error('[iam/scim] delete group failed', err);
+    moduleLog.error('[iam/scim] delete group failed', { error: err instanceof Error ? err.message : String(err) });
     scimError(res, 500, 'Failed to delete group');
   }
 });

@@ -25,7 +25,7 @@ export class DogsAPIMCPServer extends MCPAdapterBase {
       name: 'dogsapi',
       displayName: 'Dog API',
       version: '1.0.0',
-      category: 'animals',
+      category: 'science',
       keywords: [
         'dogs', 'dog', 'breeds', 'dog breeds', 'canine', 'facts', 'dog facts',
         'animals', 'pets', 'groups', 'breed groups', 'hypoallergenic',

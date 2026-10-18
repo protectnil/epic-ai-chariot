@@ -25,7 +25,7 @@ export class GitLabPublicMCPServer extends MCPAdapterBase {
       name: 'gitlab-public',
       displayName: 'GitLab Public API',
       version: '1.0.0',
-      category: 'developer-tools' as const,
+      category: 'devops' as const,
       keywords: [
         'gitlab', 'git', 'repository', 'repo', 'source code', 'version control',
         'issues', 'projects', 'open source', 'code search', 'merge requests',

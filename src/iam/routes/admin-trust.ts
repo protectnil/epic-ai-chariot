@@ -61,8 +61,12 @@ import {
   revokeIdpClient,
 } from '../services/id-jag-client.js';
 import type { OAuthClientDocument } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
 
-const router = Router();
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.admin-trust');
+
+const router = Router({ mergeParams: true });
 
 // All admin-trust routes require authentication + admin role.
 router.use(enterpriseAuthMiddleware());
@@ -259,7 +263,7 @@ router.post('/issuers', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    console.error('[iam/admin-trust] register issuer failed', err);
+    moduleLog.error('[iam/admin-trust] register issuer failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to register trusted issuer' });
   }
 });
@@ -275,7 +279,7 @@ router.get('/issuers', async (req: Request, res: Response): Promise<void> => {
     res.json({ issuers });
   } catch (err) {
 
-    console.error('[iam/admin-trust] list issuers failed', err);
+    moduleLog.error('[iam/admin-trust] list issuers failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to list trusted issuers' });
   }
 });
@@ -323,7 +327,7 @@ router.delete('/issuers/:iss', async (req: Request, res: Response): Promise<void
     res.status(204).send();
   } catch (err) {
 
-    console.error('[iam/admin-trust] revoke issuer failed', err);
+    moduleLog.error('[iam/admin-trust] revoke issuer failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to revoke trusted issuer' });
   }
 });
@@ -386,7 +390,7 @@ router.post('/scope-mappings', async (req: Request, res: Response): Promise<void
       return;
     }
 
-    console.error('[iam/admin-trust] register scope mapping failed', err);
+    moduleLog.error('[iam/admin-trust] register scope mapping failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to register scope mapping' });
   }
 });
@@ -402,7 +406,7 @@ router.get('/scope-mappings', async (req: Request, res: Response): Promise<void>
     res.json({ scopeMappings });
   } catch (err) {
 
-    console.error('[iam/admin-trust] list scope mappings failed', err);
+    moduleLog.error('[iam/admin-trust] list scope mappings failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to list scope mappings' });
   }
 });
@@ -438,7 +442,7 @@ router.delete('/scope-mappings/:id', async (req: Request, res: Response): Promis
     res.status(204).send();
   } catch (err) {
 
-    console.error('[iam/admin-trust] revoke scope mapping failed', err);
+    moduleLog.error('[iam/admin-trust] revoke scope mapping failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to revoke scope mapping' });
   }
 });
@@ -535,7 +539,7 @@ router.post('/clients', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    console.error('[iam/admin-trust] register client failed', err);
+    moduleLog.error('[iam/admin-trust] register client failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to register OAuth client' });
   }
 });
@@ -551,7 +555,7 @@ router.get('/clients', async (req: Request, res: Response): Promise<void> => {
     res.json({ clients });
   } catch (err) {
 
-    console.error('[iam/admin-trust] list clients failed', err);
+    moduleLog.error('[iam/admin-trust] list clients failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to list OAuth clients' });
   }
 });
@@ -586,7 +590,7 @@ router.delete('/clients/:client_id', async (req: Request, res: Response): Promis
     res.status(204).send();
   } catch (err) {
 
-    console.error('[iam/admin-trust] revoke client failed', err);
+    moduleLog.error('[iam/admin-trust] revoke client failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to revoke OAuth client' });
   }
 });
@@ -667,7 +671,7 @@ router.post('/idp-clients', async (req: Request, res: Response): Promise<void> =
       res.status(400).json({ error: msg });
       return;
     }
-    console.error('[iam/admin-trust] register idp-client failed', err);
+    moduleLog.error('[iam/admin-trust] register idp-client failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to register IdP client' });
   }
 });
@@ -681,7 +685,7 @@ router.get('/idp-clients', async (req: Request, res: Response): Promise<void> =>
     const idpClients = await listIdpClients(tenantId);
     res.json({ idpClients });
   } catch (err) {
-    console.error('[iam/admin-trust] list idp-clients failed', err);
+    moduleLog.error('[iam/admin-trust] list idp-clients failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to list IdP clients' });
   }
 });
@@ -723,7 +727,7 @@ router.delete('/idp-clients/:iss', async (req: Request, res: Response): Promise<
     });
     res.status(204).send();
   } catch (err) {
-    console.error('[iam/admin-trust] revoke idp-client failed', err);
+    moduleLog.error('[iam/admin-trust] revoke idp-client failed', { error: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: 'Failed to revoke IdP client' });
   }
 });

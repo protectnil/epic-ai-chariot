@@ -1,0 +1,81 @@
+{
+  "_comment": "Epic AI Chariot hardened Localhost seccomp profile (Wiz 'isolate and sandbox' gap #10). Opt-in via values.yaml seccomp.customProfile.enabled=true; RuntimeDefault stays the chart default. defaultAction ALLOW + an explicit deny list — NOT a full allow-list — because a hand-authored allow-list precise enough for the whole Node + napi runtime (ONNX/tokenizers/ed25519/aes-gcm/etc, CHARIOT-SPEC Phase 3) would be enormous and brittle across Node/glibc versions, and getting it even slightly wrong fails closed (breaks adapter/gateway startup). The deny list blocks the well-known container/sandbox-escape and system-tampering primitives while leaving the Node/napi runtime syscall surface untouched. This mirrors the deny list enforced by native/src/bin/seccomp_wrapper.rs (GAP #11, the npx/no-pod path) so both layers are maintained from one reviewed list. clone/clone3 are deliberately left off this list (unconditionally allowed) — this JSON profile format's per-argument matching was judged too hard to validate without a live kubelet/runc to test against, so no conditional CLONE_NEW*-flag denial is attempted here (unlike the BPF wrapper, which was tested end-to-end on the build host and does deny clone() when a CLONE_NEW* flag is set). Denying clone/clone3 outright would break Node's thread creation (libuv thread pool, worker_threads).",
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_X32"
+  ],
+  "syscalls": [
+    {
+      "comment": "Namespace / mount / chroot primitives — container and mount-namespace escape vectors. unshare/setns cover the primary unprivileged namespace create-or-join calls.",
+      "names": [
+        "mount",
+        "umount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "unshare",
+        "setns"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "Debugging / cross-process-memory primitives.",
+      "names": [
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "Kernel/system tampering: module load/unload, kexec, reboot, swap, time/accounting.",
+      "names": [
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "kexec_file_load",
+        "reboot",
+        "swapon",
+        "swapoff",
+        "acct",
+        "quotactl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "Kernel keyring API — not used by the Node/napi runtime; a common credential-theft/persistence primitive when available.",
+      "names": [
+        "add_key",
+        "request_key",
+        "keyctl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "bpf(2) and perf_event_open(2) — kernel introspection/tracing primitives with a history of privilege-escalation CVEs; not needed by the gateway.",
+      "names": [
+        "bpf",
+        "perf_event_open"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    },
+    {
+      "comment": "Handle-based filesystem escape primitives (open_by_handle_at requires CAP_DAC_READ_SEARCH to be useful, but denying it removes the syscall from the attack surface entirely) plus the paired lookup helper.",
+      "names": [
+        "name_to_handle_at",
+        "open_by_handle_at",
+        "lookup_dcookie"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

@@ -29,7 +29,7 @@ export class KitsuMCPServer extends MCPAdapterBase {
       name: 'kitsu',
       displayName: 'Kitsu',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'kitsu', 'anime', 'manga', 'japanese animation', 'cartoon',
         'otaku', 'categories', 'genres', 'themes', 'top anime',

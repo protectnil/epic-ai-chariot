@@ -46,7 +46,7 @@ export class ThreatFoxMCPServer extends MCPAdapterBase {
       name: 'threatfox',
       displayName: 'ThreatFox (abuse.ch)',
       version: '1.0.0',
-      category: 'security',
+      category: 'cybersecurity',
       keywords: [
         'threatfox', 'abuse.ch', 'ioc', 'indicator of compromise', 'malware',
         'threat intel', 'threat intelligence', 'ip reputation', 'domain reputation',

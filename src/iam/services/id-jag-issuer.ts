@@ -631,6 +631,15 @@ export async function issueIdJagToken(input: IssueInput): Promise<IssuedTokenEnv
     cnfJkt: input.dpopJkt,
     resolveAdapterIds: async () => grantedAdapterIds,
     resolveAllowedOperations: async () => grantedAllowedOps,
+    // Gap #3 (Wiz 2 human/agent/service partition): an ID-JAG token is
+    // requested by and issued TO a client workload (validated.clientId)
+    // exchanging an identity assertion on the user's behalf — the holder
+    // is software, not the person at a keyboard. Stamp 'agent' so
+    // adapterFilterMiddleware can withhold grants an operator scoped
+    // `principalScope: ['human']`. Zero effect on any mapping without an
+    // explicit principalScope, and interactive SSO sessions (SAML/OIDC)
+    // remain unstamped (= human).
+    principalType: 'agent',
   });
 
   return {
@@ -734,7 +743,12 @@ export async function upsertUserForSubject(
   // by RFC 2606 — guarantees the synthesized address never collides with
   // a real SCIM-provisioned email at the unique (tenantId, email) index.
   const claims = validated.payload as Record<string, unknown>;
-  const email = typeof claims.email === 'string'
+  // Do NOT persist an EXPLICITLY-unverified email: it feeds the unique
+  // (tenantId, email) index and must not be adopted from an attacker-chosen,
+  // IdP-unverified value. Fall back to the synthesized placeholder in that
+  // case. (Undefined email_verified is tolerated — some IdPs omit it.)
+  const emailVerified = claims.email_verified as boolean | undefined;
+  const email = (typeof claims.email === 'string' && emailVerified !== false)
     ? claims.email
     : `${externalId}@id-jag.chariot.invalid`;
   const displayName = typeof claims.name === 'string' ? claims.name : email;

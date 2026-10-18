@@ -80,6 +80,14 @@ export async function ensureEnterpriseIndexes(db: Db): Promise<void> {
   );
   await credentials.createIndex({ tenantId: 1, status: 1, tokenExpiry: 1 });
 
+  // -- iam_refresh_tokens (§10.6::6) -----------------------------------------
+  // Server-side, single-use refresh tokens. `_id` is the token hash (unique by
+  // construction). {tenantId,userId} backs revokeAllUserRefreshTokens; the TTL
+  // index on `expiresAt` reaps records after their 30-day window.
+  const refreshTokens = db.collection('iam_refresh_tokens');
+  await refreshTokens.createIndex({ tenantId: 1, userId: 1 });
+  await refreshTokens.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
   // -- iam_audit_events ------------------------------------------------------
   const audit = db.collection('iam_audit_events');
   await audit.createIndex({ tenantId: 1, seq: 1 }, { unique: true });

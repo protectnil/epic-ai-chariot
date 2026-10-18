@@ -1,0 +1,8 @@
+apiVersion: v2
+name: redis
+description: >-
+  Vendored Redis for Epic AI® Chariot (CH-28 fail-closed credentials, CH-30
+  non-root). Purpose-built for the Chariot umbrella chart.
+type: application
+version: 0.1.0
+appVersion: "8.10.2"

@@ -589,7 +589,6 @@ export class EgnyteMCPServer extends MCPAdapterBase {
     return { content: [{ type: 'text', text: JSON.stringify({ success: true, status: response.status }) }], isError: false };
   }
 
-
   private fsPath(path: string): string {
     // Egnyte FS API: metadata/list/delete/move/copy/create-folder uses /pubapi/v1/fs/{path}
     const clean = path.replace(/^\//, '');
@@ -727,7 +726,7 @@ export class EgnyteMCPServer extends MCPAdapterBase {
     };
     if (args.folder) params.folder = args.folder as string;
     if (args.type) params.type = args.type as string;
-    return this.egGet('/pubapi/v1/search', params);
+    return this.egGet('/pubapi/v2/search', params);
   }
 
   private async createLink(args: Record<string, unknown>): Promise<ToolResult> {
@@ -778,7 +777,7 @@ export class EgnyteMCPServer extends MCPAdapterBase {
       return this.egGet(`/pubapi/v2/users/${encodeURIComponent(String(args.user_id))}`);
     }
     if (args.username) {
-      return this.egGet('/pubapi/v2/users', { usernameFilter: args.username as string });
+      return this.egGet('/pubapi/v2/users', { username: args.username as string });
     }
     return { content: [{ type: 'text', text: 'username or user_id is required' }], isError: true };
   }

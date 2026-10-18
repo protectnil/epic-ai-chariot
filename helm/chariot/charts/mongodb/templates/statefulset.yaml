@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "chariot-mongodb.fullname" . }}
+  labels:
+    {{- include "chariot-mongodb.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "chariot-mongodb.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chariot-mongodb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chariot-mongodb.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- /* CH-30 arbitrary-UID: on OpenShift the restricted-v2 SCC allocates
+             runAsUser/runAsGroup/fsGroup from the namespace range and mutates the
+             pod before validating, so these three MUST be absent. Off OpenShift
+             they MUST be present: this image declares no USER and runs as root,
+             so runAsNonRoot has nothing to assert against. `omit` is used rather
+             than a null override because Helm's subchart coalescing does not
+             delete a key set to null. */}}
+        {{- if .Values.openshift.arbitraryUid }}
+        {{- toYaml (omit .Values.podSecurityContext "runAsUser" "runAsGroup" "fsGroup") | nindent 8 }}
+        {{- else }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- end }}
+      containers:
+        - name: mongodb
+          image: {{ include "chariot-mongodb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- if .Values.openshift.arbitraryUid }}
+            {{- toYaml (omit .Values.securityContext "runAsUser") | nindent 12 }}
+            {{- else }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- end }}
+          # Bind to all interfaces so the gateway can connect; the `mongo` image
+          # auto-enables auth when root credentials are supplied (CH-28).
+          args:
+            - "--bind_ip_all"
+          ports:
+            - name: mongodb
+              containerPort: 27017
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: {{ .Values.auth.username | quote }}
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "chariot-mongodb.secretName" . }}
+                  key: mongodb-root-password
+            - name: MONGO_INITDB_DATABASE
+              value: {{ .Values.auth.database | quote }}
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: mongodb
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: mongodb
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        # persistence disabled → ephemeral data volume so the /data/db mount is
+        # still satisfied without provisioning a PVC.
+        - name: data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+  {{- end }}

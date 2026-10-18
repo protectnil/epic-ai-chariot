@@ -26,7 +26,7 @@ export class URLhausMCPServer extends MCPAdapterBase {
       name: 'urlhaus',
       displayName: 'URLhaus',
       version: '1.0.0',
-      category: 'security',
+      category: 'cybersecurity',
       keywords: [
         'urlhaus', 'abuse.ch', 'malware', 'malware url', 'threat intelligence',
         'url lookup', 'host lookup', 'payload hash', 'phishing', 'botnet',

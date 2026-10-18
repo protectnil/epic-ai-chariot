@@ -28,7 +28,7 @@ export class VideoGamesMCPServer extends MCPAdapterBase {
       name: 'videogames',
       displayName: 'FreeToGame API',
       version: '1.0.0',
-      category: 'entertainment' as const,
+      category: 'media' as const,
       keywords: [
         'videogames', 'free to play', 'freetogame', 'games', 'gaming',
         'mmorpg', 'shooter', 'strategy', 'moba', 'browser games', 'pc games',

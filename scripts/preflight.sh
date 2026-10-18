@@ -39,7 +39,7 @@
 #   npm test (full suite)                      Y     Y  (publish-main)
 #   npm pack --dry-run                         Y     -
 #   npm publish --dry-run                      Y     -
-#   native binary build (linux-x64 only)       Y     Y  (build matrix × 4)
+#   native binary build (linux-x64 only)       Y     Y  (build matrix × 5)
 #   native binary build (darwin, win32)        -     Y
 #   Ed25519 manifest signing                   -     Y  (sign-manifest, secret)
 #   Actual npm publish                         -     Y  (publish-sibling, publish-main)
@@ -83,6 +83,7 @@ node -e '
   const deps = pkg.optionalDependencies || {};
   const siblings = [
     "@epicai/chariot-bin-linux-x64-gnu",
+    "@epicai/chariot-bin-linux-arm64-gnu",
     "@epicai/chariot-bin-darwin-arm64",
     "@epicai/chariot-bin-darwin-x64",
     "@epicai/chariot-bin-win32-x64-msvc",
@@ -101,7 +102,7 @@ node -e '
   process.exit(bad);
 ' 2>&1
 if [ "$?" -eq 0 ]; then
-  pass "all 4 siblings pinned to ${VERSION}"
+  pass "all 5 siblings pinned to ${VERSION}"
 else
   fail "optionalDependencies pins mismatch"
 fi
@@ -128,6 +129,7 @@ node -e '
   const lock = require("./package-lock.json");
   const siblings = [
     "@epicai/chariot-bin-linux-x64-gnu",
+    "@epicai/chariot-bin-linux-arm64-gnu",
     "@epicai/chariot-bin-darwin-arm64",
     "@epicai/chariot-bin-darwin-x64",
     "@epicai/chariot-bin-win32-x64-msvc",
@@ -165,7 +167,7 @@ node -e '
   process.exit(bad);
 ' 2>&1
 if [ "$?" -eq 0 ]; then
-  pass "all 4 sibling lockfile entries resolved at ${VERSION}"
+  pass "all 5 sibling lockfile entries resolved at ${VERSION}"
 else
   fail "sibling lockfile entries incomplete — this will fail publish-main npm ci"
 fi

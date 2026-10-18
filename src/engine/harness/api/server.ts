@@ -10,7 +10,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { HarnessProfile, type HarnessBackend, type HarnessToolResult, type ToolInfo, PER_TOOL_TIMEOUT } from '../types.js';
 import { CANONICAL_TOOLS } from '../shared/toolDefs.js';
 import { createHandlerState, resetHandlerState, handleTool, type HandlerState } from '../shared/handlers.js';
-import { API_AUTH_TOKEN, createVulnerabilityFixtures } from '../shared/fixtures.js';
+import { API_AUTH_TOKEN, createShadowRecords } from '../shared/fixtures.js';
 
 const RATE_LIMIT_MAX = 100;
 const RATE_LIMIT_WINDOW_MS = 1000;
@@ -23,7 +23,7 @@ export class ApiHarnessBackend implements HarnessBackend {
   private state: HandlerState = createHandlerState(HarnessProfile.Api);
   private rateLimitCounter = 0;
   private rateLimitWindowStart = 0;
-  private vulnFixtures = createVulnerabilityFixtures(25);
+  private vulnFixtures = createShadowRecords(25);
 
   async start(): Promise<void> {
     this.state = createHandlerState(HarnessProfile.Api);

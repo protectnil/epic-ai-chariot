@@ -16,7 +16,15 @@
  */
 
 import type { Tool } from '../types/index.js';
-import { expandQuery } from './QueryExpander.js';
+import { expandQuery, buildCatalogExpansionIndex, type CatalogAdapterLike, type CatalogExpansionIndex } from './QueryExpander.js';
+import type { HybridRetriever, RetrieverLogger } from '../retrieval/HybridRetriever.js';
+import type { ScoredResult, RetrievalLeg, RetrievalResult } from '../retrieval/types.js';
+import { TenantOverlayToolRegistry, type TenantOverlayToolRegistryReader } from './TenantOverlayToolRegistry.js';
+import { scoreConfidence } from '../retrieval/confidence.js';
+import {
+  stablePartitionOfficialIds,
+  assertOfficialPartitionInvariantIds,
+} from '../retrieval/OfficialPartition.js';
 
 // BM25 tuning parameters
 const K1 = 1.2;   // term frequency saturation
@@ -129,7 +137,7 @@ const HIGH_CONFIDENCE_PHRASE_PINS: ReadonlyArray<[RegExp, string]> = [
   [/\bincident management\b/i, 'rootly'],
   [/\bon-call rotation\b/i, 'rootly'],
   [/\bpaging\b/i, 'rootly'],
-  // bug-tracker-ref: "page the on-call" / "page on-call" — verb form of paging.
+  // "page the on-call" / "page on-call" — verb form of paging.
   // Customer query "page the on-call about a production database outage"
   // was scoring datadog-observability (metrics adapter) first because
   // "database outage" tokens overlapped its description, even though
@@ -144,7 +152,7 @@ const HIGH_CONFIDENCE_PHRASE_PINS: ReadonlyArray<[RegExp, string]> = [
   [/\bburn rate\b/i, 'accounting'],
   [/\bquarterly financial\b/i, 'accounting'],
   [/\bcompliance training tracking\b/i, 'drata'],
-  // bug-tracker-ref: curated-four phrase pins (pubmed, dns, helium-mcp).
+  // Curated-four phrase pins (pubmed, dns, helium-mcp).
   // Wikipedia is its own brand-token; the other three need semantic
   // phrase hooks to win over BM25 noise on multi-word natural-language
   // queries that a Workato dev would actually type.
@@ -186,9 +194,12 @@ const STOPWORDS = new Set([
   'his', 'our', 'their', 'what', 'which', 'who', 'whom', 'how', 'when',
   'where', 'why', 'if', 'then', 'than', 'so', 'no', 'all', 'each',
   'any', 'some', 'such', 'only', 'just', 'also', 'very',
+  // §4.2: MCP-specific noise tokens, added to the English stopword set so
+  // they do not inflate BM25 IDF weight on nearly every tool query.
+  'tool', 'call', 'get', 'list', 'mcp',
 ]);
 
-function tokenize(text: string): string[] {
+export function tokenize(text: string): string[] {
   return text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -252,6 +263,33 @@ export interface PreFilterOptions {
    * resolve via federation.
    */
   healthChecker?: (serverId: string) => AdapterHealthVerdict;
+  /**
+   * §8.6a (BIEN::§9::14, gate finding D1) — the requesting tenant, threaded
+   * through to `HybridRetriever.search()` so a per-tenant overlay
+   * (`overlay/CompositeEdgeShard.ts`) resolves ONLY this tenant's
+   * customer-verified vectors, never another tenant's and never every
+   * tenant's. Absent → sealed-catalog-only results, exactly the pre-§8.6a
+   * behavior. `toolHandlers.ts`'s `handleQueryImpl` already resolves the
+   * tenant via `getTenantId()` and is the intended source of this value.
+   */
+  tenantId?: string;
+}
+
+/**
+ * Rich routing result (§4.1/§4.5). `tools` is the ordered shortlist (identical
+ * to what `select()` returns). The verdict fields are the 4.0.0 honest-signal
+ * surface: `confidence` (CH-37 calibration), `abstain` (CH-49 out-of-catalog
+ * floor — true only on the hybrid path when no explicit pin overrides), the
+ * legs that contributed, and whether a vector leg degraded to BM25 (§4.4).
+ * Consumed by the `chariot_query` meta-tool to emit `no_match` rather than a
+ * confident absurd top-1.
+ */
+export interface RoutingVerdict {
+  tools: Tool[];
+  confidence: number;
+  abstain: boolean;
+  degraded: boolean;
+  legsUsed: RetrievalLeg[];
 }
 
 // Phase 0 (3.1.0): cosineSim, sparseDot, and queryMiniCOILSparse removed —
@@ -292,6 +330,13 @@ export class ToolPreFilter {
    *  zero-denominator instability. */
   private avgSemanticLength = 1.0;
   private toolIdMap: Map<string, Tool> = new Map();
+  /**
+   * BIEN::§7a::2/10 — adapter id -> governance tier, wired via
+   * `setAdapterTiers()`. Read ONLY by the official/non-official partition
+   * step in `selectInternal()`; never consulted by BM25 scoring, indexing,
+   * or any embedding/serializer path (BIEN::§7a::10's exclusion).
+   */
+  private adapterTierIndex: Map<string, string | undefined> = new Map();
   // Per-server slug tokens, computed once at index() time. The BM25 brand-match
   // boost and the brand-hoist both consult this (via allSlugTokensInQuery) so
   // they tokenize the slug identically; recomputing tokenize(server) per query
@@ -304,6 +349,137 @@ export class ToolPreFilter {
   private observabilityEmitter?: import('../types/index.js').ObservabilityEmitterContract;
  // optional model-specific tokenizer override.
   private tokenEstimator: (tool: Tool) => number = estimateToolTokens;
+  // Optional 4.0.0 hybrid retriever (dense + SPLADE over the in-process
+  // EdgeShard, fused with this BM25 leg via RRF, then cross-encoder reranked,
+  // §8.6). UNSET by default: with no retriever the ranking is the tuned
+  // BM25-only path below, byte-identical to 3.1.x — the hybrid path engages
+  // only once a verified sealed bundle + encoders are wired in the load path
+  // (4.6). This keeps the lexical evals stable while the BIEN model/bundle land.
+  private hybridRetriever: HybridRetriever | null = null;
+  // §8.6a (BIEN::§9::14) — resolves an `overlay:<tenantId>:<adapterId>:
+  // <toolName>` candidate id (surfaced only by a CompositeEdgeShard-backed
+  // hybridRetriever) into the customer-verified tool it names. UNSET by
+  // default: with no registry wired, an overlay: candidate id is dropped
+  // from the shortlist exactly like any other unrecognized id (the
+  // pre-§8.6a behavior — `this.toolIdMap.get(id)` already misses it).
+  private overlayToolRegistry: TenantOverlayToolRegistryReader | null = null;
+  // Optional structured logger (CHARIOT::§4.1::14). CHARIOT-SPEC.md §4.1: "the
+  // pre-filter falls back to BM25-only and emits a WARN-level log entry once
+  // per query" — ToolPreFilter, not HybridRetriever, owns that WARN. UNSET by
+  // default so a caller that never wires a logger degrades silently, exactly
+  // like the unset hybridRetriever above.
+  private logger: RetrieverLogger | null = null;
+  // Catalog-driven query-expansion index (CHARIOT::§4.6::1). UNSET by default:
+  // with no catalog wired, expandQuery() falls back to its legacy heuristic
+  // table only (see QueryExpander.ts).
+  private catalogExpansionIndex: CatalogExpansionIndex | null = null;
+
+  /**
+   * Wire the hybrid retriever (4.0.0 load path). When set, selectInternal fuses
+   * BM25 + dense + SPLADE via RRF and reranks; when null, BM25-only (§4.4
+   * fallback is the steady state until the bundle ships).
+   */
+  setHybridRetriever(retriever: HybridRetriever | null): void {
+    this.hybridRetriever = retriever;
+  }
+
+  /**
+   * Wire the §8.6a per-tenant overlay tool registry. Independent of
+   * `setHybridRetriever` — the registry is only ever consulted for an
+   * `overlay:`-prefixed candidate id, which only a `CompositeEdgeShard`-
+   * backed retriever can produce, but the two are set separately so a
+   * caller can supply either without the other (same pattern as
+   * `setLogger`).
+   */
+  setOverlayToolRegistry(reader: TenantOverlayToolRegistryReader | null): void {
+    this.overlayToolRegistry = reader;
+  }
+
+  /**
+   * §8.6a (BIEN::§9::14, gate finding D1/D2/D3 follow-up) — resolve an
+   * `overlay:<tenantId>:<adapterId>:<toolName>` candidate id (never a
+   * BM25/declared-tool id — those never carry this prefix) into the SAME
+   * `Tool` shape `buildToolsForRoutingChariot` builds for declared tools
+   * (`parameters`/`server`/`tier`; see that module for the precedent this
+   * mirrors). Returns `undefined` — meaning "drop this candidate from the
+   * shortlist, never a crash, never a stub tool" — when:
+   *   - no registry is wired (`setOverlayToolRegistry` never called), OR
+   *   - the caller supplied no `tenantId` (an unscoped query has no tenant
+   *     whose overlay it could possibly be asking about), OR
+   *   - `id` does not parse as a well-formed overlay id, OR
+   *   - the registry itself refuses (`TenantOverlayToolRegistryReader
+   *     .resolveForTenant`'s own tenant cross-check — defense-in-depth on
+   *     top of this method never even asking on behalf of a tenant other
+   *     than `requestingTenantId`).
+   */
+  private resolveOverlayTool(id: string, requestingTenantId: string | undefined): Tool | undefined {
+    if (!this.overlayToolRegistry || !requestingTenantId) return undefined;
+    const parsed = TenantOverlayToolRegistry.parseOverlayToolId(id);
+    if (!parsed) return undefined;
+    const verified = this.overlayToolRegistry.resolveForTenant(id, requestingTenantId);
+    if (!verified) return undefined;
+    return {
+      name: verified.name,
+      description: verified.description,
+      parameters: (verified.inputSchema as Record<string, unknown> | undefined) ?? { type: 'object', properties: {} },
+      server: parsed.adapterId,
+      tier: 'orchestrated',
+    };
+  }
+
+  /**
+   * Every `rankedIds`/`toolIdMap` lookup in `selectInternal` (the health
+   * filter, `groupAndHoist`, the pinned-server hoist, and the final
+   * maxTools/maxPerServer selection loop) MUST resolve an `overlay:`
+   * candidate the SAME way or an overlay tool silently vanishes at
+   * whichever stage still calls `this.toolIdMap.get(id)` alone — that was
+   * the actual defect: `toolIdMap` never contains an `overlay:` id (it is
+   * built once, at index time, from DECLARED adapters only), so a
+   * bare-`toolIdMap` lookup drops every overlay candidate at the FIRST
+   * stage it passes through, before this class's own final "look it up
+   * and build a Tool" line is ever reached. This single resolver is used
+   * at every stage instead.
+   */
+  private resolveToolForId(id: string, requestingTenantId: string | undefined): Tool | undefined {
+    return this.toolIdMap.get(id) ?? this.resolveOverlayTool(id, requestingTenantId);
+  }
+
+  /**
+   * Wire the structured logger used to emit the single per-query WARN when a
+   * hybrid retrieval pass degrades (CHARIOT::§4.1::14). Independent of
+   * `setHybridRetriever` so a caller can supply either without the other.
+   */
+  setLogger(logger: RetrieverLogger | null): void {
+    this.logger = logger;
+  }
+
+  /**
+   * Wire the adapter catalog that drives query expansion (CHARIOT::§4.6::1).
+   * CHARIOT-SPEC.md §4.6: "The expansion list is loaded from the catalog
+   * `keywords` field per adapter." Pass the same adapter list `index()` was
+   * built from (or any structurally-compatible catalog); pass `null` to clear.
+   */
+  setCatalogKeywords(adapters: Iterable<CatalogAdapterLike> | null): void {
+    this.catalogExpansionIndex = adapters ? buildCatalogExpansionIndex(adapters) : null;
+  }
+
+  /**
+   * Wire the adapter-id -> governance-tier index the official/non-official
+   * partition step reads (BIEN::§7a::2/3/10). Pass the same adapter list
+   * `setCatalogKeywords`/`index()` were built from (or any
+   * structurally-compatible catalog carrying `id`/`tier`); pass `null` to
+   * clear (every lookup then resolves to `undefined`, i.e. non-official —
+   * the closed-membership-test default, never a crash).
+   */
+  setAdapterTiers(adapters: Iterable<{ id?: string; tier?: string }> | null): void {
+    this.adapterTierIndex = new Map();
+    if (!adapters) return;
+    for (const a of adapters) {
+      if (typeof a.id === 'string' && a.id.length > 0) {
+        this.adapterTierIndex.set(a.id, a.tier);
+      }
+    }
+  }
 
  /** setter so callers can wire the observability emitter post-construction. */
   setObservabilityEmitter(emitter: import('../types/index.js').ObservabilityEmitterContract | undefined): void {
@@ -532,7 +708,11 @@ export class ToolPreFilter {
         //       Desc bonus = b × 1.0 × idf.
         //       Total = b × 2.0 × idf.
         //       b × 2.0 > b × 1.692 → target wins for all b > 0. ✓
-        if (doc.descTermFreq.get(qt) ?? 0 > 0) {
+        // Parenthesized: `>` binds tighter than `??`, so the unparenthesized
+        // form evaluated as `get(qt) ?? (0 > 0)` — behaviorally identical
+        // today (stored freqs are always >= 1) but a latent trap for any
+        // future zero-count entries.
+        if ((doc.descTermFreq.get(qt) ?? 0) > 0) {
           score += boost * 1.0 * idf;
         }
       }
@@ -573,12 +753,27 @@ export class ToolPreFilter {
    * brand-token hoist. Runs directly over the indexed catalog (this.docs) —
    * no embedding model and no external index load.
    */
-  select(query: string, options?: PreFilterOptions): Promise<Tool[]> {
+  async select(query: string, options?: PreFilterOptions): Promise<Tool[]> {
     // Thin async wrapper over the shared synchronous ranker. select() and
     // selectSync() MUST share one implementation so their shortlists can never
     // diverge for the same query (an earlier version applied pins/brand-hoist
     // in select() only, so the two returned different rankings).
-    return Promise.resolve(this.selectInternal(query, options));
+    //
+    // async (not Promise.resolve) so that a synchronous throw inside
+    // selectInternal becomes a Promise rejection — callers using .catch() or
+    // await/try-catch always receive the error rather than getting an uncaught
+    // synchronous exception escaping a function typed to return Promise<Tool[]>.
+    return this.selectInternal(query, options).tools;
+  }
+
+  /**
+   * Rich shortlist + honest-signal verdict (§4.5). Same ranking as select(),
+   * additionally returning the calibrated `confidence` (CH-37), the `abstain`
+   * verdict (CH-49), the contributing legs, and whether a vector leg degraded
+   * to BM25 (§4.4). The `chariot_query` surface consumes this to emit no_match.
+   */
+  selectWithVerdict(query: string, options?: PreFilterOptions): RoutingVerdict {
+    return this.selectInternal(query, options);
   }
 
   /**
@@ -593,10 +788,18 @@ export class ToolPreFilter {
    * dropped); otherwise the ranked list is fan-out-selected under the
    * maxPerServer and maxTokens budgets.
    */
-  private selectInternal(query: string, options?: PreFilterOptions): Tool[] {
+  private selectInternal(query: string, options?: PreFilterOptions): RoutingVerdict {
     const maxTools = options?.maxTools ?? DEFAULT_MAX_TOOLS;
     const maxPerServer = options?.maxPerServer ?? DEFAULT_MAX_PER_SERVER;
     const healthChecker = options?.healthChecker;
+
+    // Honest-signal verdict, populated as the ranking proceeds. Defaults are the
+    // BM25-only steady state (no abstention, single leg); the hybrid block below
+    // overwrites them when a retriever is wired.
+    let confidence = 0;
+    let abstain = false;
+    let degraded = false;
+    let legsUsed: RetrievalLeg[] = ['bm25'];
 
     // runtime tool-shortlist health filter: down-adapter exclusion. Tools whose
     // server is currently `'down'` are filtered out so the LLM
@@ -638,7 +841,7 @@ export class ToolPreFilter {
     //   - slug "atlassian-jira" is split on `-` so both "atlassian" and "jira"
     //     individually qualify; longer-slug match wins on collision
     //   - only adapters from the healthy-and-candidate set are eligible
-    // bug-tracker-ref: pin tokens come ONLY from the literal user query.
+    // Pin tokens come ONLY from the literal user query.
     // Exposing QueryExpander's brand-list expansions to the pin set caused
     // multiple canonical brands to simultaneously pin (e.g. "action items"
     // -> notion+asana+jira+monday+linear all pinning at synthetic IDF 100;
@@ -722,7 +925,7 @@ export class ToolPreFilter {
 
     const pinCandidates: { server: string; minIdf: number; fullSlugMatch: boolean }[] = [];
     const seenServers = new Set<string>();
-    // bug-tracker-ref: phrase-triggered pins MUST be honored even when the target
+    // Phrase-triggered pins MUST be honored even when the target
     // adapter has zero BM25 score (e.g. helium-mcp has no overlap with
     // "Latest AI regulation news" tokens). Pre-emit phrase-triggered
     // brands as pin candidates BEFORE the sortedCandidates loop so they
@@ -736,7 +939,7 @@ export class ToolPreFilter {
       if (seenServers.has(server)) continue;
       seenServers.add(server);
       const slugLower = server.toLowerCase();
-      // bug-tracker-ref: phrase-triggered single-brand pin checked FIRST so it
+      // Phrase-triggered single-brand pin checked FIRST so it
       // fires even when the user did not literally type the brand name (the
       // standard slug-token-presence check below would skip the adapter).
       if (phraseTriggeredPins.has(slugLower)) {
@@ -799,12 +1002,50 @@ export class ToolPreFilter {
     });
     const pinnedServerSlugs = pinCandidates.map((p) => p.server);
 
-    // Expand query with domain-specific synonyms before tokenizing
-    const expandedQuery = expandQuery(query);
+    // Build the verdict at every return site. CH-49 abstention engages ONLY on
+    // the hybrid path (abstain is never set true otherwise) AND only when no
+    // explicit pin overrides — a user who literally names an adapter has a
+    // clear intent that is not an out-of-catalog miss, so the pin wins and the
+    // router does not abstain. When abstaining, the shortlist is emptied so the
+    // surface returns no_match rather than a confident absurd top-1.
+    const finalize = (tools: Tool[]): RoutingVerdict => {
+      const budgeted = this.applyTokenBudgetAndEmit(tools, options);
+      const abstaining = abstain && pinnedServerSlugs.length === 0;
+      return {
+        tools: abstaining ? [] : budgeted,
+        confidence,
+        abstain: abstaining,
+        degraded,
+        legsUsed,
+      };
+    };
+
+    // BIEN::§7a::10 — tier resolver shared by EVERY exit path in this
+    // method, including the zero-lexical-signal fallback immediately
+    // below (this candidate list is "each query result set" per
+    // BIEN::§7a::1 exactly as much as the hybrid/BM25 paths further down —
+    // there is no carve-out for a query with no tokenizable terms).
+    const tierOf = (id: string): string | undefined =>
+      this.adapterTierIndex.get(this.toolIdMap.get(id)?.server ?? '');
+
+    // Expand query with domain-specific synonyms before tokenizing.
+    // CHARIOT::§4.6::1 — catalog-driven expansion when a catalog is wired.
+    const expandedQuery = expandQuery(query, this.catalogExpansionIndex ?? undefined);
     const queryTerms = tokenize(expandedQuery);
     if (queryTerms.length === 0) {
       // No lexical signal — deterministic alphabetical fallback.
-      return this.applyTokenBudgetAndEmit(sortedCandidates.slice(0, maxTools).map(d => d.tool), options);
+      // BIEN::§7a::1/5/6/14 — partition the COMPLETE alphabetical candidate
+      // list, THEN truncate to maxTools, THEN assert the truncated output —
+      // same partition-before-truncation discipline as every other exit
+      // path in this method (see the shared `finalizePartitionedIds`
+      // comment further below for the full rationale).
+      const allIds = sortedCandidates.map((d) => `${d.tool.server}:${d.tool.name}`);
+      const partitionedIds = stablePartitionOfficialIds(allIds, tierOf).slice(0, maxTools);
+      assertOfficialPartitionInvariantIds(partitionedIds, tierOf);
+      const tools = partitionedIds
+        .map((id) => this.toolIdMap.get(id))
+        .filter((t): t is Tool => t !== undefined);
+      return finalize(tools);
     }
 
     // BM25 scores — always computed (zero inference cost). Score
@@ -816,61 +1057,78 @@ export class ToolPreFilter {
       ? bm25ScoredAll.filter((s) => isHealthy(s.tool.server))
       : bm25ScoredAll;
 
+    // BM25 base order: score-desc, id-asc (deterministic, golden-trace
+    // comparable). Tools are mapped to `server:name` ids; the brand-hoist
+    // (groupAndHoist) then reorders by server exactly as before.
+    const bm25Positive = bm25Scored
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const bm25Ids = bm25Positive.map(s => `${s.tool.server}:${s.tool.name}`);
+
     let rankedIds: string[];
-
-    // Phase 0 (3.1.0): BM25-only ranking. The former "miniCOIL" sparse leg was a
-    // length-biased character-n-gram hash with no IDF and no normalization, and
-    // the dense leg was never implemented (always empty) — both are removed.
-    // Rank by BM25 (real IDF + length normalization), then hoist brand-named
-    // adapters (every slug token present in the query terms) — the same
-    // all-tokens semantics as the prior post-fusion reorder and the scoreBM25
-    // brand boost (see BRAND_MATCH_BOOST) — then map each adapter back to its
-    // BM25-ranked tools. Tie-break by tool id (lexicographic asc) for
-    // deterministic, golden-trace-comparable ordering.
-    {
-      const bm25Positive = bm25Scored
-        .filter(s => s.score > 0)
-        .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-
-      // Single pass over the score-desc/id-asc list: record first-occurrence
-      // server order AND bucket each server's tool ids (already in BM25 order).
-      // O(bm25Positive) — avoids re-scanning bm25Positive once per server in
-      // the emit step below (which was O(servers × bm25Positive)).
-      const serverOrder: string[] = [];
-      const idsByServer = new Map<string, string[]>();
-      for (const s of bm25Positive) {
-        let bucket = idsByServer.get(s.tool.server);
-        if (bucket === undefined) {
-          bucket = [];
-          idsByServer.set(s.tool.server, bucket);
-          serverOrder.push(s.tool.server);
+    if (this.hybridRetriever && this.hybridRetriever.hasVectorLeg) {
+      // §4.5 HYBRID path (engaged once the 4.0.0 bundle + encoders are wired):
+      // BM25 is the always-present leg; the dense (BIEN) + SPLADE legs come from
+      // the in-process EdgeShard; RankFusion.rrf fuses the three; the fused
+      // shortlist is cross-encoder reranked (§8.6 step 7). A dense/sparse leg
+      // failure degrades to the survivors with a WARN (§4.4) — search() never
+      // throws to here. Deterministic tie-breaks are preserved by the retriever
+      // (RRF id tie-break + brute-force rerank) and by groupAndHoist below.
+      const bm25Leg: ScoredResult[] = bm25Positive.map(s => ({
+        id: `${s.tool.server}:${s.tool.name}`,
+        score: s.score,
+      }));
+      // Lockstep doc text (the routing text) for the rerank stage + CH-34
+      // surface. The freeze-side serialized form rides the EdgeShard payload;
+      // at query time the tool description is the available document text.
+      const docTextById = new Map<string, string>();
+      for (const s of bm25Scored) {
+        docTextById.set(`${s.tool.server}:${s.tool.name}`, s.tool.description);
+      }
+      const outcome = this.hybridRetriever.search(query, bm25Leg, docTextById, { tenantId: options?.tenantId });
+      confidence = outcome.confidence;
+      abstain = outcome.abstain;
+      degraded = outcome.degraded;
+      legsUsed = outcome.legsUsed;
+      // CHARIOT::§4.1::14 — CHARIOT-SPEC.md §4.1: "the pre-filter falls back
+      // to BM25-only and emits a WARN-level log entry once per query." A pass
+      // can accumulate multiple leg failures (serializer + dense + sparse +
+      // malformed-payload events); they are coalesced into exactly ONE WARN
+      // call here, with every failure's detail nested inside that one record,
+      // never one WARN call per affected leg.
+      if (outcome.legFailures.length > 0) {
+        this.logger?.warn('retrieval.degraded', {
+          query,
+          legsUsed: outcome.legsUsed,
+          failures: outcome.legFailures,
+        });
+      }
+      // Keep only ids known to the routing index (declared OR a resolvable
+      // §8.6a overlay:-candidate — see resolveToolForId), honoring the
+      // health filter; group-by-server + brand-hoist on top of the fused
+      // order.
+      const known = outcome.rankedIds.filter((id) => {
+        const tool = this.resolveToolForId(id, options?.tenantId);
+        return !!tool && isHealthy(tool.server);
+      });
+      rankedIds = this.groupAndHoist(known, queryTerms, (id) => this.resolveOverlayTool(id, options?.tenantId));
+      // Safety net: never return a strict subset of the BM25 shortlist — append
+      // any BM25-positive id the fused legs did not surface, in BM25+hoist order.
+      const inRanked = new Set(rankedIds);
+      for (const id of this.groupAndHoist(bm25Ids, queryTerms)) {
+        if (!inRanked.has(id)) {
+          rankedIds.push(id);
+          inRanked.add(id);
         }
-        bucket.push(`${s.tool.server}:${s.tool.name}`);
       }
-
-      // Brand hoist: a server whose every slug token appears in the query terms
-      // AND whose slug is distinctive (IDF >= MIN_BRAND_IDF) is moved ahead of
-      // the rest. The IDF gate prevents generic-word server names (e.g. "apply",
-      // "get", "search") from hoisting when the query coincidentally contains
-      // those words — preserving the P2 BM25 monotonicity invariant.
-      const querySet = new Set(queryTerms);
-      const brandMatched: string[] = [];
-      const others: string[] = [];
-      for (const server of serverOrder) {
-        if (this.allSlugTokensInQuery(server, querySet) && this.slugIsDistinctive(server)) {
-          brandMatched.push(server);
-        } else {
-          others.push(server);
-        }
-      }
-
-      // Emit tool ids in [brand-matched, others] server order; each server's
-      // tools are already in BM25-desc / id-asc order from the bucketing pass.
-      rankedIds = [];
-      for (const server of [...brandMatched, ...others]) {
-        const bucket = idsByServer.get(server);
-        if (bucket) rankedIds.push(...bucket);
-      }
+    } else {
+      // BM25-only steady state (byte-identical to 3.1.x). The former "miniCOIL"
+      // sparse leg and the never-implemented dense leg were removed at 3.1.0;
+      // the dense + SPLADE legs return via the hybrid branch above once the
+      // bundle ships. Confidence is reported for telemetry but never gates here
+      // (abstain stays false without the hybrid relevance signal).
+      rankedIds = this.groupAndHoist(bm25Ids, queryTerms);
+      confidence = this.bm25Confidence(bm25Positive);
     }
 
     // Apply exact-name pin: move tools of pinned servers to the front of
@@ -886,12 +1144,12 @@ export class ToolPreFilter {
       // ranked id whose server matches in order.
       for (const slug of pinnedServerSlugs) {
         for (const id of rankedIds) {
-          const tool = this.toolIdMap.get(id);
+          const tool = this.resolveToolForId(id, options?.tenantId);
           if (tool && tool.server === slug) pinnedIds.push(id);
         }
       }
       for (const id of rankedIds) {
-        const tool = this.toolIdMap.get(id);
+        const tool = this.resolveToolForId(id, options?.tenantId);
         if (!tool || !pinnedSet.has(tool.server)) otherIds.push(id);
       }
       // Also include pinned-server tools that BM25 did NOT rank (score=0
@@ -911,6 +1169,34 @@ export class ToolPreFilter {
       rankedIds = [...pinnedIds, ...otherIds];
     }
 
+    // `tierOf` is defined once, earlier in this method (immediately after
+    // `finalize`), so the zero-lexical-signal early-return path above and
+    // every path below share the exact same resolver.
+    //
+    // BIEN::§7a::1/5/6/7/14 — partition THEN assert, called immediately
+    // before each of the exit points below builds its final returned id
+    // list, so every list that actually LEAVES this method (never an
+    // intermediate state a later step can still mutate) is both partitioned
+    // and invariant-checked. `stablePartitionOfficialIds` is a stable
+    // partition (Array.prototype.sort, ES2019+ stability), so ties
+    // preserve the accumulated fusion+rerank+§4.6-hoist+pin ordering,
+    // satisfying §7a::7's within-partition tiebreak without re-deriving it
+    // (no `rerankScore` survives to this call site — see
+    // OfficialPartition.ts's docstring). `assertOfficialPartitionInvariantIds`
+    // throws `OfficialPartitionInvariantError` (code
+    // `retrieval_partition_invariant_failed`, MASTER ruling item 90) on any
+    // violation — the query FAILS, propagating like any other synchronous
+    // throw through select()/selectWithVerdict()/selectSync(), NEVER
+    // silently substituting the un-partitioned order and NEVER the
+    // separate `rerankerFailed` BM25 degradation used elsewhere in this
+    // file for a different failure class (a leg/reranker exception, not a
+    // proven partition-ordering violation).
+    const finalizePartitionedIds = (ids: string[]): string[] => {
+      const partitioned = stablePartitionOfficialIds(ids, tierOf);
+      assertOfficialPartitionInvariantIds(partitioned, tierOf);
+      return partitioned;
+    };
+
     // Whole-pool completeness: when every candidate already fits within
     // maxTools the shortlist will show all of them, so neither the maxPerServer
     // diversity cap nor rank truncation applies. Return the full pool in
@@ -918,6 +1204,15 @@ export class ToolPreFilter {
     // surfaced) in deterministic id order. This replaces a prior short-circuit
     // that returned the whole small pool in plain alphabetical order, ignoring
     // BM25 and pins entirely.
+    //
+    // BIEN::§7a::1/5 — the straggler append below runs BEFORE
+    // finalizePartitionedIds, not after: partitioning only `rankedIds` and
+    // then appending unpartitioned stragglers afterward would let an
+    // official straggler land after a non-official record already in
+    // `rankedIds` (the defect a prior revision of this method had — the
+    // partition must cover the COMPLETE post-rerank candidate list, and
+    // the stragglers are part of that complete list, not an addendum to
+    // an already-finalized one).
     if (sortedCandidates.length <= maxTools) {
       const inRanked = new Set(rankedIds);
       for (const doc of sortedCandidates) {
@@ -927,10 +1222,10 @@ export class ToolPreFilter {
           inRanked.add(id);
         }
       }
-      const ordered = rankedIds
-        .map((id) => this.toolIdMap.get(id))
+      const ordered = finalizePartitionedIds(rankedIds)
+        .map((id) => this.resolveToolForId(id, options?.tenantId))
         .filter((t): t is Tool => t !== undefined);
-      return this.applyTokenBudgetAndEmit(ordered, options);
+      return finalize(ordered);
     }
 
     // Select with server diversity constraint
@@ -938,7 +1233,17 @@ export class ToolPreFilter {
     // over-budget tool does NOT consume a server slot. Tools that exceed
     // the running cost are skipped; the loop continues searching for a
     // cheaper tool further down the ranking.
+    //
+    // BIEN::§7a::5/6/8 — partition `rankedIds` BEFORE this loop scans it,
+    // so official candidates get first claim on the maxPerServer/token
+    // slots the loop hands out; §7a::14's assert then re-runs on the
+    // ACTUAL selected output below (a subsequence of a correctly
+    // partitioned sequence stays correctly partitioned by construction,
+    // but the assert is unconditional here too — one shared discipline,
+    // not a proof left unverified for this path).
+    rankedIds = finalizePartitionedIds(rankedIds);
     const selected: Tool[] = [];
+    const selectedIds: string[] = [];
     const serverCounts = new Map<string, number>();
     const maxTokensBudget = options?.maxTokens;
     let runningCost = 0;
@@ -946,7 +1251,7 @@ export class ToolPreFilter {
     for (const id of rankedIds) {
       if (selected.length >= maxTools) break;
 
-      const tool = this.toolIdMap.get(id);
+      const tool = this.resolveToolForId(id, options?.tenantId);
       if (!tool) continue;
 
       const serverCount = serverCounts.get(tool.server) ?? 0;
@@ -959,10 +1264,30 @@ export class ToolPreFilter {
       }
 
       selected.push(tool);
+      selectedIds.push(id);
       serverCounts.set(tool.server, serverCount + 1);
     }
 
-    return this.applyTokenBudgetAndEmit(selected, options);
+    // BIEN::§7a::14 — assert the ACTUAL returned list, not just the
+    // pre-loop input (see the comment above the loop).
+    assertOfficialPartitionInvariantIds(selectedIds, tierOf);
+    return finalize(selected);
+  }
+
+  /**
+   * Confidence for the BM25-only path (CH-37 telemetry; never gates). Reuses the
+   * shared `scoreConfidence` calibration over the top-2 BM25 candidates so the
+   * signal is comparable to the hybrid path: a strong, well-separated top-1
+   * reads high; a weak or ambiguous one reads low.
+   */
+  private bm25Confidence(bm25Positive: { tool: Tool; score: number; id: string }[]): number {
+    if (bm25Positive.length === 0) return 0;
+    const top2: RetrievalResult[] = bm25Positive.slice(0, 2).map((s, i) => ({
+      id: s.id,
+      fusionScore: s.score,
+      fusionSources: [{ type: 'bm25', rank: i, originalScore: s.score }],
+    }));
+    return scoreConfidence(top2).confidence;
   }
 
   /**
@@ -972,7 +1297,53 @@ export class ToolPreFilter {
    * given query yields the same shortlist whether reached sync or async.
    */
   selectSync(query: string, options?: PreFilterOptions): Tool[] {
-    return this.selectInternal(query, options);
+    return this.selectInternal(query, options).tools;
+  }
+
+  /**
+   * Group an ordered tool-id list by server (preserving first-seen server
+   * order), then hoist brand-matched servers (every distinctive slug token
+   * present in the query) to the front. Shared by the BM25 and hybrid paths so
+   * the brand-hoist semantics are identical regardless of how the base order
+   * was produced. Unknown ids (not in the routing index) are skipped.
+   */
+  private groupAndHoist(
+    orderedIds: string[],
+    queryTerms: string[],
+    /** §8.6a — resolves an `overlay:` id `this.toolIdMap` never contains
+     * (built once, at index time, from declared adapters only). Omitted by
+     * the BM25-only call sites, which never see an overlay: id. */
+    resolveExtra?: (id: string) => Tool | undefined,
+  ): string[] {
+    const serverOrder: string[] = [];
+    const idsByServer = new Map<string, string[]>();
+    for (const id of orderedIds) {
+      const tool = this.toolIdMap.get(id) ?? resolveExtra?.(id);
+      if (!tool) continue;
+      let bucket = idsByServer.get(tool.server);
+      if (bucket === undefined) {
+        bucket = [];
+        idsByServer.set(tool.server, bucket);
+        serverOrder.push(tool.server);
+      }
+      bucket.push(id);
+    }
+    const querySet = new Set(queryTerms);
+    const brandMatched: string[] = [];
+    const others: string[] = [];
+    for (const server of serverOrder) {
+      if (this.allSlugTokensInQuery(server, querySet) && this.slugIsDistinctive(server)) {
+        brandMatched.push(server);
+      } else {
+        others.push(server);
+      }
+    }
+    const out: string[] = [];
+    for (const server of [...brandMatched, ...others]) {
+      const bucket = idsByServer.get(server);
+      if (bucket) out.push(...bucket);
+    }
+    return out;
   }
 
   /** Number of indexed tools */

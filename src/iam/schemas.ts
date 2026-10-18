@@ -11,9 +11,11 @@ export const samlConfigSchema = z.object({
   issuer: z.string().min(1).max(256),
   cert: z.string().min(100).max(8192),
   callbackUrl: z.string().url(),
+  // §10.2::2 pins these to the secure values: signed assertions AND signed
+  // authn response, sha256 — a tenant config cannot select sha1/unsigned.
   signatureAlgorithm: z.literal('sha256'),
-  wantAssertionsSigned: z.boolean().default(true),
-  wantAuthnResponseSigned: z.boolean().default(true),
+  wantAssertionsSigned: z.literal(true).default(true),
+  wantAuthnResponseSigned: z.literal(true).default(true),
 }).strict();
 
 export const oidcConfigSchema = z.object({

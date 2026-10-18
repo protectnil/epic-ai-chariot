@@ -25,7 +25,7 @@ export class IetfDatatrackerMCPServer extends MCPAdapterBase {
       name: 'ietf-datatracker',
       displayName: 'IETF Datatracker',
       version: '1.0.0',
-      category: 'developer-tools' as const,
+      category: 'devops' as const,
       keywords: [
         'ietf', 'rfc', 'internet', 'standards', 'draft', 'working group',
         'datatracker', 'protocol', 'specification', 'network', 'document',

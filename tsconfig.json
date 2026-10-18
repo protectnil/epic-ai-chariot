@@ -5,8 +5,19 @@
     "moduleResolution": "bundler",
     "lib": ["ES2025"],
     "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
+    // Dangling maps: dist/**/*.map pointed at ../src/*.ts, which package.json
+    // `files` does NOT ship. 2876 map files shipped in the tarball, useless to
+    // consumers and disclosing the full internal source-tree layout. Off.
+    "declarationMap": false,
+    "sourceMap": false,
+    // removeComments MUST STAY FALSE. It is not a style choice: the
+    // release strip pass (scripts/release.mjs:83-84) locates internal-telemetry
+    // blocks by the COMMENT sentinels `@chariot-internal-telemetry-begin` /
+    // `-end`. Setting removeComments:true deletes those markers, the stripper
+    // then finds every CHARIOT_INTERNAL_TELEMETRY token "outside any sentinel
+    // pair", and test/manifest-prepublish-gate.mjs fails closed — verified
+    // 2026-07-28. Comments in dist/*.js are load-bearing build metadata.
+    "removeComments": false,
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,

@@ -37,7 +37,7 @@ export class FloodMCPServer extends MCPAdapterBase {
       name: 'flood',
       displayName: 'Open-Meteo Flood API',
       version: '1.0.0',
-      category: 'weather' as const,
+      category: 'science' as const,
       keywords: [
         'flood', 'river', 'discharge', 'hydrology', 'water level',
         'river discharge', 'flood forecast', 'open-meteo', 'weather',

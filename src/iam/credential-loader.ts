@@ -29,7 +29,7 @@
  */
 
 import { getCollection } from './db.js';
-import { decryptFields } from './crypto.js';
+import { decryptFields, VaultUpgradePersistFailedError } from './crypto.js';
 import { createLogger } from '../engine/logger.js';
 import type { AdapterCredentialDocument } from './types.js';
 import type { AdapterEntry } from '../engine/server/ChariotState.js';
@@ -122,7 +122,39 @@ export async function loadIamCredentialsForTenant(
 
     let decrypted: Record<string, string>;
     try {
-      decrypted = decryptFields(row.encrypted, row.iv, tenantId);
+      // CH-10 (§12.2): row.adapterId is the AAD binding this row was
+      // encrypted under (see adapters.ts connect routes) — required here so
+      // a row relocated to a different adapterId fails closed instead of
+      // decrypting under the wrong adapter's identity.
+      const result = await decryptFields(row.encrypted, row.iv, tenantId, row.adapterId);
+      decrypted = result.fields;
+      // CH-10 upgrade-on-decrypt (§12.2, rulings item 59, "the caller MUST
+      // persist {encrypted, iv} back to the SAME record, in the SAME
+      // operation"): a legacy row just proved it holds the correct tenant
+      // key — persist the freshly re-encrypted v2 ciphertext back to THIS
+      // row. The update predicate is a compare-and-set on the LEGACY
+      // ciphertext we just read (`encrypted: row.encrypted`): a concurrent
+      // upgrader that already rewrote this row makes the CAS match zero
+      // documents — an idempotent no-op, not a failure, and never a
+      // clobber of a v2 ciphertext some other upgrader already wrote. A
+      // genuine write error (not a CAS mismatch) is NOT swallowed — it
+      // fails this call, so a caller never sees success while the row
+      // silently stayed legacy.
+      if (result.upgraded) {
+        try {
+          await col.updateOne(
+            { _id: row._id, encrypted: row.encrypted },
+            { $set: { encrypted: result.upgraded.encrypted, iv: result.upgraded.iv } },
+          );
+        } catch (writeBackErr) {
+          log.error('iam credential upgrade-on-decrypt write-back failed', {
+            adapterId: row.adapterId,
+            tenantId,
+            error: writeBackErr instanceof Error ? writeBackErr.message : String(writeBackErr),
+          });
+          throw new VaultUpgradePersistFailedError('credential-loader', row.adapterId, writeBackErr);
+        }
+      }
     } catch (err) {
       // FAIL CLOSED — must throw so handleCall denies the call. Silently
       // skipping an active row would let dispatch proceed with no/partial

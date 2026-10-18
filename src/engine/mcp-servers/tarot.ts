@@ -25,7 +25,7 @@ export class TarotMCPServer extends MCPAdapterBase {
       name: 'tarot',
       displayName: 'Tarot API',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'tarot', 'tarot card', 'divination', 'card reading', 'major arcana',
         'minor arcana', 'wands', 'cups', 'swords', 'pentacles', 'oracle',

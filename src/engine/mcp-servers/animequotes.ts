@@ -58,7 +58,7 @@ export class AnimeQuotesMCPServer extends MCPAdapterBase {
       name: 'animequotes',
       displayName: 'AnimeQuotes — animechan.io',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'anime', 'quotes', 'manga', 'characters', 'naruto', 'attack on titan',
         'one piece', 'dragon ball', 'anime quotes', 'japanese animation',

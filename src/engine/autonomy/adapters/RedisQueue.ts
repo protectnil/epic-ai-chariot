@@ -120,6 +120,37 @@ export class RedisQueue {
     return all.filter(a => a.action.persona === tenantId);
   }
 
+  /**
+   * CHARIOT::§7.6::4 — mirror ApprovalQueue.cancelByServer() for the
+   * Redis-backed queue: mark every pending approval whose action.server
+   * matches `server` as cancelled, persist without TTL (audit retention,
+   * same treatment as decide()), and remove from the pending set.
+   */
+  async cancelByServer(server: string, reason: string): Promise<PendingApproval[]> {
+    await this.ensureConnected();
+    const redis = this.requireRedis();
+    const ids: string[] = await redis.sMembers(`${this.keyPrefix}pending`);
+    const cancelled: PendingApproval[] = [];
+
+    for (const id of ids) {
+      const data = await redis.get(`${this.keyPrefix}${id}`);
+      if (!data) continue;
+      const approval = JSON.parse(data) as PendingApproval;
+      if (approval.state !== 'pending' || approval.action.server !== server) continue;
+
+      approval.state = 'cancelled';
+      approval.decidedAt = new Date();
+      approval.denyReason = reason;
+
+      await redis.set(`${this.keyPrefix}${id}`, JSON.stringify(approval));
+      await redis.persist(`${this.keyPrefix}${id}`);
+      await redis.sRem(`${this.keyPrefix}pending`, id);
+      cancelled.push(approval);
+    }
+
+    return cancelled;
+  }
+
   async get(actionId: string): Promise<PendingApproval | null> {
     await this.ensureConnected();
     const data = await this.requireRedis().get(`${this.keyPrefix}${actionId}`);

@@ -27,6 +27,15 @@ interface StoredGroupAdapterMapping {
   adapterId?: string;      // legacy (1.0.x)
   allowedOperations: string[];
   maxQueriesPerHour: number;
+  /**
+   * Principal-kind scope (gap #3). Absent/empty = mapping applies to any
+   * principal kind (pre-partition behavior). See the field doc on
+   * GroupAdapterMappingDocument in ../types.ts. Preserved verbatim
+   * (values are NOT filtered to the recognized set) so an unrecognized
+   * value fails closed on the principal-aware path instead of being
+   * silently dropped and widening the mapping to every principal.
+   */
+  principalScope?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,6 +52,9 @@ function normalizeMapping(
     adapterIds,
     allowedOperations: stored.allowedOperations,
     maxQueriesPerHour: stored.maxQueriesPerHour,
+    ...(Array.isArray(stored.principalScope)
+      ? { principalScope: stored.principalScope }
+      : {}),
     createdAt: stored.createdAt,
     updatedAt: stored.updatedAt,
   };
@@ -143,6 +155,7 @@ export async function updateById(
     adapterIds: string[];
     allowedOperations?: string[];
     maxQueriesPerHour?: number;
+    principalScope?: string[];
   },
 ): Promise<GroupAdapterMappingDocument | null> {
   const update: UpdateFilter<StoredGroupAdapterMapping> = {
@@ -151,6 +164,7 @@ export async function updateById(
       adapterIds: fields.adapterIds,
       ...(fields.allowedOperations !== undefined && { allowedOperations: fields.allowedOperations }),
       ...(fields.maxQueriesPerHour !== undefined && { maxQueriesPerHour: fields.maxQueriesPerHour }),
+      ...(fields.principalScope !== undefined && { principalScope: fields.principalScope }),
     },
     $unset: { adapterId: '' },
   };

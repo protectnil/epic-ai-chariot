@@ -29,7 +29,7 @@ export class PkgGoDevMCPServer extends MCPAdapterBase {
       name: 'pkg-go-dev',
       displayName: 'Go Module Proxy',
       version: '1.0.0',
-      category: 'developer-tools',
+      category: 'devops',
       keywords: [
         'go', 'golang', 'modules', 'packages', 'go.mod', 'dependencies',
         'module proxy', 'pkg.go.dev', 'versions', 'semver', 'import path',

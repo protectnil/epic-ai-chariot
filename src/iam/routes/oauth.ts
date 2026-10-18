@@ -75,8 +75,9 @@ import {
 import { verifyToken, revokeAllUserSessions } from '../services/session.js';
 import { clientIp, escapeDpopHeaderValue, requestHtu, userAgent } from '../utils/url.js';
 import { isValidTenantId } from './index.js';
+import { chariotEmitter } from '../../observability/emitter.js';
 
-const router = Router();
+const router = Router({ mergeParams: true });
 export default router;
 
 // CORS for the whole /enterprise/oauth subtree. xaa.dev's Resource AS
@@ -377,7 +378,6 @@ async function authenticateClient(
   // while an unknown one is rejected before it; if these branches returned a
   // distinct status/description, a no-credential or multi-mechanism probe
   // would distinguish registered from unregistered client_ids.
-  const usedBasic = basic !== null;
   const presented = [basic, post, jwtBody].filter(Boolean).length;
   if (presented === 0) {
     // No client authentication attempted at all (RFC 6749 §5.2 / RFC 7009
@@ -412,6 +412,15 @@ async function authenticateClient(
     const cl = await infraRead(res, () => isClientRateLimited(tenantId, clientId));
     if (!cl) return null;
     if (cl.value) {
+      // §19::22 — the per-client lockout bucket has tripped: this IS the
+      // brute-force lockout. Emit at the route layer (here), not inside
+      // RateLimiter.ts/PerTenantRateLimiter.ts (the rate-limit service).
+      chariotEmitter.send('auth.brute_force_lockout', {
+        severity: 'warning',
+        alertWorthy: true,
+        data: { tenantId, clientId },
+        message: `Brute-force lockout: client "${clientId}" (tenant ${tenantId}) exceeded the auth-failure rate limit.`,
+      });
       oauthError(res, 429, 'slow_down', RATE_LIMITED);
       return null;
     }
@@ -475,18 +484,9 @@ async function authenticateClient(
   return null;
 }
 
-function tenantIdFromRequest(req: Request): string | null {
-  // Resolution order:
-  //   1. X-Tenant-Id header (set by the host's tenant-resolution layer)
-  //   2. SCIM_DEFAULT_TENANT env var (single-tenant deployments)
-  // The token endpoint itself does NOT carry tenantId in the path so the
-  // hosting environment must provide it the same way SCIM does.
-  const h = req.headers['x-tenant-id'];
-  if (typeof h === 'string' && h.length > 0 && isValidTenantId(h)) return h;
-  const env = process.env.SCIM_DEFAULT_TENANT;
-  if (env && env.length > 0 && isValidTenantId(env)) return env;
-  return null;
-}
+// §10.8::5 — tenant is taken from the URL path only (see the discovery
+// handler); the former header/env `tenantIdFromRequest` resolver was removed
+// so tenantId can never be accepted from an x-tenant-id header or env default.
 
 /**
  * Outcome of resolving the Resource-AS tenant from a presented client
@@ -1302,11 +1302,13 @@ export const oauthAuthorizationServerMetadataHandler = (req: Request, res: Respo
   // tenant's tokens. Refuse the request instead and tell the client to
   // supply x-tenant-id (or set SCIM_DEFAULT_TENANT in single-tenant
   // deployments).
-  const tenantId = tenantIdFromRequest(req);
-  if (tenantId === null) {
+  // §10.8::5 — the tenant is the URL segment (/:tenantId/oauth/...), validated
+  // upstream by requireUrlTenantIsolation. Never resolved from a header or env.
+  const tenantId = req.params.tenantId;
+  if (!tenantId) {
     res.status(400).json({
       error: 'tenant_unspecified',
-      error_description: 'discovery requires x-tenant-id header (or SCIM_DEFAULT_TENANT env in single-tenant mode)',
+      error_description: 'discovery requires the tenant in the URL path (/enterprise/{tenantId}/oauth/...)',
     });
     return;
   }
@@ -1331,6 +1333,23 @@ export const oauthAuthorizationServerMetadataHandler = (req: Request, res: Respo
   res.set('Cache-Control', 'public, max-age=3600').json({
     issuer,
     token_endpoint: `${oauthBase}/token`,
+    // RFC 8414 §2: `response_types_supported` is a REQUIRED
+    // top-level field and was previously omitted, so conformance tooling
+    // rejected the document. This AS is token-exchange-only — its sole
+    // grant type is jwt-bearer (ID-JAG), which is redeemed at the token
+    // endpoint and uses NO authorization endpoint — so there are no
+    // interactive `response_type` values to advertise. The honest,
+    // spec-conformant value is therefore an empty array (the field is
+    // present as REQUIRED, with no fabricated response types).
+    //
+    // `authorization_endpoint` is the only other core RFC 8414 field not
+    // emitted here; §2 makes it REQUIRED "unless no grant types are
+    // supported that use the authorization endpoint." Since
+    // `grant_types_supported` is jwt-bearer only, that exemption applies
+    // and emitting an authorization_endpoint would advertise a route this
+    // AS does not serve. `issuer` and `token_endpoint` (the other required
+    // core fields) are present above.
+    response_types_supported: [],
     revocation_endpoint: `${oauthBase}/revoke`,
     grant_types_supported: [...ACCEPTED_GRANT_TYPES],
     token_endpoint_auth_methods_supported: [

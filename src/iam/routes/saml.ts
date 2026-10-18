@@ -20,9 +20,15 @@ import { isMfaEnrolled } from '../services/mfa.js';
 import { samlAssertedMfa } from '../services/idp-mfa.js';
 import * as audit from '../services/audit.js';
 import { isAuthRateLimited, recordAuthFailure, clearAuthFailures } from '../services/auth-rate-limit.js';
+import { clientIp as clientIpHelper } from '../utils/url.js';
 import type { EnterpriseUserDocument } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
+import { chariotEmitter } from '../../observability/emitter.js';
 
-const router = Router();
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.saml');
+
+const router = Router({ mergeParams: true });
 
 /**
  * GET /saml/login
@@ -32,7 +38,9 @@ const router = Router();
  */
 router.get('/saml/login', async (req: Request, res: Response): Promise<void> => {
   try {
-    const tenantId = req.tenantId || (req.query.tenant as string) || (req.headers['x-tenant-id'] as string);
+    // §10.8::5 — tenant comes only from the URL (validated upstream by
+    // requireUrlTenantIsolation); never from a query param or header.
+    const tenantId = req.params.tenantId as string;
 
     if (!tenantId) {
       res.status(400).json({ error: 'Tenant not resolved' });
@@ -54,9 +62,12 @@ router.get('/saml/login', async (req: Request, res: Response): Promise<void> => 
       issuer: samlConfig.issuer,
       idpCert: samlConfig.cert,
       callbackUrl: samlConfig.callbackUrl,
-      wantAssertionsSigned: samlConfig.wantAssertionsSigned ?? true,
-      wantAuthnResponseSigned: samlConfig.wantAuthnResponseSigned ?? true,
-      signatureAlgorithm: samlConfig.signatureAlgorithm ?? 'sha256',
+      // §10.2::2: signature verification is pinned ON (sha256) at the point of
+      // use — a tenant config, even a legacy row predating the schema pin,
+      // cannot weaken it to unsigned or sha1.
+      wantAssertionsSigned: true,
+      wantAuthnResponseSigned: true,
+      signatureAlgorithm: 'sha256',
     });
 
     const loginUrl = await saml.getAuthorizeUrlAsync(
@@ -86,15 +97,20 @@ router.get('/saml/login', async (req: Request, res: Response): Promise<void> => 
  */
 router.post('/saml/callback', async (req: Request, res: Response): Promise<void> => {
   try {
-    const tenantId = req.tenantId || (req.query.tenant as string) || (req.headers['x-tenant-id'] as string);
+    // §10.8::5 — tenant comes only from the URL (validated upstream by
+    // requireUrlTenantIsolation); never from a query param or header.
+    const tenantId = req.params.tenantId as string;
 
     if (!tenantId) {
       res.status(400).json({ error: 'Tenant not resolved' });
       return;
     }
 
-    // SOC 2: Rate-limit failed authentication attempts
-    const clientIp = req.ip ?? 'unknown';
+    // SOC 2: Rate-limit failed authentication attempts. Key on the
+    // trusted-proxy-aware client IP (utils/url.clientIp) — NOT req.ip,
+    // which behind the reverse proxy is the single nginx hop and would
+    // collapse every client into one bucket (tenant-wide SSO login DoS).
+    const clientIp = clientIpHelper(req);
     if (await isAuthRateLimited(clientIp, tenantId)) {
       res.status(429).json({ error: 'Too many failed login attempts. Try again in 15 minutes.' });
       return;
@@ -115,9 +131,12 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
       issuer: samlConfig.issuer,
       idpCert: samlConfig.cert,
       callbackUrl: samlConfig.callbackUrl,
-      wantAssertionsSigned: samlConfig.wantAssertionsSigned ?? true,
-      wantAuthnResponseSigned: samlConfig.wantAuthnResponseSigned ?? true,
-      signatureAlgorithm: samlConfig.signatureAlgorithm ?? 'sha256',
+      // §10.2::2: signature verification is pinned ON (sha256) at the point of
+      // use — a tenant config, even a legacy row predating the schema pin,
+      // cannot weaken it to unsigned or sha1.
+      wantAssertionsSigned: true,
+      wantAuthnResponseSigned: true,
+      signatureAlgorithm: 'sha256',
     });
 
     const { profile } = await saml.validatePostResponseAsync(req.body);
@@ -168,7 +187,7 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
     // but the driver's type is `T | null`. Guard explicitly.
     if (!user) {
        
-      console.error(
+      moduleLog.error(
         `[iam/saml] JIT provisioning returned null for tenant=${tenantId} email=${email}`,
       );
       res.status(500).json({ error: 'Failed to provision user' });
@@ -213,6 +232,23 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
     // Issue session token. Stamp `mfaVerified: true` when either (a) the
     // tenant doesn't require MFA, or (b) the IdP asserted MFA on its side.
     const mfaVerified = !tenant.settings?.mfaRequired || idpMfa.asserted;
+
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) —
+    // `mfa.skipped_via_idp`: fires ONLY in case (b) above — the tenant DOES
+    // require MFA and the IdP already asserted it, so Chariot's own TOTP
+    // challenge (mfa.ts) is skipped. Case (a) (tenant doesn't require MFA
+    // at all) has nothing to skip and must not emit this event.
+    if (tenant.settings?.mfaRequired && idpMfa.asserted) {
+      chariotEmitter.send('mfa.skipped_via_idp', {
+        data: {
+          tenantId,
+          userId: user._id.toString(),
+          method: 'saml',
+          authnContextClassRefs: idpMfa.authnContextClassRefs,
+        },
+      });
+    }
+
     const token = await issueToken(user, tenant, { mfaVerified });
     const jti = (JSON.parse(
       Buffer.from(token.split('.')[1], 'base64url').toString(),
@@ -262,7 +298,7 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
           issuer: idpIssuerFromProfile,
         });
       } catch (e) {
-        console.warn('[iam/saml] setIdJagSubjectToken failed (non-fatal)', e);
+        moduleLog.warn('[iam/saml] setIdJagSubjectToken failed (non-fatal)', { error: e instanceof Error ? e.message : String(e) });
       }
     }
 
@@ -284,8 +320,16 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
         authnContextClassRefs: idpMfa.authnContextClassRefs,
         mfaRequired: Boolean(tenant.settings?.mfaRequired),
       },
-      ip: req.ip ?? 'unknown',
+      ip: clientIpHelper(req),
       userAgent: req.headers['user-agent'] ?? 'unknown',
+    });
+
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105) — this
+    // point is only reached for a COMPLETED login: the MFA-required branch
+    // above (line ~209) returns early before here, so this never
+    // double-fires alongside mfa.ts's own auth.success on MFA completion.
+    chariotEmitter.send('auth.success', {
+      data: { tenantId, userId: user._id.toString(), method: 'saml' },
     });
 
     // Set session cookies and redirect
@@ -315,9 +359,17 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
     const redirectUrl = isSafeRelayState(rawRelayState) ? rawRelayState : '/';
     res.redirect(redirectUrl);
   } catch {
-    // SOC 2: Record failed auth attempt
-    const failIp = req.ip ?? 'unknown';
-    const failTenant = req.tenantId || (req.query.tenant as string) || '';
+    // SOC 2: Record failed auth attempt. Must key on the SAME
+    // trusted-proxy-aware IP as the gate above so gate and recorder align.
+    const failIp = clientIpHelper(req);
+    const failTenant = (req.params.tenantId as string) || '';
+    // CHARIOT::§16.1 IAM (CHARIOT-SPEC.md:1346, rulings item 91/105).
+    // Emitted regardless of whether failTenant resolved — an unresolvable
+    // tenant on a failed SAML callback is itself a failure worth recording.
+    chariotEmitter.send('auth.failure', {
+      severity: 'warning',
+      data: { tenantId: failTenant || null, method: 'saml', ip: failIp },
+    });
     if (failTenant) {
       try {
         await recordAuthFailure(failIp, failTenant);
@@ -326,7 +378,7 @@ router.post('/saml/callback', async (req: Request, res: Response): Promise<void>
         // mask the underlying auth failure, but do not let them block the
         // 401 response to the client.
          
-        console.error('[iam/saml] recordAuthFailure failed', rateLimitErr);
+        moduleLog.error('[iam/saml] recordAuthFailure failed', { error: rateLimitErr instanceof Error ? rateLimitErr.message : String(rateLimitErr) });
       }
     }
     // Do not leak the underlying SAML library error to the client.

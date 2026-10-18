@@ -55,10 +55,37 @@ export interface SessionSurfaceState {
    * the tuple in the conversation).
    */
   surfacedBySession: Map<SessionId, Map<SurfacedKey, SurfacedToolTuple>>;
+  /**
+   * CHARIOT::§16.2 step 4 (CHARIOT-SPEC.md:1363, rulings item 91(2)/115(a))
+   * — "Conversational queue: surfaced at the start of the admin's next AI
+   * conversation." Chariot owns no conversation surface of its own
+   * (CHARIOT-SPEC.md:60), so "the start of the admin's next AI
+   * conversation" is operationalized as the FIRST successful
+   * chariot_query/chariot_list response of a new MCP session whose
+   * principal is an admin — this set records which sessions have already
+   * had `pendingAlerts` surfaced, so a second call in the same session
+   * does not repeat it. Reuses this SAME per-session tracker structure
+   * (not a parallel one) per the ruling's own instruction.
+   */
+  pendingAlertsSurfacedSessions: Set<SessionId>;
 }
 
 export function createSessionSurfaceState(): SessionSurfaceState {
-  return { surfacedBySession: new Map() };
+  return { surfacedBySession: new Map(), pendingAlertsSurfacedSessions: new Set() };
+}
+
+/**
+ * True when `pendingAlerts` has already been surfaced to this session by
+ * a prior chariot_query/chariot_list call. Sessions with no prior
+ * surfacing return false.
+ */
+export function wasPendingAlertsSurfacedInSession(state: SessionSurfaceState, sessionId: SessionId): boolean {
+  return state.pendingAlertsSurfacedSessions.has(sessionId);
+}
+
+/** Mark a session as having had pendingAlerts surfaced — fires once per session. */
+export function markPendingAlertsSurfacedInSession(state: SessionSurfaceState, sessionId: SessionId): void {
+  state.pendingAlertsSurfacedSessions.add(sessionId);
 }
 
 export function composeSurfacedKey(adapterId: string, toolName: string): SurfacedKey {

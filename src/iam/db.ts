@@ -9,7 +9,7 @@
 import type { MongoClient, Db, Collection, Document } from 'mongodb';
 
 let _client: MongoClient | null = null;
-let _dbName: string = 'epicai';
+let _dbName: string = 'chariot';
 
 /**
  * Inject the MongoDB client from bootstrap. Must be called before any
@@ -18,6 +18,16 @@ let _dbName: string = 'epicai';
 export function setMongoClient(client: MongoClient, dbName: string): void {
   _client = client;
   _dbName = dbName;
+}
+
+/**
+ * True once enterprise bootstrap has injected a MongoDB client. Lets
+ * features that must also work on a workstation/edge install without
+ * MongoDB (operational telemetry's local store, C4AMD §8) choose a backend
+ * without catching `getDb()`'s rejection.
+ */
+export function hasMongoClient(): boolean {
+  return _client !== null;
 }
 
 /**

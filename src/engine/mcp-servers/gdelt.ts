@@ -25,7 +25,7 @@ export class GdeltMCPServer extends MCPAdapterBase {
       name: 'gdelt',
       displayName: 'GDELT 2.0 News Intelligence',
       version: '1.0.0',
-      category: 'news',
+      category: 'media',
       keywords: [
         'gdelt', 'news', 'global news', 'media', 'events', 'language', 'tone',
         'sentiment', 'geopolitics', 'articles', 'news search', 'news volume',

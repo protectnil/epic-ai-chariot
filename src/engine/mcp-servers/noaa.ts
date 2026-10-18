@@ -29,7 +29,7 @@ export class NOAAMCPServer extends MCPAdapterBase {
       name: 'noaa',
       displayName: 'NOAA National Weather Service',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'noaa', 'nws', 'weather', 'forecast', 'alerts', 'stations',
         'national weather service', 'temperature', 'wind', 'severe weather',

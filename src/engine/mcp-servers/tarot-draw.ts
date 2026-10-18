@@ -41,7 +41,7 @@ export class TarotDrawMCPServer extends MCPAdapterBase {
       name: 'tarot-draw',
       displayName: 'Tarot Draw',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'tarot', 'tarot card', 'card draw', 'divination', 'fortune',
         'spread', 'past present future', 'single card', 'mystical',

@@ -70,7 +70,7 @@ export class DnsMCPServer extends MCPAdapterBase {
       name: 'dns',
       displayName: 'DNS Lookup',
       version: '1.0.0',
-      category: 'developer-tools',
+      category: 'devops',
       keywords: [
         'dns', 'domain', 'lookup', 'network', 'records', 'mx', 'ns', 'txt',
         'cname', 'aaaa', 'ptr', 'reverse dns', 'dns-over-https', 'doh',

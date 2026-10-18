@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "trustPolicies": [
+    {
+      "name": "aws-signer-tp",
+      "registryScopes": ["*"],
+      "signatureVerification": {
+        "level": "strict"
+      },
+      "trustStores": [
+        "signingAuthority:aws-signer-ts",
+        "signingAuthority:aws-us-gov-signer-ts"
+      ],
+      "trustedIdentities": [
+        "arn:aws:signer:us-east-1:827566276480:/signing-profiles/chariot_gateway_notation"
+      ]
+    }
+  ]
+}

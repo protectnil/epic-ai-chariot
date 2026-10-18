@@ -1,0 +1,56 @@
+# Epic AI® Chariot — AIR-GAP overlay (CH-29 / CH-30).
+#
+#   helm install chariot ./helm/chariot \
+#     -f ./helm/chariot/values.yaml \
+#     -f ./helm/chariot/values-airgap.yaml \
+#     --set global.imageRegistry=<acct>.dkr.ecr.<region>.amazonaws.com
+#
+# CH-29: the chart is fully self-contained — model, vector snapshot, and all
+# three images ship inside the Marketplace ECR; zero external egress at install
+# or runtime.
+#
+# This overlay pins the registry BOTH at `global.imageRegistry` and on each
+# image's own `registry` field, and that redundancy is deliberate. AWS
+# Marketplace regionalization rewrites the per-image `registry` fields in
+# values.yaml when it replicates the product to another region. Per-image
+# registry beats global (see chariot.resolveRegistry), so an overlay that set
+# only `global.imageRegistry` would be SILENTLY OVERRIDDEN by AWS's rewritten
+# value and the install would pull from the Marketplace ECR instead of the
+# operator's mirror — breaking the air gap. Setting both makes the overlay
+# authoritative regardless of what regionalization wrote.
+#
+# Replace every REPLACE_WITH_MARKETPLACE_ECR below with the same registry host.
+
+global:
+  # Set to your Marketplace ECR registry (no Docker Hub / Quay / ECR Public).
+  imageRegistry: "REPLACE_WITH_MARKETPLACE_ECR"
+  imagePullSecrets:
+    - name: marketplace-ecr
+
+gateway:
+  image:
+    registry: "REPLACE_WITH_MARKETPLACE_ECR"
+    # Air-gap MUST pin by digest once CH-54 is enabled. Set the digest mirrored
+    # into your ECR and the tag becomes advisory.
+    digest: ""
+    pullPolicy: IfNotPresent
+
+# Offline Ed25519 license is the air-gap default (CH-24) — License Manager would
+# require AWS egress, which air-gap forbids.
+license:
+  provider: "offline"
+  awsLicenseManager:
+    enabled: false
+
+# No IRSA in air-gap (no AWS reachability); the pod still bakes no keys (CH-25).
+serviceAccount:
+  roleArn: ""
+
+mongodb:
+  image:
+    registry: "REPLACE_WITH_MARKETPLACE_ECR"
+    pullPolicy: IfNotPresent
+redis:
+  image:
+    registry: "REPLACE_WITH_MARKETPLACE_ECR"
+    pullPolicy: IfNotPresent

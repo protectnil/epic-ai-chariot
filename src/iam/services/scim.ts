@@ -19,6 +19,10 @@ import type {
   ScimListResponse,
   AdapterCredentialDocument,
 } from '../types.js';
+import { createLogger } from '../../engine/logger.js';
+
+// Production logging goes through the project logger (never console.*).
+const moduleLog = createLogger('iam.scim-service');
 
 const USERS_COLLECTION = 'iam_users';
 const GROUPS_COLLECTION = 'iam_groups';
@@ -166,7 +170,7 @@ export async function syncGroupMembership(
     const memberObjectId = toObjectId(memberId);
     if (!memberObjectId) {
        
-      console.warn(`[iam/scim] syncGroupMembership: skipping non-ObjectId member '${memberId}'`);
+      moduleLog.warn(`[iam/scim] syncGroupMembership: skipping non-ObjectId member '${memberId}'`);
       continue;
     }
     const user = await usersCol.findOne({ _id: memberObjectId, tenantId });
@@ -333,6 +337,43 @@ export async function deleteUser(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Revoke every non-revoked adapter credential owned by a user (§10.4::4). Matched
+ * by the user's id string AND — when known — their email, because `connectedBy`
+ * holds the ObjectId string on some rows and the email on legacy user-scoped
+ * rows; a deprovisioned user's upstream credentials must not keep dispatching.
+ * Returns the number of credential rows revoked.
+ */
+/**
+ * The `connectedBy`/`status` match selecting a user's revocable adapter
+ * credentials (§10.4::4): every NON-revoked row keyed on the user's id OR — for
+ * legacy user-scoped rows — their email. Pure and tenant-agnostic so the
+ * targeting can be unit-tested without a database; callers add the tenant scope.
+ */
+export function userAdapterCredentialMatch(
+  userId: string,
+  userEmails: readonly string[] = [],
+): { status: { $ne: 'revoked' }; connectedBy: { $in: string[] } } {
+  // Dedupe; a credential may be keyed on the id string or on any email the
+  // user has held (a rename-then-deactivate PATCH must still revoke rows keyed
+  // on the PRIOR email, so callers pass both the old and new address).
+  const connectedBy = [...new Set([userId, ...userEmails.filter((e) => e.length > 0)])];
+  return { status: { $ne: 'revoked' }, connectedBy: { $in: connectedBy } };
+}
+
+export async function revokeUserAdapterCredentials(
+  tenantId: string,
+  userId: string,
+  userEmails: readonly string[] = [],
+): Promise<number> {
+  const credCol = await getCollection<AdapterCredentialDocument>('iam_adapter_credentials');
+  const result = await credCol.updateMany(
+    { tenantId, ...userAdapterCredentialMatch(userId, userEmails) },
+    { $set: { status: 'revoked', revokedAt: new Date(), revokedBy: 'scim' } },
+  );
+  return result.modifiedCount;
+}
+
+/**
  * CRITICAL: On deactivation/deletion, revoke all sessions and
  * mark adapter credentials as revoked.
  */
@@ -346,20 +387,10 @@ async function handleDeprovisioning(
   await revokeAllUserSessions(tenantId, userId);
   await revokeAllUserRefreshTokens(tenantId, userId);
 
-  // Revoke adapter credentials. `connectedBy` stores the user's email on
-  // user-scoped credentials; for deprovisioning by userId we match on
-  // both the ObjectId-stringified user id and any email the user owned.
-  // Callers should also ensure the user document itself is in the
-  // deactivated state before invoking this to avoid races.
-  const credCol = await getCollection<AdapterCredentialDocument>('iam_adapter_credentials');
-  await credCol.updateMany(
-    {
-      tenantId,
-      connectedBy: userId,
-      status: { $ne: 'revoked' },
-    },
-    { $set: { status: 'revoked', revokedAt: new Date() } },
-  );
+  // Revoke adapter credentials via the shared helper (§10.4::4). This internal
+  // hard-delete path revokes by userId; the SCIM routes additionally pass the
+  // email for legacy user-scoped rows keyed on `connectedBy = email`.
+  await revokeUserAdapterCredentials(tenantId, userId);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

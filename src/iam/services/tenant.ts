@@ -6,10 +6,10 @@
  */
 
 import { getCollection } from '../db.js';
-import { generateScimToken, verifyToken } from '../crypto.js';
+import { generateScimToken, verifyToken, encryptFields } from '../crypto.js';
 import type { TenantDocument, TenantSettings, SamlConfig, OidcConfig } from '../types.js';
 
-const COLLECTION = 'iam_tenants';
+export const COLLECTION = 'iam_tenants';
 
 // ── Read ────────────────────────────────────────────────────────────────────
 
@@ -25,6 +25,7 @@ export async function create(
   name: string,
   domain: string,
   settings?: Partial<TenantSettings>,
+  encryptionKeyRef?: string,
 ): Promise<TenantDocument> {
   const col = await getCollection<TenantDocument>(COLLECTION);
   const now = new Date();
@@ -44,6 +45,10 @@ export async function create(
     name,
     domain,
     settings: defaultSettings,
+    // §10.8::4 — record the per-tenant encryption key reference. Defaults to
+    // the env-key ID of the master key this deployment encrypts under; a
+    // KMS-backed deployment passes its own key pointer.
+    encryptionKeyRef: encryptionKeyRef ?? 'env:ENTERPRISE_MASTER_KEY',
     active: true,
     createdAt: now,
     updatedAt: now,
@@ -85,7 +90,7 @@ export async function updateSso(
 
   const setFields: Record<string, unknown> = { updatedAt: new Date() };
   if (sso.saml) setFields['settings.saml'] = sso.saml;
-  if (sso.oidc) setFields['settings.oidc'] = sso.oidc;
+  if (sso.oidc) setFields['settings.oidc'] = encryptOidcSecretAtRest(sso.oidc, tenantId);
 
   const result = await col.findOneAndUpdate(
     { tenantId },
@@ -94,6 +99,25 @@ export async function updateSso(
   );
 
   return result ?? null;
+}
+
+/**
+ * §10.3::1 — the OIDC client secret SHALL be encrypted at rest. Given an OIDC
+ * config carrying a plaintext `clientSecret`, encrypt it with the tenant-bound
+ * master key (AES-256-GCM) and return a config that persists ONLY the
+ * `encrypted:iv` blob in `clientSecretEncrypted`, with the plaintext removed.
+ * An already-encrypted config (no plaintext) is returned unchanged.
+ */
+function encryptOidcSecretAtRest(oidc: OidcConfig, tenantId: string): OidcConfig {
+  if (!oidc.clientSecret) return oidc;
+  // CH-10 (§12.2) AAD binding. This config carries exactly one OIDC client
+  // secret per tenant (no adapterId concept here), so a fixed record-type
+  // identifier — matched byte-for-byte in oidc.ts's resolveOidcClientSecret
+  // — provides the same anti-relocation binding a real adapterId would.
+  const { encrypted, iv } = encryptFields({ value: oidc.clientSecret }, tenantId, 'oidc-client-secret');
+  const { clientSecret: _plaintext, ...rest } = oidc;
+  void _plaintext;
+  return { ...rest, clientSecretEncrypted: `${encrypted}:${iv}` };
 }
 
 // ── SCIM Token ──────────────────────────────────────────────────────────────
@@ -161,4 +185,17 @@ export async function activate(tenantId: string): Promise<TenantDocument | null>
   );
 
   return result ?? null;
+}
+
+// ── Delete (§10.8::1 — completes tenant CRUD) ────────────────────────────────
+
+/**
+ * Hard-delete the tenant record. Returns true when a row was removed. Admin-
+ * initiated and irreversible; owned collections (users/creds/audit) are keyed
+ * by tenantId and are pruned by their own retention/cleanup paths.
+ */
+export async function deleteTenant(tenantId: string): Promise<boolean> {
+  const col = await getCollection<TenantDocument>(COLLECTION);
+  const result = await col.deleteOne({ tenantId });
+  return result.deletedCount > 0;
 }

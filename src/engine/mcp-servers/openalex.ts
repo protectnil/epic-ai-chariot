@@ -28,7 +28,7 @@ export class OpenAlexMCPServer extends MCPAdapterBase {
       name: 'openalex',
       displayName: 'OpenAlex Scholarly Works',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'openalex', 'scholarly', 'academic', 'research', 'papers', 'works',
         'authors', 'institutions', 'concepts', 'citations', 'open access',

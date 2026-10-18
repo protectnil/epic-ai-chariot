@@ -35,12 +35,49 @@ export type AuthConfig = JWTAuthConfig | MTLSConfig;
 // Tenant Context
 // =============================================================================
 
+/**
+ * Principal kind for a TenantContext. Distinguishes a human operator from
+ * an autonomous agent or a service/machine-to-machine caller.
+ *
+ * Wiz 2 finding (gap #3): TenantContext previously had NO principal-kind
+ * field at all, so nothing distinguished a human dashboard user from an
+ * agent or service principal — an agent could silently inherit a grant
+ * that was only ever intended for a human operator.
+ *
+ * Optional and MUST default to 'human' wherever it is consulted
+ * (AccessPolicyEngine.principalMatches, the native rbac principal-scope
+ * checks) so every existing caller that predates this field keeps its
+ * current grants unchanged. Only a rule/mapping that explicitly restricts
+ * itself to specific principal kinds is affected.
+ */
+export type PrincipalType = 'human' | 'agent' | 'service';
+
 export interface TenantContext {
   tenantId: string;
   principalId: string;
   roles: string[];
   tier: 'free' | 'pro' | 'enterprise';
   attributes: Record<string, string>;
+  /**
+   * Principal kind. Optional for backward compatibility — legacy context
+   * builders (contextFromJWT, contextFromCert, createDevContext in
+   * TenantContext.ts) predate this field and do not stamp it. Every
+   * consumer treats an absent value as 'human'.
+   */
+  principalType?: PrincipalType;
+}
+
+/**
+ * Minimal structural contract for an adapter-verification status lookup,
+ * satisfied by `VerifiedCatalog.getVerification()`
+ * (src/catalog/VerifiedCatalog.ts) without FederationManager needing to
+ * import the `catalog` package — that package already imports FROM
+ * `engine`, so an `engine -> catalog` import would create a dependency
+ * cycle. Any object exposing a matching `getVerification` method can be
+ * passed as `FederationManagerOptions.verifiedCatalog`.
+ */
+export interface AdapterVerificationLookup {
+  getVerification(adapterName: string): { status: 'verified' | 'failed' | 'pending' | 'stale' };
 }
 
 // =============================================================================
@@ -61,6 +98,17 @@ export interface PolicyRule {
   principal: {
     roles?: string[];
     attributes?: Record<string, string>;
+    /**
+     * Restrict this rule to specific principal kinds (gap #3). Absent or
+     * empty = matches any principal kind — identical to pre-existing
+     * behavior, so every rule authored before this field existed is
+     * unaffected. Set to `['human']` to mark a grant human-only: an
+     * agent/service TenantContext (principalType !== 'human') then fails
+     * principal matching for this rule even when its roles/attributes
+     * would otherwise match, closing the gap where an agent principal
+     * could silently hold a human-only grant.
+     */
+    principalTypes?: PrincipalType[];
   };
   resource: {
     toolCategories?: AdapterCategory[];
@@ -124,6 +172,20 @@ export interface EgressContext {
   host: string;
   port?: number;
   protocol?: 'http' | 'https';
+  /**
+   * §8.9::11 — request-scoped principal identity carried from the
+   * authenticated boundary through dispatch. Present only when the caller
+   * supplied a full TenantContext; absent on the unauthenticated OSS/local
+   * path, which therefore asserts no roles and can gain no grant.
+   *
+   * NOTE: `egressRuleMatches` does not currently branch on roles/attributes —
+   * these are carried and audited, not yet consumed as an authorization
+   * input. Adding a role/attribute condition to EgressRule is what would make
+   * them load-bearing.
+   */
+  principalId?: string;
+  roles?: string[];
+  attributes?: Record<string, string>;
 }
 
 /**

@@ -157,6 +157,13 @@ export function summarizeRenewOutcome(o: RenewOutcome): RenewSummary {
       };
     case 'no_local_license':
       return { line: o.message, color: 'r', status: 0, wrote: false };
+    case 'epoch_rollback':
+      return {
+        line: `Rollback refused — renewed license is older than the current floor: ${o.message}`,
+        color: 'r',
+        status: o.status,
+        wrote: false,
+      };
     case 'server_error':
       return {
         line: `Server error: ${o.message}`,

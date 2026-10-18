@@ -55,7 +55,7 @@ export class WeatherMCPServer extends MCPAdapterBase {
       name: 'weather',
       displayName: 'Open-Meteo Weather',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'weather', 'forecast', 'temperature', 'humidity', 'wind',
         'precipitation', 'conditions', 'open-meteo', 'meteorology',

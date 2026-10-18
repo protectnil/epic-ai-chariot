@@ -7,11 +7,11 @@
 
 import { createRequire } from 'node:module';
 import { createHash, createPublicKey, verify } from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { arch, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 
-interface NativeBinding {
+export interface NativeBinding {
   validateLicense(licenseJson: string, signatureB64: string): {
     valid: boolean;
     companyId?: string;
@@ -27,6 +27,12 @@ interface NativeBinding {
    * `tenantId` differs causes `allowed: false` with a non-empty `reason`.
    * Defense against a TS caller that accidentally constructs a
    * cross-tenant mappings array.
+   *
+   * Deny-by-default: an EMPTY `requestedAdapterIds` list returns
+   * `allowed: false` (nothing to authorize — a vacuous request is never
+   * success). Deny-precedence: any user-held group mapping with an empty
+   * `adapterIds` list is an explicit deny overriding all grants. Group ids
+   * are matched case-insensitively.
    *
    * `mappingsJson` shape: `[{ tenantId, groupId, adapterIds }, ...]`
    */
@@ -45,19 +51,91 @@ interface NativeBinding {
    * Resolve a user's accessible adapter IDs within the caller's tenant.
    * Mappings whose `tenantId` does not match are silently filtered out;
    * see `checkAccess` for the hard-error variant.
+   *
+   * Semantics are identical to `checkAccess` (shared native helper):
+   * group ids match case-insensitively, and an empty result may mean
+   * EXPLICIT DENY (a user-held group mapping with empty `adapterIds`),
+   * not just "no grants" — never treat this output as display-only truth
+   * while enforcing with different logic.
    */
   resolveUserAdapters(tenantId: string, userGroups: string[], mappingsJson: string): string[];
+  /**
+   * Principal-aware variant of `checkAccess` (gap #3 — Wiz 2 human/agent
+   * partition). Identical contract to `checkAccess` PLUS a mandatory
+   * `principalType` argument identifying the CALLER: "human" | "agent" |
+   * "service" (case-insensitive; native fails closed — denies with a
+   * structured reason — on anything else). Any mapping whose
+   * `principalScope` is a non-empty list that does not include the
+   * caller's kind is not honored for this call, so an agent/service
+   * caller cannot inherit a mapping an operator scoped to humans only.
+   *
+   * Optional on this interface (unlike `checkAccess`/`resolveUserAdapters`
+   * in `verifyBindingInterface`'s required-functions list) so a binary
+   * built before this native export existed still loads — callers that
+   * need the principal-kind partition MUST feature-detect
+   * (`typeof binding.checkAccessForPrincipal === 'function'`) before use.
+   */
+  checkAccessForPrincipal?(
+    tenantId: string,
+    principalType: 'human' | 'agent' | 'service',
+    userGroups: string[],
+    requestedAdapterIds: string[],
+    mappingsJson: string
+  ): {
+    allowed: boolean;
+    grantedAdapterIds: string[];
+    deniedAdapterIds: string[];
+    reason?: string;
+  };
+  /**
+   * Principal-aware variant of `resolveUserAdapters` (gap #3). See
+   * `checkAccessForPrincipal` for the principal-scope semantics. Returns
+   * an empty list on JSON parse error, invalid `principalType`, when no
+   * in-tenant mappings match, OR on explicit deny.
+   */
+  resolveUserAdaptersForPrincipal?(
+    tenantId: string,
+    principalType: 'human' | 'agent' | 'service',
+    userGroups: string[],
+    mappingsJson: string
+  ): string[];
+  /**
+   * CH-10 (§12.2): `adapterId` is bound into the AES-GCM AAD alongside
+   * `tenantId` so a ciphertext cannot be relocated from one adapter's row
+   * to another within the same tenant and still decrypt. Callers that do
+   * not have a literal catalog adapter (e.g. an OIDC client-secret row, an
+   * ID-JAG subject-token row) MUST still pass a stable, unique-within-tenant
+   * identifier for that record so the same anti-relocation binding applies.
+   */
   encryptCredential(
     plaintext: string,
     tenantId: string,
+    adapterId: string,
     masterKeyB64: string
   ): { encrypted: string; iv: string };
+  /**
+   * `legacyAllowed` (CHARIOT §12.2, CH-10, rulings item 59): whether an
+   * UNPREFIXED (legacy, empty-AAD) ciphertext may be decrypted in the
+   * current context. Ignored for `v2:`-prefixed (AAD-bound) records.
+   * Native-layer enforcement — see `native/src/vault.rs::decrypt_credential`
+   * and `src/iam/crypto.ts::resolveLegacyDecryptPolicy`.
+   */
   decryptCredential(
     encryptedB64: string,
     ivB64: string,
     tenantId: string,
-    masterKeyB64: string
+    adapterId: string,
+    masterKeyB64: string,
+    legacyAllowed: boolean
   ): string;
+  /**
+   * CH-10 (rulings item 59) capability probe. OPTIONAL: absent on any
+   * binary compiled before this change (e.g. the currently signed Sep-1
+   * build) — its absence MUST be treated as "the legacy-ciphertext gate is
+   * unsupported", never as "legacy decryption is allowed". See
+   * `src/iam/crypto.ts::hasVaultLegacyGate()`.
+   */
+  vaultProtocolVersion?(): number;
   discoverInternalApis(codebasePath: string): {
     services: Array<{
       name: string;
@@ -83,6 +161,7 @@ function getPlatformPackage(): string {
 
   const platformMap: Record<string, string> = {
     'linux-x64': '@epicai/chariot-bin-linux-x64-gnu',
+    'linux-arm64': '@epicai/chariot-bin-linux-arm64-gnu',
     'darwin-arm64': '@epicai/chariot-bin-darwin-arm64',
     'darwin-x64': '@epicai/chariot-bin-darwin-x64',
     'win32-x64': '@epicai/chariot-bin-win32-x64-msvc',
@@ -94,7 +173,7 @@ function getPlatformPackage(): string {
   if (!pkg) {
     throw new Error(
       `Unsupported platform: ${p}-${a}. ` +
-      `Chariot enterprise features require one of: linux-x64, darwin-arm64, darwin-x64, win32-x64`
+      `Chariot enterprise features require one of: linux-x64, linux-arm64, darwin-arm64, darwin-x64, win32-x64`
     );
   }
 
@@ -137,23 +216,6 @@ function functionalSmokeTest(binding: NativeBinding): boolean {
     return result !== null && typeof result === 'object' && result.valid === false;
   } catch {
     return false;
-  }
-}
-
-/**
- * Resolve the filesystem path of the native binary.
- * Returns the resolved path or null if not resolvable.
- */
-function resolveBinaryPath(requireFn: NodeRequire): string | null {
-  try {
-    return requireFn.resolve('../../native/chariot-native.node');
-  } catch {
-    try {
-      const pkg = getPlatformPackage();
-      return requireFn.resolve(pkg);
-    } catch {
-      return null;
-    }
   }
 }
 
@@ -359,30 +421,212 @@ function verifyIntegrityManifest(
 }
 
 /**
+ * The native addon, loaded only after its SHA-256 matched the Ed25519-signed
+ * integrity manifest. Shared by every loader of `chariot-native.node`
+ * (`loadNativeBinding` here, and `loadNativeEdge` in
+ * src/engine/retrieval/nativeEdge.ts) so no code path requires the addon
+ * without the manifest check (CHARIOT §3.5::10, §12.6::2, §12.6::3).
+ *
+ *   integrity  — a candidate exists but none matched the signed manifest, the
+ *                file could not be read for hashing, or it changed on disk
+ *                between verification and load. Fail closed.
+ *   unloadable — nothing is installed, or the verified file could not be
+ *                required (wrong ABI, missing glibc, unresolvable dep).
+ */
+export type VerifiedNativeModule =
+  | { ok: true; module: unknown; path: string; hash: string }
+  | { ok: false; kind: 'integrity' | 'unloadable'; message: string };
+
+let _verifiedNative: VerifiedNativeModule | null = null;
+
+/**
+ * Resolve, verify and load the native addon. Idempotent (cached after the
+ * first call).
+ *
+ * Order (all must pass, fail closed):
+ *   0. Signed integrity manifest — SHA-256 of THE selected file matches the
+ *      Ed25519-signed manifest entry for this platform, checked BEFORE the
+ *      file is required. Exactly one file is selected, by what it is built
+ *      for (see nativeBinaryIsBuiltForHost), not by whether it verifies: the
+ *      bundled native/ file when its header says it is built for this host,
+ *      else the platform sibling package (the bundled file is the linux-x64
+ *      build, so on linux-arm64/darwin/win32 installs it is not the host's
+ *      binary). A hash mismatch on the selected file never falls through to
+ *      another file.
+ *   1. require() only the verified file.
+ *   2. Re-hash that path after load. Path-based dlopen cannot pin the bytes
+ *      it maps, so this narrows (it does not remove) the window in which the
+ *      file could be replaced between hash and load; a replaced file is
+ *      detected and the binding is never returned.
+ */
+export function loadVerifiedNativeModule(): VerifiedNativeModule {
+  if (_verifiedNative) return _verifiedNative;
+  _verifiedNative = resolveVerifiedNativeModule();
+  return _verifiedNative;
+}
+
+/**
+ * True when the file's executable header says it was built for this process's
+ * platform and CPU. A compatibility test (ELF e_machine, Mach-O cputype, PE
+ * Machine), not an integrity test: it only decides WHICH single file is
+ * verified. Unknown or unreadable headers return false.
+ */
+function nativeBinaryIsBuiltForHost(filePath: string): boolean {
+  let header: Buffer;
+  let fd: number | null = null;
+  try {
+    fd = openSync(filePath, 'r');
+    header = Buffer.alloc(4096);
+    const n = readSync(fd, header, 0, header.length, 0);
+    header = header.subarray(0, n);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  const cpu = arch();
+  const os = platform();
+  if (header.length < 64) return false;
+
+  // ELF: 7f 'E' 'L' 'F', EI_CLASS 2 (64-bit), EI_DATA 1 (little endian)
+  if (header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46) {
+    if (os !== 'linux' || header[4] !== 2 || header[5] !== 1) return false;
+    const machine = header.readUInt16LE(18);
+    return (cpu === 'x64' && machine === 0x3e) || (cpu === 'arm64' && machine === 0xb7);
+  }
+  // Mach-O 64-bit little endian: CF FA ED FE, cputype u32 LE at offset 4
+  if (header.readUInt32LE(0) === 0xfeedfacf) {
+    if (os !== 'darwin') return false;
+    const cputype = header.readUInt32LE(4);
+    return (cpu === 'x64' && cputype === 0x01000007) || (cpu === 'arm64' && cputype === 0x0100000c);
+  }
+  // PE: 'MZ', e_lfanew u32 LE at 0x3C -> 'PE\0\0', Machine u16 LE after it
+  if (header[0] === 0x4d && header[1] === 0x5a) {
+    if (os !== 'win32') return false;
+    const peOffset = header.readUInt32LE(0x3c);
+    if (peOffset + 6 > header.length || header.readUInt32LE(peOffset) !== 0x00004550) return false;
+    const machine = header.readUInt16LE(peOffset + 4);
+    return (cpu === 'x64' && machine === 0x8664) || (cpu === 'arm64' && machine === 0xaa64);
+  }
+  return false;
+}
+
+function resolveVerifiedNativeModule(): VerifiedNativeModule {
+  const require = createRequire(import.meta.url);
+
+  // Exactly ONE candidate is selected, by what the file is built for, never by
+  // whether its hash happens to verify — so a hash mismatch is always a hard
+  // fail-closed and never falls through to another file (CHARIOT §12.6::3):
+  //   1. the bundled native/ file, when its binary header says it is built for
+  //      this host (development builds; linux-x64 installs; container images);
+  //   2. else the platform sibling package (linux-arm64/darwin/win32 installs,
+  //      where the bundled file is the linux-x64 build);
+  //   3. else the bundled file, and let verification decide.
+  let bundledPath: string | null = null;
+  let siblingPath: string | null = null;
+  let resolveError: unknown;
+  try {
+    bundledPath = require.resolve('../../native/chariot-native.node');
+  } catch (err) {
+    resolveError = err;
+  }
+  try {
+    siblingPath = require.resolve(getPlatformPackage());
+  } catch (err) {
+    resolveError = resolveError ?? err;
+  }
+  const binaryPath =
+    bundledPath && nativeBinaryIsBuiltForHost(bundledPath) ? bundledPath : (siblingPath ?? bundledPath);
+  if (!binaryPath) {
+    const message = resolveError instanceof Error ? resolveError.message : 'native binary not found';
+    return { ok: false, kind: 'unloadable', message };
+  }
+
+  const verifiedHash = computeBinaryHash(binaryPath);
+  if (!verifiedHash) {
+    // Cannot compute hash — cannot verify. Fail closed.
+    return {
+      ok: false,
+      kind: 'integrity',
+      message: 'Cannot read native binary file to compute integrity hash.',
+    };
+  }
+  const integrityError = verifyIntegrityManifest(binaryPath, verifiedHash, require);
+  if (integrityError) {
+    return {
+      ok: false,
+      kind: 'integrity',
+      message: `Native binary integrity check failed: ${integrityError}`,
+    };
+  }
+  const verifiedPath = binaryPath;
+
+  let loaded: unknown;
+  try {
+    // Load only the verified file.
+    // eslint-disable-next-line local/no-dynamic-module-specifier -- DYNAMIC_LOADER_SITES: native addon path resolved from the fixed bundled location or getPlatformPackage() and integrity-verified above
+    loaded = require(verifiedPath);
+  } catch (err) {
+    return {
+      ok: false,
+      kind: 'unloadable',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  if (computeBinaryHash(verifiedPath) !== verifiedHash) {
+    return {
+      ok: false,
+      kind: 'integrity',
+      message: 'Native binary integrity check failed: the binary changed on disk between verification and load.',
+    };
+  }
+
+  return { ok: true, module: loaded, path: verifiedPath, hash: verifiedHash };
+}
+
+/**
  * Load the native Chariot binary.
  * Returns null if the binary is not installed (single-user mode).
  *
  * Verification pipeline (all must pass, fail closed):
+ *   0. Signed integrity manifest, checked before the addon is loaded
+ *      (loadVerifiedNativeModule)
  *   1. Interface check — all required functions exist
  *   2. Functional smoke test — binary executes and returns expected structure
- *   3. Signed integrity manifest — SHA-256 hash matches Ed25519-signed manifest
  */
 export function loadNativeBinding(): NativeBinding | null {
   if (_loadAttempted) return _binding;
   _loadAttempted = true;
 
-  try {
-    const require = createRequire(import.meta.url);
-    let candidate: unknown;
+  const notLoaded = (msg: string): null => {
+    // "not installed" (expected) is distinguished from "installed but
+    // unloadable" (bug) by the captured message.
+    _loadError =
+      `Native binary not loaded (${msg}). ` +
+      'If you installed @epicai/chariot and expected the native binary to be present, ' +
+      'check that a matching platform package is installed: ' +
+      '@epicai/chariot-bin-linux-x64-gnu, @epicai/chariot-bin-linux-arm64-gnu, ' +
+      '@epicai/chariot-bin-darwin-arm64, ' +
+      '@epicai/chariot-bin-darwin-x64, or @epicai/chariot-bin-win32-x64-msvc. ' +
+      'Running in single-user mode.';
+    _binding = null;
+    return null;
+  };
 
-    // First try loading from the local native/ directory (development)
-    try {
-      candidate = require('../../native/chariot-native.node');
-    } catch {
-      // Not in development, try platform package
-      const pkg = getPlatformPackage();
-      candidate = require(pkg);
+  try {
+    const verified = loadVerifiedNativeModule();
+    if (!verified.ok) {
+      if (verified.kind === 'integrity') {
+        _loadError = `${verified.message} Enterprise mode is disabled.`;
+        _binding = null;
+        return null;
+      }
+      return notLoaded(verified.message);
     }
+    const candidate = verified.module;
 
     // Step 1: Verify the loaded artifact has the expected interface
     if (!verifyBindingInterface(candidate)) {
@@ -402,53 +646,11 @@ export function loadNativeBinding(): NativeBinding | null {
       return null;
     }
 
-    // Step 3: Signed integrity manifest — verify hash against trusted manifest
-    const binaryPath = resolveBinaryPath(require);
-    if (binaryPath) {
-      const computedHash = computeBinaryHash(binaryPath);
-      if (computedHash) {
-        _binaryHash = computedHash;
-        const integrityError = verifyIntegrityManifest(binaryPath, computedHash, require);
-        if (integrityError) {
-          _loadError = `Native binary integrity check failed: ${integrityError} ` +
-            'Enterprise mode is disabled.';
-          _binding = null;
-          return null;
-        }
-      } else {
-        // Cannot compute hash — cannot verify. Fail closed.
-        _loadError = 'Cannot read native binary file to compute integrity hash. ' +
-          'Enterprise mode is disabled.';
-        _binding = null;
-        return null;
-      }
-    } else {
-      // Cannot resolve path — cannot verify. Fail closed.
-      _loadError = 'Cannot resolve native binary file path for integrity verification. ' +
-        'Enterprise mode is disabled.';
-      _binding = null;
-      return null;
-    }
-
+    _binaryHash = verified.hash;
     _binding = candidate;
     return _binding;
   } catch (loadErr) {
-    // Reached only when `require()` throws — typically because the binary
-    // is not installed (single-user mode) or because the platform package
-    // cannot be loaded (wrong ABI, missing glibc version, unresolvable
-    // transitive dep). Capture the actual error message so operators can
-    // tell the difference between "not installed" (expected) and "installed
-    // but unloadable" (bug).
-    const msg = loadErr instanceof Error ? loadErr.message : String(loadErr);
-    _loadError =
-      `Native binary not loaded (${msg}). ` +
-      'If you installed @epicai/chariot and expected the native binary to be present, ' +
-      'check that a matching platform package is installed: ' +
-      '@epicai/chariot-bin-linux-x64-gnu, @epicai/chariot-bin-darwin-arm64, ' +
-      '@epicai/chariot-bin-darwin-x64, or @epicai/chariot-bin-win32-x64-msvc. ' +
-      'Running in single-user mode.';
-    _binding = null;
-    return null;
+    return notLoaded(loadErr instanceof Error ? loadErr.message : String(loadErr));
   }
 }
 

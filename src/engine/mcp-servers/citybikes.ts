@@ -25,7 +25,7 @@ export class CitybikesServer extends MCPAdapterBase {
       name: 'citybikes',
       displayName: 'CityBik.es Bike Sharing',
       version: '1.0.0',
-      category: 'transportation',
+      category: 'logistics',
       keywords: [
         'citybikes', 'bike sharing', 'bikeshare', 'bicycle', 'cycling',
         'stations', 'docked bikes', 'free bikes', 'bike rental',

@@ -25,7 +25,7 @@ export class NutritionMCPServer extends MCPAdapterBase {
       name: 'nutrition',
       displayName: 'Open Food Facts Nutrition',
       version: '1.0.0',
-      category: 'health' as const,
+      category: 'healthcare' as const,
       keywords: [
         'nutrition', 'food', 'diet', 'calories', 'macros', 'protein',
         'carbohydrates', 'fat', 'fiber', 'nutriscore', 'nova', 'barcode',

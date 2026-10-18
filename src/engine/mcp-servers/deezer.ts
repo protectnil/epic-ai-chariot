@@ -29,7 +29,7 @@ export class DeezerMCPServer extends MCPAdapterBase {
       name: 'deezer',
       displayName: 'Deezer',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'deezer', 'music', 'tracks', 'albums', 'artists', 'playlists',
         'search', 'chart', 'top tracks', 'streaming', 'audio',

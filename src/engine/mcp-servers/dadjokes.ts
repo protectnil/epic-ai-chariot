@@ -30,7 +30,7 @@ export class DadJokesMCPServer extends MCPAdapterBase {
       name: 'dadjokes',
       displayName: 'Dad Jokes',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'dad jokes', 'jokes', 'humor', 'comedy', 'funny', 'puns',
         'random joke', 'trivia', 'fun', 'icanhazdadjoke',

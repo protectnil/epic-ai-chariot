@@ -27,7 +27,7 @@ export class LyricsOvhMCPServer extends MCPAdapterBase {
       name: 'lyrics-ovh',
       displayName: 'Lyrics OVH',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'lyrics', 'song lyrics', 'music', 'artist', 'songs', 'track',
         'search', 'suggest', 'ovh', 'free lyrics', 'lyrics lookup',

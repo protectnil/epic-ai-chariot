@@ -85,7 +85,7 @@ export class DataCiteMCPServer extends MCPAdapterBase {
       name: 'datacite',
       displayName: 'DataCite',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'datacite', 'doi', 'dataset', 'software', 'research data',
         'scholarly', 'zenodo', 'dryad', 'figshare', 'citation',

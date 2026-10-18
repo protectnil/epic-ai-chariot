@@ -41,7 +41,7 @@ export class TheCommitteeMCPServer extends MCPAdapterBase {
       name: 'the-committee',
       displayName: 'The Committee',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'committee', 'random', 'random number', 'democracy', 'vote',
         'decision', 'funny', 'humor', 'stupid', 'generator', 'dissent',

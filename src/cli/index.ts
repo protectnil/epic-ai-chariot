@@ -18,7 +18,7 @@ export {
   upsertAdapterState,
   withLastHealthCheck,
 } from './state.js';
-export { loadCredentials, loadCredentialsFrom, parseEnvFile, writeCredential, CREDENTIAL_VALUE_CONTROL_CHAR_RE } from './credentials.js';
-export { detectMcpClients, detectSystem, writeMcpConfig } from './mcp-clients.js';
+export { loadCredentials, loadCredentialsFrom, parseEnvFile, removeCredential, writeCredential, CREDENTIAL_VALUE_CONTROL_CHAR_RE } from './credentials.js';
+export { detectMcpClients, detectSystem, removeMcpConfig, verifyMcpConfigLoaded, writeMcpConfig } from './mcp-clients.js';
 export type { McpEntry } from './mcp-clients.js';
 export { adapterTypeLabel } from './display.js';

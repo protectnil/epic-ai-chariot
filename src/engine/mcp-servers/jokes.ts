@@ -34,7 +34,7 @@ export class JokesMCPServer extends MCPAdapterBase {
       name: 'jokes',
       displayName: 'JokeAPI — Jokes & Humor',
       version: '1.0.0',
-      category: 'entertainment',
+      category: 'media',
       keywords: [
         'jokes', 'humor', 'comedy', 'funny', 'pun', 'programming jokes',
         'dark humor', 'spooky', 'christmas', 'random joke', 'joke search',

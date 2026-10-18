@@ -25,7 +25,7 @@ export class UsgsVolcanoMCPServer extends MCPAdapterBase {
       name: 'usgs-volcano',
       displayName: 'USGS Volcano Hazards',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'usgs', 'volcano', 'eruption', 'volcanic', 'hazards', 'alert',
         'aviation color code', 'VONA', 'VAN', 'alaska', 'hawaii', 'yellowstone',

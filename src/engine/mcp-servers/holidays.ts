@@ -61,7 +61,7 @@ export class HolidaysMCPServer extends MCPAdapterBase {
       name: 'holidays',
       displayName: 'Holidays (Nager.Date)',
       version: '1.0.0',
-      category: 'calendar',
+      category: 'productivity',
       keywords: [
         'holidays', 'public holidays', 'national holidays', 'calendar',
         'country holidays', 'nager', 'date', 'bank holiday', 'federal holiday',

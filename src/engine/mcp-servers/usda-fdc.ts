@@ -43,7 +43,7 @@ export class UsdaFdcMCPServer extends MCPAdapterBase {
       name: 'usda-fdc',
       displayName: 'USDA Food Data Central',
       version: '1.0.0',
-      category: 'food-nutrition',
+      category: 'food',
       keywords: [
         'usda', 'fdc', 'food', 'nutrition', 'nutrients', 'calories',
         'food database', 'branded food', 'food search', 'nutrient values',

@@ -45,7 +45,7 @@ export class SpaceNewsMCPServer extends MCPAdapterBase {
       name: 'spacenews',
       displayName: 'Spaceflight News API',
       version: '1.0.0',
-      category: 'news',
+      category: 'media',
       keywords: [
         'spaceflight', 'space', 'nasa', 'spacex', 'rocket', 'launch',
         'astronomy', 'aerospace', 'satellite', 'iss', 'news', 'articles',

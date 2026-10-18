@@ -82,7 +82,7 @@ export class UnpaywallMCPServer extends MCPAdapterBase {
       name: 'unpaywall',
       displayName: 'Unpaywall Open Access',
       version: '1.0.0',
-      category: 'research',
+      category: 'science',
       keywords: [
         'unpaywall', 'open access', 'oa', 'doi', 'scholarly', 'academic',
         'papers', 'research', 'publications', 'free pdf', 'preprint',

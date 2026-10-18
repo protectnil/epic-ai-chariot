@@ -27,7 +27,7 @@ export class MeteostatMCPServer extends MCPAdapterBase {
       name: 'meteostat',
       displayName: 'Meteostat Historical Weather',
       version: '1.0.0',
-      category: 'weather',
+      category: 'science',
       keywords: [
         'meteostat', 'weather', 'historical weather', 'climate', 'temperature',
         'precipitation', 'wind', 'pressure', 'weather station', 'daily weather',

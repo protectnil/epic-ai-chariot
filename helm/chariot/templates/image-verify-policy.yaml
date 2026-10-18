@@ -1,0 +1,62 @@
+{{- /*
+The fail-closed assert is called UNCONDITIONALLY here (not inside the `if`
+below) so that turning verification off entirely — imageVerification.enabled:
+false, or engine: none/rhacs — cannot silently skip the CH-54 guard the way it
+would if the assert were nested inside the same condition that gates whether
+this ClusterPolicy renders. See chariot.assertImageVerifyFailClosed.
+*/ -}}
+{{- include "chariot.assertImageVerifyFailClosed" . -}}
+{{- if and .Values.imageVerification.enabled (eq (include "chariot.imageVerificationEngine" .) "kyverno") -}}
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "chariot.fullname" . }}-image-verify
+  labels:
+    {{- include "chariot.labels" . | nindent 4 }}
+spec:
+  background: false
+  validationFailureAction: {{ .Values.imageVerification.kyverno.validationFailureAction }}
+  webhookConfiguration:
+    failurePolicy: {{ .Values.imageVerification.kyverno.failurePolicy }}
+    timeoutSeconds: {{ .Values.imageVerification.kyverno.timeoutSeconds }}
+  rules:
+    - name: verify-gateway-image-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: {{ include "chariot.name" . }}
+                  app.kubernetes.io/component: gateway
+      verifyImages:
+        - type: Notary
+          imageReferences:
+            {{- /*
+              Kyverno normalizes pod image refs to canonical form BEFORE
+              wildcard-matching imageReferences. A bare Docker Hub repository
+              (global.imageRegistry empty) renders here without a registry host
+              (e.g. "chariot-gateway"), but the pod ref is
+              normalized to "docker.io/protectnil/...". A host-less pattern would
+              then match NOTHING and verifyImages would silently skip the pod —
+              a fail-OPEN. Emit an explicit docker.io-normalized pattern whenever
+              the rendered repository carries no registry host; keep the bare
+              pattern too for tooling that matches on the un-normalized ref.
+            */ -}}
+            {{- $repo := include "chariot.gatewayImageRepository" . }}
+            {{- if not (regexMatch `^([a-zA-Z0-9-]+\.)+[a-zA-Z0-9-]+(:[0-9]+)?/` $repo) }}
+            - {{ printf "docker.io/%s*" $repo | quote }}
+            {{- end }}
+            - {{ printf "%s*" $repo | quote }}
+          required: true
+          mutateDigest: true
+          verifyDigest: true
+          failureAction: {{ .Values.imageVerification.kyverno.validationFailureAction }}
+          attestors:
+            - count: 1
+              entries:
+                - certificates:
+                    cert: |-
+{{ .Values.imageVerification.notation.certs | nindent 22 }}
+{{- end -}}

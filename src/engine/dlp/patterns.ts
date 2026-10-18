@@ -146,4 +146,42 @@ export const BUILTIN_RULES: DlpRule[] = [
     // Classic: npm_[A-Za-z0-9]{36}. Legacy UUID: no prefix but in npm-specific contexts.
     pattern: /\bnpm_[A-Za-z0-9]{36,}\b/g,
   },
+  {
+    id: 'markdown-exfil-url',
+    label: 'Markdown link/image with query-string exfil URL',
+    // OWASP LLM02/LLM01 — an untrusted MCP tool response can embed a
+    // markdown IMAGE (`![alt](url)`) or LINK (`[text](url)`) whose target
+    // carries a query string. Markdown image syntax is commonly
+    // auto-rendered (auto-fetched) by clients without any user click, so
+    // secrets/context the agent has already seen can be smuggled out
+    // encoded in the query string of an attacker-controlled host the
+    // moment the response is displayed. `!?` makes the leading `!`
+    // (image marker) optional so both link and image forms are covered.
+    // Scoped to URLs that carry a `?query` — plain markdown links/images
+    // with no query string are the overwhelmingly common benign case
+    // (docs, article links) and are deliberately NOT flagged, keeping the
+    // false-positive rate low per this module's stated bias.
+    pattern: /!?\[[^\]\n]{0,500}\]\(\s*https?:\/\/[^\s)]+\?[^\s)]*\)/gi,
+  },
+  {
+    id: 'shell-command-substitution',
+    label: 'Shell command substitution ($() or backtick)',
+    // Command-substitution syntax embedded in untrusted tool output. If
+    // this text is later copy-pasted or interpolated into an actual shell
+    // (by a downstream human, agent, or misconfigured integration) the
+    // substitution executes. Matching the substitution syntax itself
+    // (rather than every bare `$`/backtick) keeps documentation identifiers
+    // such as `YOUR_API_KEY` harmless. Backtick form must contain shell-like
+    // spacing/operators and must not be part of a fenced Markdown block.
+    pattern: /\$\([^)\r\n]{1,500}\)|(?<!`)`(?=[^`\r\n]{1,500}(?:\s+|&&|;|\|\|))[^`\r\n]{1,500}`(?!`)/g,
+  },
+  {
+    id: 'shell-metachar-chain',
+    label: 'Shell metacharacter command chain',
+    // A shell chain/pipe operator (`;`, `&&`, `||`, `|`) immediately
+    // followed by a well-known executable name — the shape of an
+    // injected follow-on command, not the bare metacharacters alone
+    // (which are far too common in ordinary prose/code to flag safely).
+    pattern: /(?:;|&&|\|\||\|)\s*(?:rm|curl|wget|bash|sh|zsh|nc|ncat|python3?|perl|chmod|chown|sudo|dd|mkfifo|base64|eval|exec)\b/gi,
+  },
 ];

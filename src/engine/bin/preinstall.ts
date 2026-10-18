@@ -24,6 +24,7 @@ import type { AdapterEntry } from '../server/ChariotState.js';
 import type { AuditTrail } from '../audit/AuditTrail.js';
 import { findOnPath, EPIC_AI_DIR, ensureDir } from '../../cli/paths.js';
 import { runConcurrent, warmConcurrency, extractStdioPackageName } from './concurrency.js';
+import { verifyNpmIntegrity } from '../federation/adapters/npmIntegrityGuard.js';
 
 export type Host = 'darwin' | 'debian' | 'rhel' | 'arch' | 'win32' | 'unsupported';
 type Manager = 'brew' | 'apt' | 'dnf' | 'pacman' | 'winget' | 'manual';
@@ -409,7 +410,7 @@ function githubCloneUrl(pkg: string): string | null {
 }
 
 // Partition adapters into pinned (have version + integrityShasum), git-pinned
-// (github: source with a 40-hex mcp.gitRef — bug-tracker-ref) and unpinned
+// (github: source with a 40-hex mcp.gitRef) and unpinned
 // (return INTEGRITY_UNPINNED before any host-tool check, so strict refusal is
 // host-independent).
 function classifyIntegrity(adapters: AdapterEntry[]): { pinned: PinnedAdapter[]; gitPinned: GitPinnedAdapter[]; unpinned: Record<string, PackageStatus> } {
@@ -559,13 +560,26 @@ async function auditMismatch(audit: AuditTrail | undefined, pkg: string, version
   });
 }
 
-interface WarmCtx { dryRun: boolean; spawnFn: SpawnInstallFn; audit: AuditTrail | undefined }
+// Injectable form of npmIntegrityGuard.ts's verifyNpmIntegrity — threaded
+// through WarmCtx (same pattern as spawnFn below) so unit tests can drive
+// npxInstall's re-verify step with canned outcomes instead of depending on
+// real _cacache filesystem state.
+export type VerifyNpmIntegrityFn = (pkg: string, version: string, expectedSha: string) => { ok: true } | { ok: false; reason: string };
+
+interface WarmCtx { dryRun: boolean; spawnFn: SpawnInstallFn; audit: AuditTrail | undefined; verifyNpmIntegrityFn: VerifyNpmIntegrityFn }
 
 // Build a fetcher closure for an npm row: `npm pack --pack-destination <tmp>`
 // produces the registry-served tarball as a file we own.
 function npmFetch(p: PinnedAdapter, ctx: WarmCtx): () => Promise<FetchResult> {
   return async () => {
     const destDir = join(tmpdir(), 'chariot-npm-verify', p.pkg.replace(/^@/, '').replace('/', '-'));
+    // W42-FIX (row 1.42 proof, gap 2 of 3): `npm pack --pack-destination
+    // <dir>` does NOT create <dir> itself (confirmed empirically against
+    // npm 11.19.0 — a fresh, never-before-used destDir fails ENOENT opening
+    // the .tgz; see /tmp/scratch/wave3/w42/run/VERDICT.md). ensureDir() is
+    // idempotent (mkdir -p semantics) so this is safe on every call,
+    // including the common case where a prior run already created it.
+    ensureDir(destDir);
     const { exitCode, stderr } = await ctx.spawnFn('npm', ['pack', `${p.pkg}@${p.version}`, '--pack-destination', destDir], 60_000, false);
     if (exitCode !== 0) {
       const status: PackageStatus = (stderr.includes('404') || stderr.includes('E404'))
@@ -611,7 +625,69 @@ const uvxInstall: PostInstallFactory = (p, ctx) => async () => {
   return { ok: true };
 };
 
-// Clone-and-verify pre-fetch for git-pinned github: stdio adapters (bug-tracker-ref).
+// W42-FIX (row 1.42 proof, gap 3 of 3): npm keeps TWO separate caches.
+// `npm pack` (npmFetch above) populates `_cacache` (content-addressable
+// download cache) — verifying a tarball there does NOT mean `npx
+// --no-install <pkg>@<version>` can resolve it, because `npx --no-install`
+// reads ONLY from the SEPARATE `_npx` execution cache
+// (`~/.npm/_npx/<hash>/node_modules/`). Confirmed empirically
+// (/tmp/scratch/wave3/w42/run/VERDICT.md): after `chariot setup
+// --pre-install` reported WARMED for a pinned npm adapter, the runtime's
+// OWN dispatch-time launch (`MCPClientAdapter.ts` → `npx --no-install
+// <pkg>@<version>`, network off) failed with
+// `MCP error -32000: Connection closed` / stderr `npm error npx canceled
+// due to missing packages and no YES option` — because nothing had ever
+// seeded `_npx`. This post-install step seeds it explicitly (network ON,
+// the only place in the npx warm path that reaches the network deliberately)
+// then re-verifies and dry-probes the EXACT offline launch form before
+// reporting success, so a WARMED status means the runtime's own launch will
+// actually work air-gapped — not merely that a tarball was downloaded once.
+const npxInstall: PostInstallFactory = (p, ctx) => async () => {
+  // Step 1: seed the `_npx` execution cache. `npm exec --package=<pkg>@<version>
+  // -- true` is npm's own documented mechanism for populating `_npx` for a
+  // pinned spec without actually running the target's bin (we run the
+  // no-op `true` command instead of the adapter's real MCP server entry
+  // point, which would otherwise block on stdin forever).
+  const seed = await ctx.spawnFn('npm', ['exec', '--yes', `--package=${p.pkg}@${p.version}`, '--', 'true'], 60_000, false);
+  if (seed.exitCode !== 0) {
+    return {
+      ok: false,
+      status: { status: 'FAILED', detail: `npm exec (seed _npx cache) exit ${seed.exitCode}: ${redactStderr(seed.stderr)}`.slice(0, 400) },
+    };
+  }
+  // Step 2: re-verify against the SAME check `guardNpmStdioAdapter()` runs
+  // at dispatch time (`npmIntegrityGuard.ts`). `npm exec` can in principle
+  // resolve a different tarball than the one `npm pack` just verified if
+  // registry state changed between the two network round-trips (TOCTOU);
+  // this keeps "WARMED" meaning exactly what the runtime's own admission
+  // gate will accept.
+  const verified = ctx.verifyNpmIntegrityFn(p.pkg, p.version, p.expectedSha);
+  if (!verified.ok) {
+    return { ok: false, status: { status: 'INTEGRITY_MISMATCH', detail: `post-seed re-verify failed: ${verified.reason}`.slice(0, 400) } };
+  }
+  // Step 3: dry probe — launch the EXACT offline form the runtime dispatch
+  // path uses (`enforcePinnedArgs()` rewrites every npx launch to
+  // `--no-install <pkg>@<version>`), with `--offline` added so this probe
+  // cannot mask a real gap by silently reaching the network instead of the
+  // cache just seeded above. Bounded to 8s: on success the adapter's MCP
+  // server process starts and blocks on stdin (expected — killed by the
+  // spawn timeout, which is NOT a failure signal here); on the specific
+  // resolution failure this fix targets, npx exits fast with the literal
+  // stderr text confirmed in VERDICT.md, "npx canceled due to missing
+  // packages" — that text, not the exit code alone (a timeout-kill also
+  // yields a non-zero/-1 exit), is what distinguishes "not resolvable
+  // offline" from "resolved and running".
+  const probe = await ctx.spawnFn('npx', ['--no-install', '--offline', `${p.pkg}@${p.version}`], 8_000, false);
+  if (/canceled due to missing packages|could not determine executable to run/i.test(probe.stderr)) {
+    return {
+      ok: false,
+      status: { status: 'FAILED', detail: `npx --no-install --offline dry probe: package not resolvable from _npx cache: ${redactStderr(probe.stderr)}`.slice(0, 400) },
+    };
+  }
+  return { ok: true };
+};
+
+// Clone-and-verify pre-fetch for git-pinned github: stdio adapters.
 // Each repo is fetched at exactly mcp.gitRef into
 // ~/.epic-ai/git-adapters/<owner__repo>/<sha> and the checked-out HEAD is
 // verified against the pin before reporting WARMED. Fail-closed: fetch
@@ -699,9 +775,9 @@ function warmNpx(adapters: AdapterEntry[], ctx: WarmCtx): Promise<Record<string,
   return warmStdio(
     adapters, 'npm',
     { status: 'FAILED', detail: 'npm not on PATH' },
-    (p) => `npm pack ${p.pkg}@${p.version}`,
+    (p) => `npm pack ${p.pkg}@${p.version} → verify → npm exec --package=${p.pkg}@${p.version} -- true (seed _npx) → npx --no-install --offline ${p.pkg}@${p.version} (dry probe)`,
     npmFetch,
-    undefined,
+    npxInstall,
     ctx,
   );
 }
@@ -739,6 +815,12 @@ export interface PreInstallOptions {
    * environments configure audit at `chariot setup` time.
    */
   auditTrail?: AuditTrail;
+  /**
+   * test-only injection point for npxInstall's post-seed re-verify step
+   * (mirrors `spawnInstall` above). Production callers omit this and get
+   * the real `verifyNpmIntegrity` from npmIntegrityGuard.ts.
+   */
+  verifyNpmIntegrity?: VerifyNpmIntegrityFn;
 }
 
 export async function runPreInstall(opts: PreInstallOptions = {}): Promise<Manifest> {
@@ -756,6 +838,7 @@ export async function runPreInstallWithAdapters(adapters: AdapterEntry[], opts: 
   const dryRun = !!opts.dryRun;
   const spawnFn: SpawnInstallFn = opts.spawnInstall ?? spawnInstall;
   const audit = opts.auditTrail;
+  const verifyNpmIntegrityFn: VerifyNpmIntegrityFn = opts.verifyNpmIntegrity ?? verifyNpmIntegrity;
 
   console.log(`Chariot setup --pre-install (host=${host}, dryRun=${dryRun})`);
   console.log(`  cli-bridge binaries: ${workload.cli.length}`);
@@ -771,7 +854,7 @@ export async function runPreInstallWithAdapters(adapters: AdapterEntry[], opts: 
   // password prompt's TTY. Once CLI is done, the npx and uvx warmers
   // dispatch to different binaries and share no resource constraint, so
   // they run in parallel.
-  const ctx: WarmCtx = { dryRun, spawnFn, audit };
+  const ctx: WarmCtx = { dryRun, spawnFn, audit, verifyNpmIntegrityFn };
   const cliResults = onlyCli ? await preinstallCli(workload.cli, host, dryRun) : {};
   const [npxResults, uvxResults] = await Promise.all([
     onlyNpx ? warmNpx(workload.npx, ctx) : Promise.resolve<Record<string, PackageStatus>>({}),

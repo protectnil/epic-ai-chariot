@@ -40,7 +40,7 @@ export class RipeStatMCPServer extends MCPAdapterBase {
       name: 'ripe-stat',
       displayName: 'RIPE Stat',
       version: '1.0.0',
-      category: 'networking',
+      category: 'devops',
       keywords: [
         'ripe', 'ripe stat', 'ip', 'asn', 'bgp', 'whois', 'geoloc',
         'prefix', 'routing', 'abuse contact', 'network info', 'internet registry',

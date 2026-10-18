@@ -27,7 +27,10 @@ export type DlpPatternId =
   | 'private-key-pem'
   | 'jwt'
   | 'github-pat'
-  | 'generic-api-key';
+  | 'generic-api-key'
+  | 'markdown-exfil-url'
+  | 'shell-command-substitution'
+  | 'shell-metachar-chain';
 
 export type DlpDecision = 'block' | 'redact' | 'allow';
 

@@ -25,7 +25,7 @@ export class RxNormMCPServer extends MCPAdapterBase {
       name: 'rxnorm',
       displayName: 'RxNorm (NLM RxNav)',
       version: '1.0.0',
-      category: 'medical',
+      category: 'healthcare',
       keywords: [
         'rxnorm', 'rxcui', 'drug', 'medication', 'pharmaceutical',
         'ndc', 'national drug code', 'drug interaction', 'brand name',

@@ -28,7 +28,7 @@ export class CodeforcesMCPServer extends MCPAdapterBase {
       name: 'codeforces',
       displayName: 'Codeforces',
       version: '1.0.0',
-      category: 'developer-tools',
+      category: 'devops',
       keywords: [
         'codeforces', 'competitive programming', 'programming contests',
         'algorithm', 'data structures', 'problemset', 'user rating',
