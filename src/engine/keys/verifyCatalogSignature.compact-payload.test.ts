@@ -473,13 +473,13 @@ test('§7.2.6 wiring: chariot-adapter-bundle.json with signingPayloadVersion ABS
   });
 });
 
-test('§7.2.6 wiring: a non-bundle artifact (chariot-adapter-catalog.json) ignores signingPayloadVersion entirely, even when present and well-formed', () => {
+test('catalog artifact ignores signingPayloadVersion and uses its digest/full-bytes verification paths', () => {
   withTempDir((dir) => {
     const catalogPath = join(dir, 'chariot-adapter-catalog.json');
     // Same shape as a well-formed compact-ready bundle, but this artifact
-    // is explicitly OUTSIDE the Merkle leaf set per FPS §7.2.3 ("the
-    // compact payload for the bundle only") — it must always take the
-    // full-bytes path regardless of what its JSON happens to contain.
+    // is explicitly OUTSIDE the Merkle leaf set. It uses the catalog
+    // SHA-512-digest path (with a legacy full-bytes fallback), regardless
+    // of what its JSON happens to contain.
     const bundle = twoLeafBundle();
     writeFileSync(catalogPath, JSON.stringify(bundle));
     writeFileSync(`${catalogPath}.sig`, 'garbage-not-a-real-signature==');

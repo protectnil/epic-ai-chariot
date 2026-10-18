@@ -15,7 +15,7 @@ The materializer:
 
 1. Reads the publication-eligible adapter set from MongoDB.
 2. Builds the bundle in memory.
-3. Signs it with the operator-held Ed25519 catalog-signing key.
+3. Signs the compact bundle payload and the SHA-512 digest of the catalog with the operator-held Ed25519 catalog-signing key. The digest path is required because AWS KMS `Sign` accepts at most 4096 bytes per RAW request.
 4. Writes the `.json` and `.sig` files atomically into the chariot
    repo root.
 

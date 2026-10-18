@@ -245,7 +245,7 @@ Ed25519 detached signature. Two artifacts are signed per publish cycle:
 - `chariot-adapter-bundle.json` → `chariot-adapter-bundle.json.sig`
 - `chariot-adapter-catalog.json` → `chariot-adapter-catalog.json.sig`
 
-Verification: `crypto.verify(null, bundleBytes, publicKeyPem, signatureBytes)` using Node's built-in `crypto` module. The public key set is operator-configurable; the default embedded key is the production root (see §7.2).
+The bundle signature verifies the compact payload selected by its manifest version. The catalog signature is over `sha512(catalogBytes)` so it remains compatible with AWS KMS's 4096-byte `Sign` request limit; verification applies the same digest and retains a legacy full-bytes fallback during migration. Verification uses Node's built-in `crypto` module and the public key set is operator-configurable; the default embedded key is the production root (see §7.2).
 
 ### 7.2 Key disclosure
 

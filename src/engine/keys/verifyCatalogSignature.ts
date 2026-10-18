@@ -617,18 +617,18 @@ export function verifyAndReadArtifact(
   // Chariot artifact (not a per-backend/per-cloud fork). Only
   // chariot-adapter-bundle.json carries the compact-payload envelope
   // (manifest.merkleRoot/signingPayloadVersion, FPS §7.2.2/§7.2.3);
-  // chariot-adapter-catalog.json and chariot-mcp-registry.json are outside
-  // the Merkle leaf set (FPS §7.2.3: "the compact payload for the bundle
-  // only") and always verify full-bytes, unchanged. Runs BEFORE the
-  // rotation-set trust decision below so a malformed/unrecognized envelope
-  // fails closed on its own merits, independent of which keys the caller
-  // supplied.
-  let bytesToVerify: Buffer = artifact.bytes;
+  // chariot-adapter-catalog.json is outside the Merkle leaf set. Its
+  // producer signs a SHA-512 digest because AWS KMS RAW requests are capped
+  // at 4096 bytes; the digest is still a cryptographic commitment to every
+  // catalog byte. Legacy full-bytes signatures remain accepted during the
+  // migration. The registry is derivative and has no own signature.
+  const bytesToVerify: Buffer[] = [];
   if (artifactPath.endsWith('chariot-adapter-bundle.json')) {
     const compact = resolveCompactSigningPayload(artifact.bytes);
     switch (compact.kind) {
       case 'legacy':
-        break; // bytesToVerify stays artifact.bytes — existing full-bytes path, unchanged.
+        bytesToVerify.push(artifact.bytes);
+        break;
       case 'invalid-version':
         return { ok: false, reason: 'signing-payload-version-invalid', detail: compact.detail };
       case 'malformed':
@@ -644,9 +644,15 @@ export function verifyAndReadArtifact(
       case 'merkle-mismatch':
         return { ok: false, reason: 'compact-payload-merkle-root-mismatch', detail: compact.detail };
       case 'compact-ready':
-        bytesToVerify = compact.payloadBytes;
+        bytesToVerify.push(compact.payloadBytes);
         break;
     }
+  } else if (artifactPath.endsWith('chariot-adapter-catalog.json')) {
+    bytesToVerify.push(createHash('sha512').update(artifact.bytes).digest());
+    // Backward compatibility for catalogs signed before the KMS-size fix.
+    bytesToVerify.push(artifact.bytes);
+  } else {
+    bytesToVerify.push(artifact.bytes);
   }
 
   // CHARIOT-SPEC.md:525 trust anchor (module docstring above). Filtered
@@ -682,12 +688,10 @@ export function verifyAndReadArtifact(
       // callers passing custom keys (test fixtures, eval suite) still
       // work without pre-registering.
       const keyObject = getKeyObject(key.pem);
-      // `bytesToVerify` is the compact FPS §7.2.3 payload when the version
-      // gate above selected it, otherwise the full artifact bytes
-      // (unchanged legacy behavior). The RETURNED `bytes` is always the
-      // full artifact — downstream callers (ChariotState.ts etc.) parse the
-      // whole bundle JSON regardless of which bytes the signature covered.
-      if (cryptoVerify(null, bytesToVerify, keyObject, sigBytes)) {
+      // `bytesToVerify` contains the format-selected payload(s). The
+      // RETURNED `bytes` is always the full artifact — downstream callers
+      // parse the whole JSON regardless of which payload was signed.
+      if (bytesToVerify.some((payload) => cryptoVerify(null, payload, keyObject, sigBytes))) {
         return { ok: true, bytes: artifact.bytes, keyId: key.id };
       }
     } catch {
